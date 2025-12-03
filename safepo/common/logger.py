@@ -26,6 +26,12 @@ import numpy as np
 import torch
 from torch.utils.tensorboard.writer import SummaryWriter
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 # from safepo.common.mpi_tools import proc_id, mpi_statistics_scalar
 
 
@@ -121,11 +127,16 @@ class Logger:
         level: int = 1,
         use_tensorboard=True,
         verbose=True,
+        use_wandb=False,
+        wandb_project=None,
+        wandb_config=None,
     ):
         self.log_dir = log_dir
-        self.debug = debug
+        self._debug = debug
         self.level = level
         self.verbose = verbose
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
+        self.wandb_run = None
 
         os.makedirs(self.log_dir, exist_ok=True)
         self.output_file = open(  # noqa: SIM115 # pylint: disable=consider-using-with
@@ -150,15 +161,30 @@ class Logger:
         # Setup tensor board logging if enabled and MPI root process
         if use_tensorboard:
             self.summary_writer = SummaryWriter(os.path.join(self.log_dir, "tb"))
+        
+        # Setup wandb logging if enabled
+        if self.use_wandb:
+            if wandb_project is None:
+                wandb_project = "safepo"
+            wandb_config = wandb_config or {}
+            self.wandb_run = wandb.init(
+                project=wandb_project,
+                name=self.exp_name,
+                dir=self.log_dir,
+                config=wandb_config,
+                resume="allow",
+            )
 
     def close(self):
         """Close the output file.
         """
         self.output_file.close()
+        if self.use_wandb and self.wandb_run is not None:
+            self.wandb_run.finish()
 
     def debug(self, msg, color="yellow"):
         """Print a colorized message to stdout."""
-        if self.debug:
+        if self._debug:
             print(colorize(msg, color, bold=False))
 
     def log(self, msg, color="green"):
@@ -305,6 +331,11 @@ class Logger:
         if self.use_tensorboard:
             for key, val in self.log_current_row.items():
                 self.summary_writer.add_scalar(key, val, global_step=self.epoch)
+        
+        if self.use_wandb and self.wandb_run is not None:
+            wandb_log = {key: val for key, val in self.log_current_row.items() if isinstance(val, (int, float, np.integer, np.floating))}
+            wandb_log["epoch"] = self.epoch
+            self.wandb_run.log(wandb_log)
 
         # free logged information in all processes...
         self.log_current_row.clear()
@@ -322,6 +353,9 @@ class EpochLogger(Logger):
         level: int = 1,
         use_tensorboard=True,
         verbose=True,
+        use_wandb=False,
+        wandb_project=None,
+        wandb_config=None,
     ):
         super().__init__(
             log_dir=log_dir,
@@ -331,6 +365,9 @@ class EpochLogger(Logger):
             level=level,
             use_tensorboard=use_tensorboard,
             verbose=verbose,
+            use_wandb=use_wandb,
+            wandb_project=wandb_project,
+            wandb_config=wandb_config,
         )
         self.epoch_dict = dict()
 

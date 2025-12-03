@@ -33,6 +33,7 @@ import torch.optim
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 from safepo.common.buffer import VectorizedOnPolicyBuffer
 from safepo.common.env import make_sa_mujoco_env, make_sa_isaac_env
@@ -137,6 +138,10 @@ def main(args, cfg_env=None):
     logger = EpochLogger(
         log_dir=args.log_dir,
         seed=str(args.seed),
+        use_wandb=True,
+        wandb_project="safepo",
+        wandb_config=dict_args,
+        verbose=False,  # Disable verbose output
     )
     rew_deque = deque(maxlen=50)
     cost_deque = deque(maxlen=50)
@@ -146,7 +151,6 @@ def main(args, cfg_env=None):
     eval_len_deque = deque(maxlen=50)
     logger.save_config(dict_args)
     logger.setup_torch_saver(policy.actor)
-    logger.log("Start with training.")
     obs, _ = env.reset()
     obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
     ep_ret, ep_cost, ep_len = (
@@ -154,8 +158,9 @@ def main(args, cfg_env=None):
         np.zeros(args.num_envs),
         np.zeros(args.num_envs),
     )
-    # training loop
-    for epoch in range(epochs):
+    # training loop with tqdm progress bar
+    pbar = tqdm(range(epochs), desc="Training", ncols=100)
+    for epoch in pbar:
         rollout_start_time = time.time()
         # collect samples until we have enough to update
         for steps in range(local_steps_per_epoch):
@@ -347,6 +352,15 @@ def main(args, cfg_env=None):
                 break
         update_end_time = time.time()
         actor_scheduler.step()
+        
+        # Update tqdm progress bar with key metrics
+        if not logger.logged:
+            pbar.set_postfix({
+                'EpRet': f"{np.mean(rew_deque):.2f}" if len(rew_deque) > 0 else "N/A",
+                'EpCost': f"{np.mean(cost_deque):.2f}" if len(cost_deque) > 0 else "N/A",
+                'Lag': f"{lagrange.lagrangian_multiplier:.4f}",
+            })
+        
         if not logger.logged:
             # log data
             logger.log_tabular("Metrics/EpRet")
@@ -383,6 +397,7 @@ def main(args, cfg_env=None):
                         },
                         itr = epoch
                     )
+    pbar.close()
     logger.close()
 
 
