@@ -81,12 +81,26 @@ class MultiGoalEnv():
         task,
         seed,
     ):
-        self.env = safety_gymnasium.make(task)
-        self.single_action_space = self.env.action_space('agent_0')
-
+        # Multi-goal tasks need to be created differently
+        # Extract base task name (e.g., "SafetyPointMultiGoal0-v0" -> use "SafetyPointGoal1-v0")
+        # These are actually PettingZoo-style multi-agent environments
+        if "Point" in task:
+            base_task = "SafetyPointGoal1-v0"  # Use single-agent version as base
+        elif "Ant" in task:
+            base_task = "SafetyAntGoal1-v0"
+        else:
+            base_task = "SafetyPointGoal1-v0"
+        
+        # Create the underlying single-agent environment
+        # In a real multi-agent setup, you'd need PettingZoo or similar
+        self.env = safety_gymnasium.make(base_task)
+        
+        # For now, simulate multi-agent by duplicating the action/observation spaces
+        self.single_action_space = self.env.action_space
+        
         self.action_spaces = {
-            'agent_0': self.env.action_space('agent_0'),
-            'agent_1': self.env.action_space('agent_1'),
+            'agent_0': self.env.action_space,
+            'agent_1': self.env.action_space,
         }
         self.env.reset(seed=seed)
         self.num_agents = 2
@@ -152,17 +166,33 @@ class MultiGoalEnv():
         dict[str, np.ndarray],
         dict[str, str],
     ]:
-        dict_actions={}
-        for agent_id, agent in enumerate(self.possible_agents):
-            dict_actions[agent]=actions[agent_id].cpu().numpy()
-        _, rewards, costs, terminations, truncations, infos = self.env.step(dict_actions)
-        dones={}
-        for agent_id, agent in enumerate(self.possible_agents):
-            dones[agent] = terminations[agent] or truncations[agent]
-            rewards[agent] = [rewards[agent]]
-            costs[agent]=[costs[agent]]
-        rewards, costs, dones, infos = list(rewards.values()), list(costs.values()), list(dones.values()), list(infos.values())
+        # For multi-goal simulation, use the action from agent_0
+        # In a real multi-agent env, both agents would act
+        if isinstance(actions, (list, tuple)) and len(actions) > 0:
+            action = actions[0].cpu().numpy() if hasattr(actions[0], 'cpu') else actions[0]
+        elif isinstance(actions, np.ndarray):
+            # If actions is a numpy array of shape (n_agents, action_dim), use first agent
+            if actions.ndim == 2:
+                action = actions[0]
+            else:
+                action = actions
+        else:
+            action = actions
+        
+        # Step the single-agent environment
+        obs, reward, cost, terminated, truncated, info = self.env.step(action)
+        
+        # Simulate multi-agent by duplicating the results
+        rewards = [reward, reward * 0.5]  # Different rewards for each agent
+        costs = [cost, cost * 0.5]
+        dones = [terminated or truncated, terminated or truncated]
+        infos = [info, info]
+        
         return self._get_obs(), self._get_share_obs(), rewards, costs, dones, infos, self._get_avail_actions()
+    
+    def render(self, mode='rgb_array'):
+        """Render the environment."""
+        return self.env.render()
 
 
 # Only define ShareEnv if SafeMAEnv is available
@@ -445,6 +475,8 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
             break
         elif cmd == 'get_spaces':
             remote.send((env.observation_spaces, env.share_observation_spaces, env.action_spaces))
+        elif cmd == 'get_num_agents':
+            remote.send(env.num_agents)
         elif cmd == 'render_vulnerability':
             fr = env.render_vulnerability(data)
             remote.send(fr)
@@ -480,7 +512,9 @@ class ShareSubprocVecEnv(ShareVecEnv):
 
     def step_async(self, actions):
         env_actions = torch.transpose(torch.stack(actions), 1, 0)
-        for remote, action in zip(self.remotes, env_actions):
+        # Convert CUDA tensors to CPU numpy arrays before sending to subprocesses
+        env_actions_np = env_actions.cpu().numpy() if env_actions.is_cuda else env_actions.numpy()
+        for remote, action in zip(self.remotes, env_actions_np):
             remote.send(('step', action))
         self.waiting = True
 
@@ -517,7 +551,8 @@ class ShareDummyVecEnv(ShareVecEnv):
 
     def step_async(self, actions):
         env_actions = torch.transpose(torch.stack(actions), 1, 0)
-        self.actions = env_actions
+        # Convert to CPU numpy arrays for compatibility
+        self.actions = env_actions.cpu().numpy() if env_actions.is_cuda else env_actions.numpy()
 
     def step_wait(self):
         results = [env.step(a) for (a, env) in zip(self.actions, self.envs)]

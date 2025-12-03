@@ -148,7 +148,7 @@ def make_ma_mujoco_env(scenario, agent_conf, seed, cfg_train):
     if cfg_train['n_rollout_threads']== 1:
         return ShareDummyVecEnv([get_env_fn(0)], cfg_train['device'])
     else:
-        return ShareSubprocVecEnv([get_env_fn(i) for i in range(cfg_train['n_rollout_threads'])])
+        return ShareSubprocVecEnv([get_env_fn(i) for i in range(cfg_train['n_rollout_threads'])], cfg_train['device'])
 
 def make_ma_multi_goal_env(task, seed, cfg_train):
     """
@@ -180,7 +180,7 @@ def make_ma_multi_goal_env(task, seed, cfg_train):
     if cfg_train['n_rollout_threads']== 1:
         return ShareDummyVecEnv([get_env_fn(0)], cfg_train['device'])
     else:
-        return ShareSubprocVecEnv([get_env_fn(i) for i in range(cfg_train['n_rollout_threads'])])
+        return ShareSubprocVecEnv([get_env_fn(i) for i in range(cfg_train['n_rollout_threads'])], cfg_train['device'])
 
 def make_ma_isaac_env(args, cfg, cfg_train, sim_params, agent_index):
     """

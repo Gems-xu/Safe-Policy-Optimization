@@ -25,6 +25,7 @@ import torch.nn as nn
 import os
 import sys
 import time
+from tqdm import tqdm
 
 from safepo.common.env import make_ma_mujoco_env, make_ma_isaac_env, make_ma_multi_goal_env
 from safepo.common.popart import PopArt
@@ -224,6 +225,10 @@ class Runner:
         self.logger = EpochLogger(
             log_dir = config["log_dir"],
             seed = str(config["seed"]),
+            use_wandb=config.get("use_wandb", True),
+            wandb_project=config.get("wandb_project", "safepo"),
+            wandb_config=config,
+            verbose=False,
         )
         self.save_dir = str(config["log_dir"]+'/models_seed{}'.format(self.config["seed"]))
         if not os.path.exists(self.save_dir):
@@ -266,7 +271,8 @@ class Runner:
         train_episode_costs = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
         eval_rewards=0.0
         eval_costs=0.0
-        for episode in range(episodes):
+        pbar = tqdm(range(episodes), desc="Training", ncols=100)
+        for episode in pbar:
 
             done_episodes_rewards = []
             done_episodes_costs = []
@@ -336,6 +342,15 @@ class Runner:
                 self.logger.log_tabular("Time/Total", end - start)
                 self.logger.log_tabular("Time/FPS", int(total_num_steps / (end - start)))
                 self.logger.dump_tabular()
+                
+                # Update tqdm progress bar with key metrics
+                pbar.set_postfix({
+                    'EpRet': f"{aver_episode_rewards.item():.2f}",
+                    'EpCost': f"{aver_episode_costs.item():.2f}",
+                    'EvalRet': f"{eval_rewards:.2f}",
+                    'EvalCost': f"{eval_costs:.2f}",
+                })
+        pbar.close()
 
     def return_aver_cost(self, aver_episode_costs):
         for agent_id in range(self.num_agents):
@@ -410,7 +425,7 @@ class Runner:
             self.buffer[agent_id].insert(share_obs[:, agent_id], obs_to_insert, rnn_states[:, agent_id],
                                          rnn_states_critic[:, agent_id], actions[agent_id],
                                          action_log_probs[agent_id],
-                                         values[:, agent_id], rewards[:, agent_id], masks[:, agent_id], None,
+                                         values[:, agent_id], rewards[:, agent_id].unsqueeze(-1), masks[:, agent_id], None,
                                          active_masks[:, agent_id], None)
 
     def train(self):

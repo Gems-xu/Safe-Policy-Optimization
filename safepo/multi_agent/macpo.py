@@ -25,12 +25,14 @@ import torch.nn as nn
 import os
 import sys
 import time
+from tqdm import tqdm
 
 from safepo.common.env import make_ma_mujoco_env, make_ma_isaac_env, make_ma_multi_goal_env
 from safepo.common.popart import PopArt
 from safepo.common.model import MultiAgentActor as Actor, MultiAgentCritic as Critic
 from safepo.common.buffer import SeparatedReplayBuffer
 from safepo.common.logger import EpochLogger
+from safepo.common.video_recorder import MultiAgentVideoRecorder, setup_headless_rendering
 from safepo.utils.config import multi_agent_args, parse_sim_params, set_np_formatting, set_seed, multi_agent_velocity_map, isaac_gym_map, multi_agent_goal_tasks
 
 
@@ -443,15 +445,31 @@ class Runner:
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = True
 
+        # Setup headless rendering for video recording
+        setup_headless_rendering()
+        
+        # Initialize logger with wandb
         self.logger = EpochLogger(
             log_dir = config["log_dir"],
             seed = str(config["seed"]),
+            use_wandb=config.get("use_wandb", True),
+            wandb_project=config.get("wandb_project", "safepo"),
+            wandb_config=config,
+            verbose=False,
         )
         self.save_dir = str(config["log_dir"]+'/models_seed{}'.format(self.config["seed"]))
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
 
         self.logger.save_config(config)
+        
+        # Initialize video recorder for evaluation
+        self.video_recorder = MultiAgentVideoRecorder(
+            fps=30,
+            enabled=config.get("record_video", True),
+            record_freq=config.get("video_record_freq", 10),
+            max_episode_length=config.get("episode_length", 1000)
+        )
         self.policy = []
         for agent_id in range(self.num_agents):
             share_observation_space = self.envs.share_observation_space[agent_id]
@@ -487,7 +505,8 @@ class Runner:
         train_episode_costs = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
         eval_rewards=0.0
         eval_costs=0.0
-        for episode in range(episodes):
+        pbar = tqdm(range(episodes), desc="Training", ncols=100)
+        for episode in pbar:
 
             done_episodes_rewards = []
             done_episodes_costs = []
@@ -563,6 +582,15 @@ class Runner:
                 self.logger.log_tabular("Time/Total", end - start)
                 self.logger.log_tabular("Time/FPS", int(total_num_steps / (end - start)))
                 self.logger.dump_tabular()
+                
+                # Update tqdm progress bar with key metrics
+                pbar.set_postfix({
+                    'EpRet': f"{aver_episode_rewards.item():.2f}",
+                    'EpCost': f"{aver_episode_costs.item():.2f}",
+                    'EvalRet': f"{eval_rewards:.2f}",
+                    'EvalCost': f"{eval_costs:.2f}",
+                })
+        pbar.close()
 
 
     def return_aver_cost(self, aver_episode_costs):
@@ -649,8 +677,8 @@ class Runner:
             self.buffer[agent_id].insert(share_obs[:, agent_id], obs_to_insert, rnn_states[:, agent_id],
                                          rnn_states_critic[:, agent_id], actions[agent_id],
                                          action_log_probs[agent_id],
-                                         values[:, agent_id], rewards[:, agent_id], masks[:, agent_id], None,
-                                         active_masks[:, agent_id], None, costs=costs[:, agent_id],
+                                         values[:, agent_id], rewards[:, agent_id].unsqueeze(-1), masks[:, agent_id], None,
+                                         active_masks[:, agent_id], None, costs=costs[:, agent_id].unsqueeze(-1),
                                          cost_preds=cost_preds[:, agent_id],
                                          rnn_states_cost=rnn_states_cost[:, agent_id], done_episodes_costs_aver=done_episodes_costs_aver, aver_episode_costs=aver_episode_costs)
 
@@ -710,6 +738,11 @@ class Runner:
         one_episode_costs = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
 
         eval_obs, _, _ = self.eval_envs.reset()
+        
+        # Start video recording for first eval episode only
+        should_record = self.video_recorder.should_record()
+        if should_record:
+            self.video_recorder.start_episode()
 
         eval_rnn_states = torch.zeros(self.config["n_eval_rollout_threads"], self.num_agents, self.config["recurrent_N"], self.config["hidden_size"],
                                    device=self.config["device"])
@@ -734,6 +767,17 @@ class Runner:
             if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
                 zeros = torch.zeros(eval_actions_collector[-1].shape[0], 1)
                 eval_actions_collector[-1]=torch.cat((eval_actions_collector[-1], zeros), dim=1)
+            
+            # Capture frame for video (only for non-Isaac Gym envs and when recording)
+            if should_record and self.config["env_name"] not in isaac_gym_map:
+                try:
+                    # Get render from environment
+                    if hasattr(self.eval_envs, 'render'):
+                        frame = self.eval_envs.render()
+                        if frame is not None and len(frame.shape) == 3:
+                            self.video_recorder.capture_frame(frame)
+                except Exception:
+                    pass  # Silently ignore rendering errors
 
             eval_obs, _, eval_rewards, eval_costs, eval_dones, _, _ = self.eval_envs.step(
                 eval_actions_collector
@@ -757,9 +801,21 @@ class Runner:
             for eval_i in range(self.config["n_eval_rollout_threads"]):
                 if eval_dones_env[eval_i]:
                     eval_episode += 1
-                    eval_episode_rewards.append(one_episode_rewards[:, eval_i].mean().item())
+                    ep_reward = one_episode_rewards[:, eval_i].mean().item()
+                    ep_cost = one_episode_costs[:, eval_i].mean().item()
+                    eval_episode_rewards.append(ep_reward)
+                    eval_episode_costs.append(ep_cost)
+                    
+                    # Upload video for first environment only if recording
+                    if eval_i == 0 and should_record:
+                        self.video_recorder.end_episode(
+                            episode_reward=ep_reward,
+                            episode_cost=ep_cost,
+                            step=None
+                        )
+                        should_record = False  # Only record first eval episode
+                    
                     one_episode_rewards[:, eval_i] = 0
-                    eval_episode_costs.append(one_episode_costs[:, eval_i].mean().item())
                     one_episode_costs[:, eval_i] = 0
 
             if eval_episode >= eval_episodes:
