@@ -28,10 +28,19 @@ from gymnasium.wrappers.normalize import NormalizeObservation
 
 import safety_gymnasium
 from safety_gymnasium.vector.utils.tile_images import tile_images
+
+# Try to import SafeMAEnv for multi-agent environments
+# This may not be available in all versions of safety_gymnasium
+SafeMAEnv = None
 try:
     from safety_gymnasium.tasks.safe_multi_agent.safe_mujoco_multi import SafeMAEnv
 except ImportError:
-    from safety_gymnasium.tasks.safe_multi_agent.tasks.velocity.safe_mujoco_multi import SafeMAEnv
+    try:
+        from safety_gymnasium.tasks.safe_multi_agent.tasks.velocity.safe_mujoco_multi import SafeMAEnv
+    except ImportError:
+        # SafeMAEnv not available - multi-agent environments won't work
+        pass
+
 from typing import Optional
 try :
     from safety_gymnasium.tasks.safe_isaac_gym.envs.tasks.hand_base.vec_task import VecTaskPython
@@ -156,38 +165,40 @@ class MultiGoalEnv():
         return self._get_obs(), self._get_share_obs(), rewards, costs, dones, infos, self._get_avail_actions()
 
 
-class ShareEnv(SafeMAEnv):
-    
-    def __init__(
-        self,
-        scenario: str,
-        agent_conf: str | None,
-        agent_obsk: int | None = 1,
-        agent_factorization: dict | None = None,
-        local_categories: list[list[str]] | None = None,
-        global_categories: tuple[str, ...] | None = None,
-        render_mode: str | None = None,
-        **kwargs,
-    ):
-        super().__init__(
-            scenario=scenario,
-            agent_conf=agent_conf,
-            agent_obsk=agent_obsk,
-            agent_factorization=agent_factorization,
-            local_categories=local_categories,
-            global_categories=global_categories,
-            render_mode=render_mode,
+# Only define ShareEnv if SafeMAEnv is available
+if SafeMAEnv is not None:
+    class ShareEnv(SafeMAEnv):
+        
+        def __init__(
+            self,
+            scenario: str,
+            agent_conf: str | None,
+            agent_obsk: int | None = 1,
+            agent_factorization: dict | None = None,
+            local_categories: list[list[str]] | None = None,
+            global_categories: tuple[str, ...] | None = None,
+            render_mode: str | None = None,
             **kwargs,
-        )
-        self.num_agents = len(self.agent_action_partitions)
-        self.n_actions = max([len(l) for l in self.agent_action_partitions])
-        self.share_obs_size = self._get_share_obs_size()
-        self.obs_size=self._get_obs_size()
-        self.share_observation_spaces = {}
-        self.observation_spaces={}
-        for agent in range(self.num_agents):
-            self.share_observation_spaces[f"agent_{agent}"] = Box(low=-10, high=10, shape=(self.share_obs_size,)) 
-            self.observation_spaces[f"agent_{agent}"] = Box(low=-10, high=10, shape=(self.obs_size,)) 
+        ):
+            super().__init__(
+                scenario=scenario,
+                agent_conf=agent_conf,
+                agent_obsk=agent_obsk,
+                agent_factorization=agent_factorization,
+                local_categories=local_categories,
+                global_categories=global_categories,
+                render_mode=render_mode,
+                **kwargs,
+            )
+            self.num_agents = len(self.agent_action_partitions)
+            self.n_actions = max([len(l) for l in self.agent_action_partitions])
+            self.share_obs_size = self._get_share_obs_size()
+            self.obs_size=self._get_obs_size()
+            self.share_observation_spaces = {}
+            self.observation_spaces={}
+            for agent in range(self.num_agents):
+                self.share_observation_spaces[f"agent_{agent}"] = Box(low=-10, high=10, shape=(self.share_obs_size,)) 
+                self.observation_spaces[f"agent_{agent}"] = Box(low=-10, high=10, shape=(self.obs_size,)) 
 
     def _get_obs(self):
         state = self.env.state()
@@ -247,6 +258,15 @@ class ShareEnv(SafeMAEnv):
             costs[agent]=[costs[agent]]
         rewards, costs, dones, infos = list(rewards.values()), list(costs.values()), list(dones.values()), list(infos.values())
         return self._get_obs(), self._get_share_obs(), rewards, costs, dones, infos, self._get_avail_actions()
+else:
+    # SafeMAEnv not available - create a placeholder class
+    class ShareEnv:
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "ShareEnv requires safety_gymnasium with multi-agent support. "
+                "Please install safety_gymnasium from source with multi-agent features: "
+                "https://github.com/PKU-Alignment/safety-gymnasium"
+            )
 
 
 class CloudpickleWrapper:
