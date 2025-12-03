@@ -196,14 +196,14 @@ def multi_agent_args(algo):
     # Define custom parameters
     custom_parameters = [
         {"name": "--use-eval", "type": lambda x: bool(strtobool(x)), "default": False, "help": "Use evaluation environment for testing"},
-        {"name": "--task", "type": str, "default": "Safety2x4AntVelocity-v0", "help": "The task to run"},
+        {"name": "--task", "type": str, "default": "SafetyPointMultiGoal0-v0", "help": "The task to run"},
         {"name": "--agent-conf", "type": str, "default": "2x4", "help": "The agent configuration"},
         {"name": "--scenario", "type": str, "default": "Ant", "help": "The scenario"},
         {"name": "--experiment", "type": str, "default": "Base", "help": "Experiment name"},
         {"name": "--seed", "type": int, "default":0, "help": "Random seed"},
         {"name": "--model-dir", "type": str, "default": "", "help": "Choose a model dir"},
         {"name": "--cost-limit", "type": float, "default": 25.0, "help": "cost_lim"},
-        {"name": "--device", "type": str, "default": "cpu", "help": "The device to run the model on"},
+        {"name": "--device", "type": str, "default": "cuda", "help": "The device to run the model on"},
         {"name": "--device-id", "type": int, "default": 0, "help": "The device id to run the model on"},
         {"name": "--write-terminal", "type": lambda x: bool(strtobool(x)), "default": True, "help": "Toggles terminal logging"},
         {"name": "--headless", "type": lambda x: bool(strtobool(x)), "default": False, "help": "Toggles headless mode"},
@@ -238,18 +238,41 @@ def multi_agent_args(algo):
             args.agent_conf = multi_agent_velocity_map[args.task]["agent_conf"]
             args.scenario = multi_agent_velocity_map[args.task]["scenario"]
         elif args.task in multi_agent_goal_tasks:
-            cfg_train.update(cfg_train.get("mamujoco"))
+            # Don't inherit mamujoco config for MultiGoal tasks to keep n_eval_rollout_threads=1
+            # This ensures ShareDummyVecEnv is used for proper video rendering
+            pass
 
-    cfg_train["use_eval"] = args.use_eval
-    cfg_train["cost_limit"]=args.cost_limit
-    cfg_train["algorithm_name"]=algo
-    cfg_train["device"] = args.device + ":" + str(args.device_id)
-
+    # Only override config file values if explicitly provided via command line
+    # This ensures config.yaml values take precedence unless user specifies otherwise
+    import sys
+    
+    # use_eval: only override if explicitly provided
+    if '--use-eval' in sys.argv:
+        cfg_train["use_eval"] = args.use_eval
+    
+    # cost_limit: only override if explicitly provided
+    if '--cost-limit' in sys.argv:
+        cfg_train["cost_limit"] = args.cost_limit
+    
+    # device: only override if explicitly provided
+    if '--device' in sys.argv:
+        cfg_train["device"] = args.device + ":" + str(args.device_id)
+    elif 'device' not in cfg_train:
+        # Set default only if not in config
+        cfg_train["device"] = args.device + ":" + str(args.device_id)
+    
+    # Algorithm name (always set)
+    cfg_train["algorithm_name"] = algo
+    
+    # Task name (always set from command line as it's required)
     cfg_train["env_name"] = args.task
 
-    if args.total_steps:
+    # num_env_steps: only override if explicitly provided
+    if '--total-steps' in sys.argv and args.total_steps:
         cfg_train["num_env_steps"] = args.total_steps
-    if args.num_envs:
+    
+    # n_rollout_threads: only override if explicitly provided
+    if '--num-envs' in sys.argv and args.num_envs:
         cfg_train["n_rollout_threads"] = args.num_envs
         cfg_train["n_eval_rollout_threads"] = args.num_envs
     relpath = time.strftime("%Y-%m-%d-%H-%M-%S")

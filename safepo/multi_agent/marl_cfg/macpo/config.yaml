@@ -3,9 +3,9 @@ algorithm_name: macpo
 experiment_name: check
 seed: 0
 run_dir: ./runs
-num_env_steps: 100000000
-episode_length: 8
-n_rollout_threads: 1
+num_env_steps: 10000000
+episode_length: 1000
+n_rollout_threads: 10
 n_eval_rollout_threads: 1
 hidden_size: 512
 use_render: False
@@ -17,11 +17,11 @@ wandb_project: safepo
 record_video: True
 video_record_freq: 1  # Record video on first eval episode only
 
-save_interval: 1
+save_interval: 50
 use_eval: True
-eval_interval: 2
-log_interval: 25
-eval_episodes: 10000
+eval_interval: 50
+log_interval: 50
+eval_episodes: 10
 
 cost_limit: 25
 EPS: 1.e-8
@@ -80,7 +80,7 @@ mamujoco:
   num_env_steps: 10000000
   episode_length: 1000
   n_rollout_threads: 10
-  n_eval_rollout_threads: 10
+  n_eval_rollout_threads: 1
   hidden_size: 128
   gamma: 0.99
   safety_gamma: 0.2

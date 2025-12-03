@@ -549,7 +549,7 @@ class Runner:
             end = time.time()
             
             if episode % self.config["eval_interval"] == 0 and self.config["use_eval"]:
-                eval_rewards, eval_costs = self.eval()
+                eval_rewards, eval_costs = self.eval(eval_episodes=1, total_steps=total_num_steps)
 
             if len(done_episodes_rewards) != 0:
                 aver_episode_rewards = torch.stack(done_episodes_rewards).mean()
@@ -730,7 +730,7 @@ class Runner:
             self.policy[agent_id].critic.load_state_dict(policy_critic_state_dict)
 
     @torch.no_grad()
-    def eval(self, eval_episodes=1):
+    def eval(self, eval_episodes=1, total_steps=None):
         eval_episode = 0
         eval_episode_rewards = []
         eval_episode_costs = []
@@ -771,13 +771,12 @@ class Runner:
             # Capture frame for video (only for non-Isaac Gym envs and when recording)
             if should_record and self.config["env_name"] not in isaac_gym_map:
                 try:
-                    # Get render from environment
                     if hasattr(self.eval_envs, 'render'):
                         frame = self.eval_envs.render()
                         if frame is not None and len(frame.shape) == 3:
                             self.video_recorder.capture_frame(frame)
                 except Exception:
-                    pass  # Silently ignore rendering errors
+                    pass
 
             eval_obs, _, eval_rewards, eval_costs, eval_dones, _, _ = self.eval_envs.step(
                 eval_actions_collector
@@ -811,7 +810,7 @@ class Runner:
                         self.video_recorder.end_episode(
                             episode_reward=ep_reward,
                             episode_cost=ep_cost,
-                            step=None
+                            step=total_steps
                         )
                         should_record = False  # Only record first eval episode
                     

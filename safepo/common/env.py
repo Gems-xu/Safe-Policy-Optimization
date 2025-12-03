@@ -161,6 +161,11 @@ def make_ma_multi_goal_env(task, seed, cfg_train):
     Returns:
         env: A multi-agent environment.
     """
+    # Get render dimensions from cfg_train, default to 1024x1024 for high-quality bird's-eye view
+    render_width = cfg_train.get('render_width', 1024)
+    render_height = cfg_train.get('render_height', 1024)
+    camera_name = cfg_train.get('camera_name', 'fixedfar')  # Fixed bird's-eye view by default (height ~5)
+    
     def get_env_fn(rank):
         def init_env():
             """
@@ -172,6 +177,9 @@ def make_ma_multi_goal_env(task, seed, cfg_train):
             env=MultiGoalEnv(
                 task=task,
                 seed=seed,
+                width=render_width,
+                height=render_height,
+                camera_name=camera_name,
             )
             return env
 

@@ -79,7 +79,7 @@ class VideoRecorder:
         key: str = "video"
     ) -> bool:
         """
-        Upload recorded video to WandB without saving locally.
+        Upload recorded video to WandB directly from numpy arrays.
 
         Args:
             caption: Caption for the video
@@ -89,38 +89,35 @@ class VideoRecorder:
         Returns:
             True if successful, False otherwise
         """
-        if not self.enabled or len(self.frames) == 0:
+        if not self.enabled:
+            return False
+            
+        if len(self.frames) == 0:
             return False
 
         try:
-            # Create temporary file for video
-            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp_file:
-                tmp_path = tmp_file.name
-
-            # Write video to temporary file
-            writer = imageio.get_writer(tmp_path, fps=self.fps)
-            for frame in self.frames:
-                writer.append_data(frame)
-            writer.close()
-
-            # Upload to wandb
-            if wandb.run is not None:
-                wandb.log({
-                    key: wandb.Video(tmp_path, caption=caption, fps=self.fps, format="mp4")
-                }, step=step)
-                
-            # Clean up temporary file
-            os.remove(tmp_path)
+            if wandb.run is None:
+                return False
+            
+            # Stack frames into numpy array: (T, H, W, C)
+            video_array = np.array(self.frames)
+            
+            # Validate video array
+            if video_array.size == 0 or video_array.ndim != 4:
+                return False
+            
+            # Transpose: (T, H, W, C) -> (T, C, H, W) for wandb
+            video_array = np.transpose(video_array, (0, 3, 1, 2))
+            
+            # Create and log video
+            video = wandb.Video(video_array, caption=caption, fps=self.fps, format="mp4")
+            wandb.log({key: video}, step=step)
             
             # Clear frames after upload
             self.clear()
             return True
 
-        except Exception as e:
-            print(f"Error uploading video to wandb: {e}")
-            # Clean up temporary file if it exists
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        except Exception:
             return False
 
     def get_frame_count(self) -> int:
@@ -159,12 +156,13 @@ class MultiAgentVideoRecorder:
 
     def should_record(self) -> bool:
         """Check if current episode should be recorded."""
-        return self.enabled and (self.episode_count % self.record_freq == 0)
+        # Check NEXT episode (episode_count + 1) to see if it should be recorded
+        return self.enabled and ((self.episode_count + 1) % self.record_freq == 0)
 
     def start_episode(self) -> None:
         """Start recording a new episode if appropriate."""
         self.episode_count += 1
-        self.is_recording = self.should_record()
+        self.is_recording = self.enabled and (self.episode_count % self.record_freq == 0)
         if self.is_recording:
             self.recorder.clear()
 

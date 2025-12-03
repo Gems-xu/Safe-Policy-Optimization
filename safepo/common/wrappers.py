@@ -80,6 +80,9 @@ class MultiGoalEnv():
         self,
         task,
         seed,
+        width=1024,
+        height=1024,
+        camera_name='fixedfar',  # Fixed bird's-eye view camera (height ~5)
     ):
         # Multi-goal tasks need to be created differently
         # Extract base task name (e.g., "SafetyPointMultiGoal0-v0" -> use "SafetyPointGoal1-v0")
@@ -91,9 +94,15 @@ class MultiGoalEnv():
         else:
             base_task = "SafetyPointGoal1-v0"
         
-        # Create the underlying single-agent environment
-        # In a real multi-agent setup, you'd need PettingZoo or similar
-        self.env = safety_gymnasium.make(base_task)
+        # Create the underlying single-agent environment with render mode for video recording
+        # Use 512x512 for bird's-eye view video recording with fixed camera
+        self.env = safety_gymnasium.make(
+            base_task, 
+            render_mode='rgb_array', 
+            width=width, 
+            height=height,
+            camera_name=camera_name  # Fixed bird's-eye view, not tracking agent
+        )
         
         # For now, simulate multi-agent by duplicating the action/observation spaces
         self.single_action_space = self.env.action_space
@@ -536,6 +545,11 @@ class ShareSubprocVecEnv(ShareVecEnv):
         )
         return obs, share_obs, available_actions
 
+    def render(self, mode='rgb_array'):
+        """Render the first environment and return the frame."""
+        self.remotes[0].send(('render', mode))
+        return self.remotes[0].recv()
+
     
 
 class ShareDummyVecEnv(ShareVecEnv):
@@ -576,5 +590,6 @@ class ShareDummyVecEnv(ShareVecEnv):
         )
         return obs, share_obs, available_actions
 
-    def render(self):
+    def render(self, mode='rgb_array'):
+        """Render the first environment and return the frame."""
         return self.envs[0].render()
