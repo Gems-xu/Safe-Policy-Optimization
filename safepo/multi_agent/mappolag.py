@@ -406,8 +406,8 @@ class Runner:
                 pbar.set_postfix({
                     'EpRet': f"{aver_episode_rewards.item():.2f}",
                     'EpCost': f"{aver_episode_costs.item():.2f}",
-                    'EvalRet': f"{eval_rewards:.2f}",
-                    'EvalCost': f"{eval_costs:.2f}",
+                    # 'EvalRet': f"{eval_rewards:.2f}",
+                    # 'EvalCost': f"{eval_costs:.2f}",
                 })
         pbar.close()
 
