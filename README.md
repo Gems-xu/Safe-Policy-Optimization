@@ -26,6 +26,7 @@ If you find Safe Policy Optimization useful, please cite it in your publications
 
 **What's New**: 
 
+- **🚀 Now using [uv](https://docs.astral.sh/uv/)!** SafePO has migrated to uv for 10-100x faster package management. See [MIGRATION_TO_UV.md](MIGRATION_TO_UV.md) for details.
 - Feel free to open an [issue](https://github.com/PKU-Alignment/Safe-Policy-Optimization/issues) if you encounter any problem in Mac or Windows.
 - We have release [Documentation](https://safe-policy-optimization.readthedocs.io).
 - The **benchmark results** of SafePO can be viewed at [Wandb Report](https://safe-policy-optimization.readthedocs.io/en/latest/algorithms/general.html).
@@ -190,13 +191,38 @@ pip install -e .
 
 To use SafePO-Baselines, you need to install environments. Please refer to [Safety-Gymnasium](https://github.com/PKU-Alignment/safety-gymnasium) for more details on installation. Details regarding the installation of IsaacGym can be found [here](https://developer.nvidia.com/isaac-gym).
 
-## Conda-Environment
+## Installation with uv
+
+SafePO now uses [uv](https://docs.astral.sh/uv/) for fast and reliable package management. First, install uv:
 
 ```bash
-conda create -n safepo python=3.8
-conda activate safepo
-# because the cuda version, we recommend you install pytorch manual.
-pip install -e .
+# On macOS and Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# On Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then install SafePO:
+
+```bash
+git clone https://github.com/PKU-Alignment/Safe-Policy-Optimization.git
+cd Safe-Policy-Optimization
+uv sync
+```
+
+This will automatically:
+- Create a virtual environment with Python 3.8
+- Install all dependencies
+- Install SafePO in editable mode
+
+To activate the environment:
+
+```bash
+# uv will automatically use the virtual environment for `uv run` commands
+# Or manually activate:
+source .venv/bin/activate  # On Linux/macOS
+# .venv\Scripts\activate  # On Windows
 ```
 
 ## Getting Started
@@ -206,16 +232,18 @@ pip install -e .
 To verify the performance of SafePO, you can run the following:
 
 ```bash
-conda create -n safepo python=3.8
-conda activate safepo
+git clone https://github.com/PKU-Alignment/Safe-Policy-Optimization.git
+cd Safe-Policy-Optimization
+uv sync
 make benchmark
 ```
 
 We also support simple benchmark commands for single-agent and multi-agent algorithms:
 
 ```bash
-conda create -n safepo python=3.8
-conda activate safepo
+git clone https://github.com/PKU-Alignment/Safe-Policy-Optimization.git
+cd Safe-Policy-Optimization
+uv sync
 make simple-benchmark
 ```
 
@@ -223,14 +251,13 @@ The above commands will run all algorithms in sampled environments to get
 a quick overview of the performance of the algorithms.
 
 **Please notice that these commands would reinstall Safety-Gymnasium from PyPI.
-To run Safe Isaac Gym and Safe MultiGoal, please reinstall it manully from source by:**
+To run Safe Isaac Gym and Safe MultiGoal, please reinstall it manually from source by:**
 
 ```bash
-conda activate safepo
 wget https://github.com/PKU-Alignment/safety-gymnasium/archive/refs/heads/main.zip
 unzip main.zip
 cd safety-gymnasium-main
-pip install -e .
+uv pip install -e .
 ```
 
 ### Single-Agent
@@ -239,14 +266,14 @@ Each algorithm file is the entrance. Running `ALGO.py` with arguments about algo
 
 ```bash
 cd safepo/single_agent
-python ppo_lag.py --task SafetyPointGoal1-v0 --seed 0
+uv run python ppo_lag.py --task SafetyPointGoal1-v0 --seed 0
 ```
 
 To run a benchmark parallelly, for example, you can use the following commands to run `PPO-Lag`, `TRPO-Lag` in `SafetyAntVelocity-v1`, `SafetyHalfCheetahVelocity-v1`: 
 
 ```bash
 cd safepo/single_agent
-python benchmark.py --tasks SafetyAntVelocity-v1 SafetyHalfCheetahVelocity-v1 --algo ppo_lag trpo_lag --workers 2
+uv run python benchmark.py --tasks SafetyAntVelocity-v1 SafetyHalfCheetahVelocity-v1 --algo ppo_lag trpo_lag --workers 2
 ```
 
 Commands above will run two processes in parallel, each process will run one algorithm in one environment. The results will be saved in `./runs/`.
@@ -259,14 +286,14 @@ To train a multi-agent algorithm:
 
 ```bash
 cd safepo/multi_agent
-python macpo.py --task Safety2x4AntVelocity-v0 --experiment benchmark
+uv run python macpo.py --task Safety2x4AntVelocity-v0 --experiment benchmark
 ```
 
 You can also train on Isaac Gym based environment if you have installed [Isaac Gym](https://developer.nvidia.com/isaac-gym).
 
 ```bash
 cd safepo/multi_agent
-python macpo.py --task ShadowHandOver_Safe_joint --experiment benchmark
+uv run python macpo.py --task ShadowHandOver_Safe_joint --experiment benchmark
 ```
 
 ### Experiment Evaluation
@@ -275,14 +302,14 @@ After running the experiment, you can use the following command to plot the resu
 
 ```bash
 cd safepo
-python plot.py --logdir ./runs/benchmark
+uv run python plot.py --logdir ./runs/benchmark
 ```
 
 To evaluate the performance of the algorithm, you can use the following command:
 
 ```bash
 cd safepo
-python evaluate.py --benchmark-dir ./runs/benchmark
+uv run python evaluate.py --benchmark-dir ./runs/benchmark
 ```
 
 ## Machine Configuration

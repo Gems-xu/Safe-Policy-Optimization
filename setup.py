@@ -13,39 +13,15 @@
 # limitations under the License.
 # ==============================================================================
 
-from setuptools import find_packages, setup
+"""
+Legacy setup.py for backward compatibility.
 
-setup(
-    name='safepo',
-    packages=[package for package in find_packages() if package.startswith('safepo')],
-    package_data={'safepo': ['py.typed', 'version.txt']},
-    install_requires=[
-        'joblib',
-        'scipy',
-        "torch >= 1.10.0",
-        'tensorboard >= 2.8.0',
-        "wandb >= 0.13.0",
-        'pyyaml >= 6.0',
-        'matplotlib >= 3.7.1',
-        "seaborn >= 0.12.2",
-        "pandas >=  1.5.3",
-        'safety-gymnasium',
-        "rich>=13.3.0",
-        "moviepy>=1.0.3",
-    ],
-    description='Pytorch version of Safe Reinforcement Learning Algorithm',
-    author='OmniSafeAI Team',
-    url='https://github.com/OmniSafeAI/Safe-Policy-Optimization',
-    author_email='jiamg.ji@gmail.com',
-    keywords='Safe Single Agent Reinforcement Learning'
-    'Safe Mult Agent Rinforcement Learning',
-    license='Apache License 2.0',
-    version='1.0.1',
-    python_requires='>=3.8',
-    classifiers=[
-        'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
-    ],
-)
+This project now uses pyproject.toml for all configuration.
+This file is kept only for backward compatibility with older tools.
+Please use 'uv sync' or 'pip install .' for installation.
+"""
+
+from setuptools import setup
+
+# All configuration is now in pyproject.toml
+setup()

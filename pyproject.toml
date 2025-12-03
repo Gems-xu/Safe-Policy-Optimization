@@ -1,0 +1,126 @@
+# Copyright 2023 OmniSafeAI Team. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+[project]
+name = "safepo"
+version = "1.0.1"
+description = "Pytorch version of Safe Reinforcement Learning Algorithm"
+authors = [
+    { name = "Gems-Xu", email = "gems_xu@outlook.com" }
+]
+keywords = [
+    "Safe Single Agent Reinforcement Learning",
+    "Safe Multi Agent Reinforcement Learning"
+]
+readme = "README.md"
+license = { text = "Apache License 2.0" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: Apache Software License",
+]
+
+dependencies = [
+    "joblib",
+    "scipy",
+    "torch>=1.10.0,<2.5.0",
+    "tensorboard>=2.8.0",
+    "wandb>=0.13.0",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7.1",
+    "seaborn>=0.12.2",
+    "pandas>=1.5.3",
+    "safety-gymnasium",
+    "rich>=13.3.0",
+    "moviepy>=1.0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-xdist",
+    "black",
+    "isort",
+    "pylint",
+    "mypy",
+]
+
+docs = [
+    "furo",
+    "sphinx",
+    "myst-parser",
+    "sphinx-autobuild",
+    "sphinx-copybutton",
+    "sphinx-design",
+    "moviepy",
+    "pygame",
+    "sphinx_github_changelog",
+    "sphinxcontrib-spelling",
+    "pydocstyle[toml]",
+    "doc8",
+    "sphinx-autoapi",
+    "sphinx-autodoc-typehints",
+    "pyenchant",
+]
+
+mujoco = [
+    "mujoco-py==2.0.2.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/OmniSafeAI/Safe-Policy-Optimization"
+Repository = "https://github.com/OmniSafeAI/Safe-Policy-Optimization"
+Documentation = "https://safe-policy-optimization.readthedocs.io"
+"Bug Tracker" = "https://github.com/OmniSafeAI/Safe-Policy-Optimization/issues"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["safepo"]
+
+[tool.setuptools.package-data]
+safepo = ["py.typed", "version.txt"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "pytest-xdist>=2.0.0",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --color=yes"
