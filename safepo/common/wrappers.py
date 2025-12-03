@@ -89,6 +89,12 @@ class MultiGoalEnv():
         # These are actually PettingZoo-style multi-agent environments
         if "Point" in task:
             base_task = "SafetyPointGoal1-v0"  # Use single-agent version as base
+        elif "Car" in task and "Racecar" not in task:  # Check Car before Racecar
+            base_task = "SafetyCarGoal1-v0"
+        elif "Racecar" in task:
+            base_task = "SafetyRacecarGoal1-v0"
+        elif "Doggo" in task:
+            base_task = "SafetyDoggoGoal1-v0"
         elif "Ant" in task:
             base_task = "SafetyAntGoal1-v0"
         else:
@@ -192,6 +198,7 @@ class MultiGoalEnv():
         obs, reward, cost, terminated, truncated, info = self.env.step(action)
         
         # Simulate multi-agent by duplicating the results
+        # Return scalar values for each agent (not lists) to match ShareEnv format
         rewards = [reward, reward * 0.5]  # Different rewards for each agent
         costs = [cost, cost * 0.5]
         dones = [terminated or truncated, terminated or truncated]
@@ -231,72 +238,83 @@ if SafeMAEnv is not None:
             )
             self.num_agents = len(self.agent_action_partitions)
             self.n_actions = max([len(l) for l in self.agent_action_partitions])
-            self.share_obs_size = self._get_share_obs_size()
-            self.obs_size=self._get_obs_size()
+            
+            # Calculate obs and share_obs sizes directly without calling private methods
+            # This avoids AttributeError from SafeMAEnv's __getattr__ that blocks private attributes
+            state = self.env.state()
+            state_normed = (state - np.mean(state)) / (np.std(state) + 1e-8)
+            agent_id_feats = np.zeros(self.num_agents, dtype=np.float32)
+            obs_with_id = np.concatenate([state, agent_id_feats])
+            
+            self.share_obs_size = len(state_normed)
+            self.obs_size = len(obs_with_id)
             self.share_observation_spaces = {}
             self.observation_spaces={}
             for agent in range(self.num_agents):
                 self.share_observation_spaces[f"agent_{agent}"] = Box(low=-10, high=10, shape=(self.share_obs_size,)) 
                 self.observation_spaces[f"agent_{agent}"] = Box(low=-10, high=10, shape=(self.obs_size,)) 
 
-    def _get_obs(self):
-        state = self.env.state()
-        obs_n = []
-        for a in range(self.num_agents):
-            agent_id_feats = np.zeros(self.num_agents, dtype=np.float32)
-            agent_id_feats[a] = 1.0
-            obs_i = np.concatenate([state, agent_id_feats])
-            obs_i = (obs_i - np.mean(obs_i)) / np.std(obs_i)
-            obs_n.append(obs_i)
-        return obs_n
+        def _get_obs(self):
+            state = self.env.state()
+            obs_n = []
+            for a in range(self.num_agents):
+                agent_id_feats = np.zeros(self.num_agents, dtype=np.float32)
+                agent_id_feats[a] = 1.0
+                obs_i = np.concatenate([state, agent_id_feats])
+                obs_i = (obs_i - np.mean(obs_i)) / np.std(obs_i)
+                obs_n.append(obs_i)
+            return obs_n
 
-    def _get_obs_size(self):
-        return len(self._get_obs()[0])
+        def _get_obs_size(self):
+            return len(self._get_obs()[0])
 
-    def _get_share_obs(self):
-        state = self.env.state()
-        state_normed = (state - np.mean(state)) / (np.std(state)+1e-8)
-        share_obs = []
-        for _ in range(self.num_agents):
-            share_obs.append(state_normed)
-        return share_obs
+        def _get_share_obs(self):
+            state = self.env.state()
+            state_normed = (state - np.mean(state)) / (np.std(state)+1e-8)
+            share_obs = []
+            for _ in range(self.num_agents):
+                share_obs.append(state_normed)
+            return share_obs
 
-    def _get_share_obs_size(self):
-        return len(self._get_share_obs()[0])
+        def _get_share_obs_size(self):
+            return len(self._get_share_obs()[0])
 
-    def _get_avail_actions(self):
-        return np.ones(
-            shape=(
-                self.num_agents,
-                self.n_actions,
+        def _get_avail_actions(self):
+            return np.ones(
+                shape=(
+                    self.num_agents,
+                    self.n_actions,
+                )
             )
-        )
 
-    def reset(self, seed=None):
-        super().reset(seed=seed)
-        return self._get_obs(), self._get_share_obs(), self._get_avail_actions()
+        def reset(self, seed=None):
+            obs_dict, info = super().reset(seed=seed)
+            return self._get_obs(), self._get_share_obs(), self._get_avail_actions()
 
-    
-    def step(
-        self, actions: dict[str, np.ndarray]
-    ) -> tuple[
-        dict[str, np.ndarray],
-        dict[str, np.ndarray],
-        dict[str, np.ndarray],
-        dict[str, np.ndarray],
-        dict[str, str],
-    ]:
-        dict_actions={}
-        for agent_id, agent in enumerate(self.possible_agents):
-            dict_actions[agent]=actions[agent_id].cpu().numpy()
-        _, rewards, costs, terminations, truncations, infos = super().step(dict_actions)
-        dones={}
-        for agent_id, agent in enumerate(self.possible_agents):
-            dones[agent] = terminations[agent] or truncations[agent]
-            rewards[agent] = [rewards[agent]]
-            costs[agent]=[costs[agent]]
-        rewards, costs, dones, infos = list(rewards.values()), list(costs.values()), list(dones.values()), list(infos.values())
-        return self._get_obs(), self._get_share_obs(), rewards, costs, dones, infos, self._get_avail_actions()
+        
+        def step(
+            self, actions: dict[str, np.ndarray]
+        ) -> tuple[
+            dict[str, np.ndarray],
+            dict[str, np.ndarray],
+            dict[str, np.ndarray],
+            dict[str, np.ndarray],
+            dict[str, str],
+        ]:
+            dict_actions={}
+            for agent_id, agent in enumerate(self.possible_agents):
+                # Handle both torch tensors and numpy arrays
+                action = actions[agent_id]
+                if hasattr(action, 'cpu'):
+                    action = action.cpu().numpy()
+                dict_actions[agent] = action
+            _, rewards, costs, terminations, truncations, infos = super().step(dict_actions)
+            dones={}
+            for agent_id, agent in enumerate(self.possible_agents):
+                dones[agent] = terminations[agent] or truncations[agent]
+            # Keep rewards and costs as scalars, not lists, for proper shape handling
+            rewards, costs, dones, infos = list(rewards.values()), list(costs.values()), list(dones.values()), list(infos.values())
+            return self._get_obs(), self._get_share_obs(), rewards, costs, dones, infos, self._get_avail_actions()
 else:
     # SafeMAEnv not available - create a placeholder class
     class ShareEnv:
