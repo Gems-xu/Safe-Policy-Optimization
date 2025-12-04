@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safety_gymnasium"
+version = "1.2.1"
+description = "A highly scalable and customizable safe reinforcement learning environment."
+authors = [
+    { name = "Safety-Gymnasium Contributors" }
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "gymnasium==0.28.1",
+    "gymnasium-robotics==1.2.2",
+    "pygame==2.1.0",
+    "mujoco==2.3.3",
+    "xmltodict>=0.13.0",
+    "pyyaml>=6.0",
+    "imageio>=2.27.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/PKU-Alignment/safety-gymnasium"
+Repository = "https://github.com/PKU-Alignment/safety-gymnasium"
+Documentation = "https://www.safety-gymnasium.com"
+"Bug Report" = "https://github.com/PKU-Alignment/safety-gymnasium/issues"
+
+[tool.setuptools]
+packages = ["safety_gymnasium"]
+
+[tool.setuptools.package-data]
+safety_gymnasium = ["**/*.xml", "**/*.yaml", "**/*.py"]
+
