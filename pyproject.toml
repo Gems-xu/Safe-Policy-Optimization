@@ -45,12 +45,13 @@ dependencies = [
     "matplotlib>=3.7.1",
     "seaborn>=0.12.2",
     "pandas>=1.5.3",
-    "safety-gymnasium @ git+https://github.com/PKU-Alignment/safety-gymnasium.git@v1.2.0",
     "rich>=13.3.0",
     "moviepy>=1.0.3",
     "imageio>=2.0.0",
     "imageio-ffmpeg>=0.4.0",
     "tqdm>=4.65.0",
+    "safety-gymnasium @ file:///./safety_gymnasium",
+    "nvitop>=1.6.0",
 ]
 
 [project.optional-dependencies]
@@ -83,7 +84,7 @@ docs = [
 ]
 
 mujoco = [
-    "mujoco-py==2.0.2.7",
+    "mujoco==2.3.3",
 ]
 
 [project.urls]
@@ -127,3 +128,11 @@ disallow_untyped_defs = false
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --color=yes"
+
+[tool.uv.workspace]
+members = [
+    "safety_gymnasium",
+]
+
+[tool.uv.sources]
+safety-gymnasium = { workspace = true }
