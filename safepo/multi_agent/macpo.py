@@ -381,7 +381,7 @@ class MACPO_Trainer():
 
         return value_loss, critic_grad_norm, kl, loss_improve, expected_improve, dist_entropy, ratio, cost_loss, cost_grad_norm, whether_recover_policy_value, cost_preds_batch, cost_returns_barch, B_cost_loss_grad, lam, nu, g_step_dir, b_step_dir, x, action_mu, action_std, B_cost_loss_grad_dot
 
-    def train(self, buffer, logger):
+    def train(self, buffer, logger, agent_id):
         advantages = buffer.returns[:-1] - self.value_normalizer.denormalize(buffer.value_preds[:-1])
 
         advantages_copy = advantages.clone()
@@ -396,24 +396,43 @@ class MACPO_Trainer():
         std_cost_adv = cost_adv_copy.std()
         cost_adv = (cost_adv - mean_cost_adv) / (std_cost_adv + 1e-5)
 
+        # Accumulate losses across mini-batches
+        train_info = {
+            "value_loss": 0,
+            "cost_loss": 0,
+            "loss_improve": 0,
+            "expected_improve": 0,
+            "critic_grad_norm": 0,
+            "cost_grad_norm": 0,
+            "dist_entropy": 0,
+            "imp_weights": 0,
+            "kl": 0,
+        }
+        num_updates = 0
+        
         data_generator = buffer.feed_forward_generator(advantages, self.config["num_mini_batch"], cost_adv=cost_adv)
         for sample in data_generator:
             value_loss, critic_grad_norm, kl, loss_improve, expected_improve, dist_entropy, imp_weights, cost_loss, cost_grad_norm, whether_recover_policy_value, cost_preds_batch, cost_returns_barch, B_cost_loss_grad, lam, nu, g_step_dir, b_step_dir, x, action_mu, action_std, B_cost_loss_grad_dot \
                 = self.trpo_update(sample)
-                
-            logger.store(
-                **{
-                    "Loss/Loss_reward_critic": value_loss.item(),
-                    "Loss/Loss_cost_critic": cost_loss.item(),
-                    "Loss/Loss_actor_improve": loss_improve.item(),
-                    "Loss/Loss_actor_expected_improve": expected_improve.item(),
-                    "Misc/Reward_critic_norm": critic_grad_norm.item(),
-                    "Misc/Cost_critic_norm": cost_grad_norm.item(),
-                    "Misc/Entropy": dist_entropy.item(),
-                    "Misc/Ratio": imp_weights.detach().mean().item(),
-                    "Misc/KL": kl.detach().item(),
-                }
-            )
+            
+            # Accumulate losses
+            train_info["value_loss"] += value_loss.item()
+            train_info["cost_loss"] += cost_loss.item()
+            train_info["loss_improve"] += loss_improve.item()
+            train_info["expected_improve"] += expected_improve.item()
+            train_info["critic_grad_norm"] += critic_grad_norm.item()
+            train_info["cost_grad_norm"] += cost_grad_norm.item()
+            train_info["dist_entropy"] += dist_entropy.item()
+            train_info["imp_weights"] += imp_weights.detach().mean().item()
+            train_info["kl"] += kl.detach().item()
+            num_updates += 1
+        
+        # Average over mini-batches
+        for k in train_info:
+            train_info[k] /= num_updates
+        
+        # Return train_info for aggregation across agents (don't log per-agent metrics)
+        return train_info
 
     def prep_training(self):
         self.policy.actor.train()
@@ -505,16 +524,18 @@ class Runner:
         train_episode_costs = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
         eval_rewards=0.0
         eval_costs=0.0
+        step = 0
         pbar = tqdm(range(episodes), desc="Training", ncols=100)
         for episode in pbar:
 
             done_episodes_rewards = []
             done_episodes_costs = []
+            episode_steps_list = []  # Track steps for each completed episode
 
-            for step in range(self.config["episode_length"]):
+            for env_step in range(self.config["episode_length"]):
                 # Sample actions
                 values, actions, action_log_probs, rnn_states, rnn_states_critic, cost_preds, \
-                rnn_states_cost = self.collect(step)
+                rnn_states_cost = self.collect(env_step)
                 obs, share_obs, rewards, costs, dones, infos, _ = self.envs.step(actions)
 
                 dones_env = torch.all(dones, dim=1)
@@ -524,12 +545,14 @@ class Runner:
 
                 train_episode_rewards += reward_env
                 train_episode_costs += cost_env
+                step += self.config["n_rollout_threads"]
 
                 for t in range(self.config["n_rollout_threads"]):
                     if dones_env[t]:
                         done_episodes_rewards.append(train_episode_rewards[:, t].clone())
-                        train_episode_rewards[:, t] = 0
                         done_episodes_costs.append(train_episode_costs[:, t].clone())
+                        episode_steps_list.append(step)
+                        train_episode_rewards[:, t] = 0
                         train_episode_costs[:, t] = 0
 
                 done_episodes_costs_aver = train_episode_costs.mean()
@@ -541,35 +564,36 @@ class Runner:
             self.compute()
             self.train()
 
-            total_num_steps = (episode + 1) * self.config["episode_length"] * self.config["n_rollout_threads"]
-
             if (episode % self.config["save_interval"] == 0 or episode == episodes - 1):
                 self.save()
                 
             end = time.time()
             
-            if episode % self.config["eval_interval"] == 0 and self.config["use_eval"]:
-                eval_rewards, eval_costs = self.eval(eval_episodes=1, total_steps=total_num_steps)
+            # Evaluate if needed
+            should_eval = episode % self.config["eval_interval"] == 0 and self.config["use_eval"]
+            if should_eval:
+                eval_rewards, eval_costs = self.eval(eval_episodes=1, total_steps=step)
 
-            if len(done_episodes_rewards) != 0:
-                aver_episode_rewards = torch.stack(done_episodes_rewards).mean()
-                aver_episode_costs = torch.stack(done_episodes_costs).mean()
-                self.return_aver_cost(aver_episode_costs)
+            # Store each completed episode separately with its corresponding step
+            for ep_ret, ep_cost, ep_steps in zip(done_episodes_rewards, done_episodes_costs, episode_steps_list):
+                self.return_aver_cost(ep_cost)
                 self.logger.store(
                     **{
-                        "Metrics/EpRet": aver_episode_rewards.item(),
-                        "Metrics/EpCost": aver_episode_costs.item(),
-                        "Eval/EpRet": eval_rewards,
-                        "Eval/EpCost": eval_costs,
+                        "Metrics/EpRet": ep_ret.item(),
+                        "Metrics/EpCost": ep_cost.item(),
                     }
                 )
-                
+            
+            if len(done_episodes_rewards) != 0:
+                # Log training metrics
                 self.logger.log_tabular("Metrics/EpRet", min_and_max=True, std=True)
                 self.logger.log_tabular("Metrics/EpCost", min_and_max=True, std=True)
-                self.logger.log_tabular("Eval/EpRet")
-                self.logger.log_tabular("Eval/EpCost")
+                # Only log eval metrics when eval was actually performed
+                if should_eval:
+                    self.logger.log_tabular("Eval/EpRet", eval_rewards)
+                    self.logger.log_tabular("Eval/EpCost", eval_costs)
                 self.logger.log_tabular("Train/Epoch", episode)
-                self.logger.log_tabular("Train/TotalSteps", total_num_steps)
+                self.logger.log_tabular("Train/Step", step)
                 self.logger.log_tabular("Loss/Loss_reward_critic")
                 self.logger.log_tabular("Loss/Loss_cost_critic")
                 self.logger.log_tabular("Loss/Loss_actor_improve")
@@ -580,15 +604,15 @@ class Runner:
                 self.logger.log_tabular("Misc/Ratio")
                 self.logger.log_tabular("Misc/KL")
                 self.logger.log_tabular("Time/Total", end - start)
-                self.logger.log_tabular("Time/FPS", int(total_num_steps / (end - start)))
-                self.logger.dump_tabular()
+                self.logger.log_tabular("Time/FPS", int(step / (end - start)))
+                self.logger.dump_tabular(step=step)
                 
-                # Update tqdm progress bar with key metrics
+                # Update tqdm progress bar with key metrics (use mean)
+                aver_episode_rewards = torch.stack(done_episodes_rewards).mean()
+                aver_episode_costs = torch.stack(done_episodes_costs).mean()
                 pbar.set_postfix({
                     'EpRet': f"{aver_episode_rewards.item():.2f}",
                     'EpCost': f"{aver_episode_costs.item():.2f}",
-                    # 'EvalRet': f"{eval_rewards:.2f}",
-                    # 'EvalCost': f"{eval_costs:.2f}",
                 })
         pbar.close()
 
@@ -686,6 +710,19 @@ class Runner:
         action_dim = 1
         factor = torch.ones(self.config["episode_length"], self.config["n_rollout_threads"], action_dim, device=self.config["device"])
 
+        # Accumulate training info across agents
+        avg_train_info = {
+            "value_loss": 0,
+            "cost_loss": 0,
+            "loss_improve": 0,
+            "expected_improve": 0,
+            "critic_grad_norm": 0,
+            "cost_grad_norm": 0,
+            "dist_entropy": 0,
+            "imp_weights": 0,
+            "kl": 0,
+        }
+        
         for agent_id in torch.randperm(self.num_agents):
             action_dim=self.buffer[agent_id].actions.shape[-1]
 
@@ -701,7 +738,12 @@ class Runner:
                 self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
                 available_actions,
                 self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
-            self.trainer[agent_id].train(self.buffer[agent_id], logger=self.logger)
+            
+            train_info = self.trainer[agent_id].train(self.buffer[agent_id], logger=self.logger, agent_id=agent_id)
+            
+            # Accumulate for average
+            for k in avg_train_info:
+                avg_train_info[k] += train_info[k]
 
             new_actions_logprob, _, _, _ = self.trainer[agent_id].policy.actor.evaluate_actions(
                 self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
@@ -714,6 +756,24 @@ class Runner:
             action_prod = torch.prod(torch.exp(new_actions_logprob.detach()-old_actions_logprob.detach()).reshape(self.config["episode_length"],self.config["n_rollout_threads"],action_dim), dim=-1, keepdim=True)
             factor = factor*action_prod.detach()
             self.buffer[agent_id].after_update()
+        
+        # Store average losses across all agents
+        for k in avg_train_info:
+            avg_train_info[k] /= self.num_agents
+        
+        self.logger.store(
+            **{
+                "Loss/Loss_reward_critic": avg_train_info["value_loss"],
+                "Loss/Loss_cost_critic": avg_train_info["cost_loss"],
+                "Loss/Loss_actor_improve": avg_train_info["loss_improve"],
+                "Loss/Loss_actor_expected_improve": avg_train_info["expected_improve"],
+                "Misc/Reward_critic_norm": avg_train_info["critic_grad_norm"],
+                "Misc/Cost_critic_norm": avg_train_info["cost_grad_norm"],
+                "Misc/Entropy": avg_train_info["dist_entropy"],
+                "Misc/Ratio": avg_train_info["imp_weights"],
+                "Misc/KL": avg_train_info["kl"],
+            }
+        )
 
     def save(self):
         for agent_id in range(self.num_agents):

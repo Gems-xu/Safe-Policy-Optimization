@@ -148,6 +148,7 @@ class Logger:
         self._csv_writer = csv.writer(self.output_file)
 
         self.epoch = 0
+        self.current_step = None  # For WandB step tracking
         self.first_row = True
         self.log_headers = []
         self.log_current_row = {}
@@ -164,16 +165,21 @@ class Logger:
         
         # Setup wandb logging if enabled
         if self.use_wandb:
-            if wandb_project is None:
-                wandb_project = "safepo"
-            wandb_config = wandb_config or {}
-            self.wandb_run = wandb.init(
-                project=wandb_project,
-                name=self.exp_name,
-                dir=self.log_dir,
-                config=wandb_config,
-                resume="allow",
-            )
+            try:
+                if wandb_project is None:
+                    wandb_project = "safepo"
+                wandb_config = wandb_config or {}
+                self.wandb_run = wandb.init(
+                    project=wandb_project,
+                    name=self.exp_name,
+                    dir=self.log_dir,
+                    config=wandb_config,
+                    resume="allow",
+                )
+            except Exception as e:
+                print(f"Warning: Failed to initialize wandb: {e}")
+                self.use_wandb = False
+                self.wandb_run = None
 
     def close(self):
         """Close the output file.
@@ -333,13 +339,35 @@ class Logger:
                 self.summary_writer.add_scalar(key, val, global_step=self.epoch)
         
         if self.use_wandb and self.wandb_run is not None:
-            wandb_log = {key: val for key, val in self.log_current_row.items() if isinstance(val, (int, float, np.integer, np.floating))}
-            wandb_log["epoch"] = self.epoch
-            self.wandb_run.log(wandb_log)
+            try:
+                wandb_log = {key: val for key, val in self.log_current_row.items() if isinstance(val, (int, float, np.integer, np.floating))}
+                wandb_log["epoch"] = self.epoch
+                # Use current_step if available, otherwise use epoch
+                step = self.current_step if self.current_step is not None else self.epoch
+                self.wandb_run.log(wandb_log, step=step)
+            except Exception as e:
+                print(f"Warning: Failed to log to wandb: {e}")
 
         # free logged information in all processes...
         self.log_current_row.clear()
         self.first_row = False
+
+    def log_episode_metrics(self, ep_ret, ep_cost, step, eval_ret, eval_cost, epoch, total_num_steps, time_elapsed):
+        """Log individual episode metrics with explicit step to WandB."""
+        if self.use_wandb and self.wandb_run is not None:
+            try:
+                wandb_log = {
+                    "Metrics/EpRet": ep_ret,
+                    "Metrics/EpCost": ep_cost,
+                    "Eval/EpRet": eval_ret,
+                    "Eval/EpCost": eval_cost,
+                    "Train/Epoch": epoch,
+                    "Train/Step": total_num_steps,
+                    "Time/Elapsed": time_elapsed,
+                }
+                self.wandb_run.log(wandb_log, step=step)
+            except Exception as e:
+                print(f"Warning: Failed to log episode metrics to wandb: {e}")
 
 
 class EpochLogger(Logger):
@@ -371,12 +399,16 @@ class EpochLogger(Logger):
         )
         self.epoch_dict = dict()
 
-    def dump_tabular(self):
+    def dump_tabular(self, step=None):
         self.logged = True
+        # Set current_step before calling parent dump_tabular
+        if step is not None:
+            self.current_step = step
         super().dump_tabular()
         for k, v in self.epoch_dict.items():
             if len(v) > 0:
                 print(f"epoch_dict: key={k} was not logged.")
+        self.current_step = None
 
     def store(self, add_value=False, **kwargs):
         for k, v in kwargs.items():
