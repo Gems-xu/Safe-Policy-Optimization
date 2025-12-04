@@ -75,6 +75,24 @@ except NameError:
     pass
 
 class MultiGoalEnv():
+    """
+    Wrapper for safety_gymnasium's true multi-agent MultiGoal environments.
+    
+    This environment contains multiple agents (e.g., 2 Point robots) that need to
+    navigate to their respective colored goals while avoiding hazards and each other.
+    
+    Supported task formats:
+        - SafetyPointMultiGoal{0,1,2}-v0
+        - SafetyCarMultiGoal{0,1,2}-v0
+        - SafetyRacecarMultiGoal{0,1,2}-v0
+        - SafetyDoggoMultiGoal{0,1,2}-v0
+        - SafetyAntMultiGoal{0,1,2}-v0
+    
+    Where the level (0, 1, 2) determines difficulty:
+        - Level 0: Just goals, no obstacles
+        - Level 1: Goals + hazards (8) + vases (1, no cost)
+        - Level 2: Goals + hazards (10) + vases (10, with cost)
+    """
     
     def __init__(
         self,
@@ -82,133 +100,194 @@ class MultiGoalEnv():
         seed,
         width=1024,
         height=1024,
-        camera_name='fixedfar',  # Fixed bird's-eye view camera (height ~5)
+        camera_name='fixedfar',  # Fixed bird's-eye view camera
     ):
-        # Multi-goal tasks need to be created differently
-        # Extract base task name (e.g., "SafetyPointMultiGoal0-v0" -> use "SafetyPointGoal1-v0")
-        # These are actually PettingZoo-style multi-agent environments
-        if "Point" in task:
-            base_task = "SafetyPointGoal1-v0"  # Use single-agent version as base
-        elif "Car" in task and "Racecar" not in task:  # Check Car before Racecar
-            base_task = "SafetyCarGoal1-v0"
-        elif "Racecar" in task:
-            base_task = "SafetyRacecarGoal1-v0"
-        elif "Doggo" in task:
-            base_task = "SafetyDoggoGoal1-v0"
-        elif "Ant" in task:
-            base_task = "SafetyAntGoal1-v0"
-        else:
-            base_task = "SafetyPointGoal1-v0"
+        """
+        Initialize the MultiGoal multi-agent environment.
         
-        # Create the underlying single-agent environment with render mode for video recording
-        # Use 512x512 for bird's-eye view video recording with fixed camera
+        Args:
+            task: Task name like "SafetyPointMultiGoal1-v0"
+            seed: Random seed
+            width: Render width
+            height: Render height  
+            camera_name: Camera name for rendering
+        """
+        # Create the true multi-agent environment from safety_gymnasium
+        # The task name is used directly (e.g., "SafetyPointMultiGoal1-v0")
         self.env = safety_gymnasium.make(
-            base_task, 
-            render_mode='rgb_array', 
-            width=width, 
+            task, 
+            render_mode='rgb_array',
+            width=width,
             height=height,
-            camera_name=camera_name  # Fixed bird's-eye view, not tracking agent
+            camera_name=camera_name,
         )
         
-        # For now, simulate multi-agent by duplicating the action/observation spaces
-        self.single_action_space = self.env.action_space
+        self.task = task
+        self._seed = seed
         
-        self.action_spaces = {
-            'agent_0': self.env.action_space,
-            'agent_1': self.env.action_space,
-        }
-        self.env.reset(seed=seed)
-        self.num_agents = 2
-        self.n_actions = self.single_action_space.shape[0]
-        self.share_obs_size = self._get_share_obs_size()
-        self.obs_size=self._get_obs_size()
-        self.share_observation_spaces = {}
+        # Get agents info from the PettingZoo-style environment
+        self.possible_agents = self.env.possible_agents  # ['agent_0', 'agent_1']
+        self.num_agents = len(self.possible_agents)
+        
+        # Get action and observation spaces for each agent
+        self.action_spaces = {}
         self.observation_spaces = {}
-        for agent in range(self.num_agents):
-            self.share_observation_spaces[f"agent_{agent}"] = Box(low=-10, high=10, shape=(self.share_obs_size,)) 
-            self.observation_spaces[f"agent_{agent}"] = Box(low=-10, high=10, shape=(self.obs_size,)) 
-
-    def __getattr__(self, name: str) -> Any:
-        """Returns an attribute with ``name``, unless ``name`` starts with an underscore."""
-        if name.startswith('_'):
-            raise AttributeError(f"accessing private attribute '{name}' is prohibited")
-        return getattr(self.env, name)
+        for agent in self.possible_agents:
+            self.action_spaces[agent] = self.env.action_space(agent)
+            self.observation_spaces[agent] = self.env.observation_space(agent)
+        
+        # n_actions is the action dimension (e.g., 2 for Point robot)
+        self.n_actions = self.action_spaces['agent_0'].shape[0]
+        
+        # Initialize environment to get observation sizes
+        obs_dict, _ = self.env.reset(seed=seed)
+        
+        # For multi-agent, each agent gets its own observation
+        # share_obs is the concatenation of all agents' observations for centralized critic
+        sample_obs = obs_dict['agent_0']
+        self.obs_size = len(sample_obs)
+        
+        # Share observation: concatenate all agent observations
+        # This gives the centralized critic full observability
+        self.share_obs_size = self.obs_size * self.num_agents
+        
+        # Create share_observation_spaces (for centralized critic)
+        self.share_observation_spaces = {}
+        for agent in self.possible_agents:
+            self.share_observation_spaces[agent] = Box(
+                low=-np.inf, 
+                high=np.inf, 
+                shape=(self.share_obs_size,),
+                dtype=np.float64
+            )
+        
+        # Store last observation for _get_obs methods
+        self._last_obs_dict = obs_dict
 
     def _get_obs(self):
-        state = self.env.task.obs()
+        """Get observations for all agents."""
         obs_n = []
-        for a in range(self.num_agents):
-            agent_id_feats = np.zeros(self.num_agents, dtype=np.float32)
-            agent_id_feats[a] = 1.0
-            obs_i = np.concatenate([state, agent_id_feats])
-            obs_i = (obs_i - np.mean(obs_i)) / np.std(obs_i)
-            obs_n.append(obs_i)
+        for agent in self.possible_agents:
+            obs = self._last_obs_dict[agent]
+            # Normalize observation
+            obs_normed = (obs - np.mean(obs)) / (np.std(obs) + 1e-8)
+            obs_n.append(obs_normed.astype(np.float32))
         return obs_n
 
-    def _get_obs_size(self):
-        return len(self._get_obs()[0])
-
     def _get_share_obs(self):
-        state = self.env.task.obs()
-        state_normed = (state - np.mean(state)) / (np.std(state)+1e-8)
+        """
+        Get shared observations for centralized critic.
+        Concatenates all agents' observations.
+        """
+        # Concatenate all agent observations
+        all_obs = []
+        for agent in self.possible_agents:
+            all_obs.append(self._last_obs_dict[agent])
+        
+        concat_obs = np.concatenate(all_obs)
+        concat_obs_normed = (concat_obs - np.mean(concat_obs)) / (np.std(concat_obs) + 1e-8)
+        
+        # Each agent gets the same shared observation
         share_obs = []
         for _ in range(self.num_agents):
-            share_obs.append(state_normed)
+            share_obs.append(concat_obs_normed.astype(np.float32))
         return share_obs
 
-    def _get_share_obs_size(self):
-        return len(self._get_share_obs()[0])
-
     def _get_avail_actions(self):
+        """Get available actions mask (all actions available for continuous control)."""
         return np.ones(
-            shape=(
-                self.num_agents,
-                self.n_actions,
-            )
+            shape=(self.num_agents, self.n_actions),
+            dtype=np.float32
         )
 
     def reset(self, seed=None):
-        self.env.reset(seed=seed)
+        """Reset the environment."""
+        if seed is None:
+            seed = self._seed
+        obs_dict, info = self.env.reset(seed=seed)
+        self._last_obs_dict = obs_dict
         return self._get_obs(), self._get_share_obs(), self._get_avail_actions()
 
-    
-    def step(
-        self, actions: dict[str, np.ndarray]
-    ) -> tuple[
-        dict[str, np.ndarray],
-        dict[str, np.ndarray],
-        dict[str, np.ndarray],
-        dict[str, np.ndarray],
-        dict[str, str],
-    ]:
-        # For multi-goal simulation, use the action from agent_0
-        # In a real multi-agent env, both agents would act
-        if isinstance(actions, (list, tuple)) and len(actions) > 0:
-            action = actions[0].cpu().numpy() if hasattr(actions[0], 'cpu') else actions[0]
+    def step(self, actions):
+        """
+        Step the environment with actions from all agents.
+        
+        Args:
+            actions: Either a list/array of actions [action_agent0, action_agent1, ...]
+                     or already a numpy array of shape (num_agents, action_dim)
+        
+        Returns:
+            obs: List of observations for each agent
+            share_obs: List of shared observations for centralized critic
+            rewards: List of rewards for each agent
+            costs: List of costs for each agent
+            dones: List of done flags for each agent
+            infos: List of info dicts for each agent
+            available_actions: Available actions mask
+        """
+        # Convert actions to dict format expected by PettingZoo environment
+        if isinstance(actions, (list, tuple)):
+            action_dict = {}
+            for i, agent in enumerate(self.possible_agents):
+                action = actions[i]
+                if hasattr(action, 'cpu'):
+                    action = action.cpu().numpy()
+                action_dict[agent] = action
         elif isinstance(actions, np.ndarray):
-            # If actions is a numpy array of shape (n_agents, action_dim), use first agent
-            if actions.ndim == 2:
-                action = actions[0]
-            else:
-                action = actions
+            action_dict = {}
+            for i, agent in enumerate(self.possible_agents):
+                action_dict[agent] = actions[i]
         else:
-            action = actions
+            action_dict = actions
         
-        # Step the single-agent environment
-        obs, reward, cost, terminated, truncated, info = self.env.step(action)
+        # Step the environment
+        obs_dict, rewards_dict, costs_dict, terminations_dict, truncations_dict, infos_dict = self.env.step(action_dict)
         
-        # Simulate multi-agent by duplicating the results
-        # Return scalar values for each agent (not lists) to match ShareEnv format
-        rewards = [reward, reward * 0.5]  # Different rewards for each agent
-        costs = [cost, cost * 0.5]
-        dones = [terminated or truncated, terminated or truncated]
-        infos = [info, info]
+        # Update last observations
+        self._last_obs_dict = obs_dict
         
-        return self._get_obs(), self._get_share_obs(), rewards, costs, dones, infos, self._get_avail_actions()
+        # Convert dicts to lists in agent order
+        # Handle both dict and scalar returns (safety_gymnasium may return scalar on truncation)
+        rewards = [rewards_dict[agent] for agent in self.possible_agents]
+        costs = [costs_dict[agent] for agent in self.possible_agents]
+        
+        # Handle terminations - can be dict or bool
+        if isinstance(terminations_dict, dict):
+            terminations_list = [terminations_dict[agent] for agent in self.possible_agents]
+        else:
+            terminations_list = [terminations_dict] * self.num_agents
+            
+        # Handle truncations - can be dict or bool  
+        if isinstance(truncations_dict, dict):
+            truncations_list = [truncations_dict[agent] for agent in self.possible_agents]
+        else:
+            truncations_list = [truncations_dict] * self.num_agents
+            
+        dones = [t or tr for t, tr in zip(terminations_list, truncations_list)]
+        
+        # Handle infos - can be dict or other
+        if isinstance(infos_dict, dict) and self.possible_agents[0] in infos_dict:
+            infos = [infos_dict[agent] for agent in self.possible_agents]
+        else:
+            infos = [infos_dict] * self.num_agents
+        
+        return (
+            self._get_obs(), 
+            self._get_share_obs(), 
+            rewards, 
+            costs, 
+            dones, 
+            infos, 
+            self._get_avail_actions()
+        )
     
     def render(self, mode='rgb_array'):
         """Render the environment."""
         return self.env.render()
+    
+    def close(self):
+        """Close the environment."""
+        self.env.close()
 
 
 # Only define ShareEnv if SafeMAEnv is available
