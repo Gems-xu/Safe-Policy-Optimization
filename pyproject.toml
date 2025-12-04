@@ -50,8 +50,8 @@ dependencies = [
     "imageio>=2.0.0",
     "imageio-ffmpeg>=0.4.0",
     "tqdm>=4.65.0",
-    "safety-gymnasium @ file:///./safety_gymnasium",
     "nvitop>=1.6.0",
+    "safety-gymnasium",
 ]
 
 [project.optional-dependencies]
