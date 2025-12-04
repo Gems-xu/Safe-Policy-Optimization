@@ -47,7 +47,7 @@ learning_iters: 5
 num_mini_batch: 1
 data_chunk_length: 
 value_loss_coef: 1
-entropy_coef: 0.0
+entropy_coef: 0.01  # FIXED: Changed from 0.0 to 0.01 to encourage exploration
 max_grad_norm: 10
 huber_delta: 10.0
 use_recurrent_policy: False
