@@ -159,10 +159,11 @@ class MultiAgentVideoRecorder:
         # Check NEXT episode (episode_count + 1) to see if it should be recorded
         return self.enabled and ((self.episode_count + 1) % self.record_freq == 0)
 
-    def start_episode(self) -> None:
+    def start_episode(self, force: bool = False) -> None:
         """Start recording a new episode if appropriate."""
         self.episode_count += 1
-        self.is_recording = self.enabled and (self.episode_count % self.record_freq == 0)
+        should_record = force or (self.episode_count % self.record_freq == 0)
+        self.is_recording = self.enabled and should_record
         if self.is_recording:
             self.recorder.clear()
 

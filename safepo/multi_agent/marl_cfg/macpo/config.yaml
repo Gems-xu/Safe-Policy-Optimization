@@ -3,9 +3,9 @@ algorithm_name: macpo
 experiment_name: check
 seed: 0
 run_dir: ./runs
-num_env_steps: 10000000
+num_env_steps: 40000000
 episode_length: 1000
-n_rollout_threads: 10
+n_rollout_threads: 20
 n_eval_rollout_threads: 1
 hidden_size: 512
 use_render: False
@@ -15,12 +15,13 @@ recurrent_N: 1
 use_wandb: True
 wandb_project: safepo
 record_video: True
-video_record_freq: 1  # Record video on first eval episode only
+video_record_freq: 1  # Recording frequency (overridden by max-reward recording)
+render_max_reward: -1.0e9  # Only upload eval video when an episode beats this reward
 
-save_interval: 50
+save_interval: 40
 use_eval: True
-eval_interval: 50
-log_interval: 50
+eval_interval: 20
+log_interval: 20
 eval_episodes: 10
 
 cost_limit: 25

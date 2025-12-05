@@ -460,6 +460,10 @@ class Runner:
 
         self.num_agents = self.envs.num_agents
 
+        # Track the best eval reward for conditional video rendering
+        self.render_max_reward = float(self.config.get("render_max_reward", float("-inf")))
+        self.config["render_max_reward"] = self.render_max_reward
+
         torch.autograd.set_detect_anomaly(True)
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = True
@@ -592,6 +596,7 @@ class Runner:
                 if should_eval:
                     self.logger.log_tabular("Eval/EpRet", eval_rewards)
                     self.logger.log_tabular("Eval/EpCost", eval_costs)
+                    # self.logger.log_tabular("Eval/render_max_reward", self.render_max_reward)
                 self.logger.log_tabular("Train/Epoch", episode)
                 self.logger.log_tabular("Train/Step", step)
                 self.logger.log_tabular("Loss/Loss_reward_critic")
@@ -762,6 +767,7 @@ class Runner:
             avg_train_info[k] /= self.num_agents
         
         self.logger.store(
+            add_value=False,
             **{
                 "Loss/Loss_reward_critic": avg_train_info["value_loss"],
                 "Loss/Loss_cost_critic": avg_train_info["cost_loss"],
@@ -796,13 +802,15 @@ class Runner:
         eval_episode_costs = []
         one_episode_rewards = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
         one_episode_costs = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
+        
+        # Track best episode that beats global max for video recording
+        best_episode_frames = []
+        best_episode_reward = 0.0
+        best_episode_cost = 0.0
+        best_episode_num = 0
+        current_frames = []
 
         eval_obs, _, _ = self.eval_envs.reset()
-        
-        # Start video recording for first eval episode only
-        should_record = self.video_recorder.should_record()
-        if should_record:
-            self.video_recorder.start_episode()
 
         eval_rnn_states = torch.zeros(self.config["n_eval_rollout_threads"], self.num_agents, self.config["recurrent_N"], self.config["hidden_size"],
                                    device=self.config["device"])
@@ -828,13 +836,13 @@ class Runner:
                 zeros = torch.zeros(eval_actions_collector[-1].shape[0], 1)
                 eval_actions_collector[-1]=torch.cat((eval_actions_collector[-1], zeros), dim=1)
             
-            # Capture frame for video (only for non-Isaac Gym envs and when recording)
-            if should_record and self.config["env_name"] not in isaac_gym_map:
+            # Capture frame for video (only for non-Isaac Gym envs)
+            if self.video_recorder.enabled and self.config["env_name"] not in isaac_gym_map:
                 try:
                     if hasattr(self.eval_envs, 'render'):
                         frame = self.eval_envs.render()
                         if frame is not None and len(frame.shape) == 3:
-                            self.video_recorder.capture_frame(frame)
+                            current_frames.append(frame.copy())
                 except Exception:
                     pass
 
@@ -851,7 +859,11 @@ class Runner:
             eval_dones_env = torch.all(eval_dones, dim=1)
 
             eval_rnn_states[eval_dones_env == True] = torch.zeros(
-                (eval_dones_env == True).sum(), self.num_agents, self.config["recurrent_N"], self.config["hidden_size"], device=self.config["device"])
+                (eval_dones_env == True).sum(), 
+                self.num_agents, 
+                self.config["recurrent_N"], 
+                self.config["hidden_size"], 
+                device=self.config["device"])
 
             eval_masks = torch.ones(self.config["n_eval_rollout_threads"], self.num_agents, 1, device=self.config["device"])
             eval_masks[eval_dones_env == True] = torch.zeros((eval_dones_env == True).sum(), self.num_agents, 1,
@@ -864,20 +876,37 @@ class Runner:
                     ep_cost = one_episode_costs[:, eval_i].mean().item()
                     eval_episode_rewards.append(ep_reward)
                     eval_episode_costs.append(ep_cost)
+
+                    # Only record episodes that beat global max, and keep the best one among them
+                    if ep_reward > self.render_max_reward:
+                        if len(best_episode_frames) == 0 or ep_reward > best_episode_reward:
+                            best_episode_frames = current_frames.copy()
+                            best_episode_reward = ep_reward
+                            best_episode_cost = ep_cost
+                            best_episode_num = eval_episode
                     
-                    # Upload video for first environment only if recording
-                    if eval_i == 0 and should_record:
-                        self.video_recorder.end_episode(
-                            episode_reward=ep_reward,
-                            episode_cost=ep_cost,
-                            step=total_steps
-                        )
-                        should_record = False  # Only record first eval episode
-                    
+                    # Clear current frames for next episode
+                    current_frames = []
+
                     one_episode_rewards[:, eval_i] = 0
                     one_episode_costs[:, eval_i] = 0
 
             if eval_episode >= eval_episodes:
+                # Upload video for the best episode if any episode beat the global max
+                if len(best_episode_frames) > 0:
+                    self.render_max_reward = best_episode_reward
+                    self.config["render_max_reward"] = self.render_max_reward
+                    
+                    # Upload the best episode from this eval run
+                    if self.video_recorder.enabled:
+                        self.video_recorder.recorder.frames = best_episode_frames
+                        caption = f"Episode {best_episode_num} - Reward: {best_episode_reward:.2f}, Cost: {best_episode_cost:.2f}"
+                        self.video_recorder.recorder.upload_to_wandb(
+                            caption=caption,
+                            step=total_steps,
+                            key="eval/video"
+                        )
+                
                 return np.mean(eval_episode_rewards), np.mean(eval_episode_costs)
 
     @torch.no_grad()
@@ -934,7 +963,7 @@ def train(args, cfg_train):
     runner = Runner(env, eval_env, cfg_train, args.model_dir)
 
     if args.model_dir != "":
-        runner.eval(100000)
+        runner.eval(10)
     else:
         runner.run()
 
