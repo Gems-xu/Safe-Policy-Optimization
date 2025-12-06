@@ -238,8 +238,17 @@ def multi_agent_args(algo):
             raise Exception("Please install isaacgym to run Isaac Gym tasks!")
         args = gymutil.parse_arguments(description="RL Policy", custom_parameters=issac_parameters)
         args.device = args.sim_device_type if args.use_gpu_pipeline else 'cpu'
-    cfg_train_path = "marl_cfg/{}/config.yaml".format(algo)
     base_path = os.path.dirname(os.path.abspath(__file__)).replace("utils", "multi_agent")
+    
+    # Auto-select optimized config for Point MultiGoal tasks
+    if args.task.startswith("SafetyPoint") and "MultiGoal" in args.task:
+        cfg_train_path = "marl_cfg/{}/config_point_multigoal.yaml".format(algo)
+        # Check if optimized config exists, otherwise fall back to default
+        if not os.path.exists(os.path.join(base_path, cfg_train_path)):
+            cfg_train_path = "marl_cfg/{}/config.yaml".format(algo)
+    else:
+        cfg_train_path = "marl_cfg/{}/config.yaml".format(algo)
+    
     with open(os.path.join(base_path, cfg_train_path), 'r') as f:
         cfg_train = yaml.load(f, Loader=yaml.SafeLoader)
         if args.task in multi_agent_velocity_map.keys():
