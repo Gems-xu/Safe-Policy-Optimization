@@ -3,9 +3,9 @@ algorithm_name: macpo
 experiment_name: point_multigoal
 seed: 0
 run_dir: ./runs
-num_env_steps: 10000000
+num_env_steps: 12000000  # Balanced training duration
 episode_length: 1000
-n_rollout_threads: 20
+n_rollout_threads: 24  # Balanced sampling diversity
 n_eval_rollout_threads: 1
 hidden_size: 256  # Reduced from 512 to prevent overfitting on low-dim control
 use_render: False
@@ -25,33 +25,33 @@ log_interval: 10
 eval_episodes: 10
 
 # Safety constraints - tuned for Point robot
-cost_limit: 20  # Reduced from 25 to enforce better safety
+cost_limit: 30  # Further relaxed to encourage both agents to move
 EPS: 1.e-8
-safety_gamma: 0.12  # Increased from 0.09 for stricter cost control
+safety_gamma: 0.08  # Reduced to allow more freedom
 step_fraction: 0.5
 g_step_dir_coef: 0.1
 b_step_dir_coef: 0.1
 fraction_coef: 0.1
 
 # Value function and GAE
-gamma: 0.96
-gae_lambda: 0.95
+gamma: 0.95  # Reduced to emphasize short-term coordination
+gae_lambda: 0.94  # Sharper advantage estimates for clearer signals
 use_gae: True
 use_popart: True
 use_valuenorm: True
 use_proper_time_limits: False
 
 # Policy optimization - adjusted for Point's 2D control space
-target_kl: 0.01  # More conservative updates
-searching_steps: 10
-conjugate_gradient_iters: 15  # Increased from 10
+target_kl: 0.008  # Tighter constraint to prevent policy collapse
+searching_steps: 15  # More aggressive line search
+conjugate_gradient_iters: 18  # Balance between accuracy and speed
 accept_ratio: 0.5
 clip_param: 0.2
-learning_iters: 8  # Increased from 5 for thorough training
-num_mini_batch: 1
+learning_iters: 12  # More thorough updates
+num_mini_batch: 2  # CRITICAL: Reduced from 3, balance variance and stability
 data_chunk_length: 
-value_loss_coef: 1
-entropy_coef: 0.02  # Increased from 0.01 to encourage exploration
+value_loss_coef: 1.2  # Increased to strengthen value learning
+entropy_coef: 0.025  # Reduced from 0.04, moderate exploration
 max_grad_norm: 10
 huber_delta: 10.0
 use_recurrent_policy: False
@@ -62,11 +62,11 @@ use_huber_loss: True
 use_value_active_masks: False
 use_policy_active_masks: False
 
-# Learning rates - increased for better convergence
-actor_lr: 1.2e-4  # Increased from 9.e-5
-critic_lr: 6.e-3  # Increased from 5.e-3
+# Learning rates - more aggressive to escape local optima
+actor_lr: 1.5e-4  # CRITICAL: Significantly increased to speed up learning
+critic_lr: 7.0e-3  # Increased for faster value convergence
 opti_eps: 1.e-5
-weight_decay: 0.0
+weight_decay: 0  # Removed weight decay to allow full learning capacity
 
 gain: 0.01
 actor_gain: 0.01
