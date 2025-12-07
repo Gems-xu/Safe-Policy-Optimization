@@ -333,7 +333,7 @@ class Runner:
                 self.logger.log_tabular("Misc/Ratio")
                 self.logger.log_tabular("Time/Total", end - start)
                 self.logger.log_tabular("Time/FPS", int(total_num_steps / (end - start)))
-                self.logger.dump_tabular()
+                self.logger.dump_tabular(step=total_num_steps)
                 
                 # Update tqdm progress bar with key metrics
                 pbar.set_postfix({
