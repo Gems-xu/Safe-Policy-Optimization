@@ -417,4 +417,4 @@ tags
 wandb/
 media/
 MUJOCO_LOG.TXT
-docs/source/PointMultiGoal/
+docs/PointMultiGoal/
