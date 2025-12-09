@@ -1,6 +1,6 @@
-env_name: macpo
-algorithm_name: macpo
-experiment_name: point_multigoal
+env_name: macpo_point
+algorithm_name: macpo_point
+experiment_name: point_multigoal_balanced
 seed: 0
 run_dir: ./runs
 num_env_steps: 10000000  # Balanced training duration
@@ -24,11 +24,11 @@ eval_interval: 10
 log_interval: 10
 eval_episodes: 10
 
-# Safety constraints - BALANCED (original was too strict, previous relaxation too loose)
-# Use medium constraint that allows learning while maintaining safety awareness
+# Safety constraints - BALANCED (symmetric factor + optimized for point robot)
+# Designed to prevent both under-constraint (performance collapse) and over-constraint (learning slowdown)
 cost_limit: 32  # ← BALANCED: 32 steps of cost in 1000-step episode (0.032/step)
 EPS: 1.e-8
-safety_gamma: 0.10  # ← BALANCED: Neither too strict nor too loose (was 0.15, tried 0.05)
+safety_gamma: 0.10  # ← BALANCED: Neither too strict nor too loose
 step_fraction: 0.5
 g_step_dir_coef: 0.1
 b_step_dir_coef: 0.1
@@ -42,14 +42,14 @@ use_popart: True
 use_valuenorm: True
 use_proper_time_limits: False
 
-# Policy optimization - STABILIZED for multi-agent learning
+# Policy optimization - STABILIZED for multi-agent learning with symmetric factors
 target_kl: 0.03  # Slightly increased for more conservative updates
 searching_steps: 30  # More line search attempts for safety
 conjugate_gradient_iters: 25  # Balanced convergence
 accept_ratio: 0.5
 clip_param: 0.2
 learning_iters: 15  # Reduced to prevent overfitting on weak signals
-num_mini_batch: 6  # ← BALANCED: Reduced variance, better gradient estimates (was 8, tried 4)
+num_mini_batch: 6  # ← BALANCED: Reduced variance, better gradient estimates
 data_chunk_length: 
 value_loss_coef: 2.0  # Standard value learning weight
 entropy_coef: 0.02  # Moderate entropy for exploration without instability
@@ -63,9 +63,9 @@ use_huber_loss: True
 use_value_active_masks: False
 use_policy_active_masks: False
 
-# Learning rates - MODERATE (too high caused instability)
-actor_lr: 1.0e-4  # ← REDUCED: 0.0001 instead of 0.0002 for stability
-critic_lr: 5.0e-3  # ← REDUCED: 0.005 instead of 0.008
+# Learning rates - MODERATE (reduced from original for stability)
+actor_lr: 1.0e-4  # ← REDUCED: 0.0001 for stability
+critic_lr: 5.0e-3  # ← REDUCED: 0.005 for stability
 opti_eps: 1.e-5
 weight_decay: 0  # No regularization
 
