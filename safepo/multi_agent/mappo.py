@@ -32,6 +32,7 @@ from safepo.common.popart import PopArt
 from safepo.common.model import MultiAgentActor as Actor, MultiAgentCritic as Critic
 from safepo.common.buffer import SeparatedReplayBuffer
 from safepo.common.logger import EpochLogger
+from safepo.common.video_recorder import MultiAgentVideoRecorder, setup_headless_rendering
 from safepo.utils.config import multi_agent_args, parse_sim_params, set_np_formatting, set_seed, multi_agent_velocity_map, isaac_gym_map, multi_agent_goal_tasks
 
 
@@ -210,10 +211,18 @@ class Runner:
 
         self.num_agents = self.envs.num_agents
 
+        # Track the best eval reward for conditional video rendering
+        self.render_max_reward = float(self.config.get("render_max_reward", float("-inf")))
+        self.config["render_max_reward"] = self.render_max_reward
+
         torch.autograd.set_detect_anomaly(True)
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = True
 
+        # Setup headless rendering for video recording
+        setup_headless_rendering()
+        
+        # Initialize logger with wandb
         self.logger = EpochLogger(
             log_dir = config["log_dir"],
             seed = str(config["seed"]),
@@ -227,6 +236,14 @@ class Runner:
             os.makedirs(self.save_dir)
 
         self.logger.save_config(config)
+        
+        # Initialize video recorder for evaluation
+        self.video_recorder = MultiAgentVideoRecorder(
+            fps=30,
+            enabled=config.get("record_video", True),
+            record_freq=config.get("video_record_freq", 10),
+            max_episode_length=config.get("episode_length", 1000)
+        )
         self.policy = []
         for agent_id in range(self.num_agents):
             share_observation_space = self.envs.share_observation_space[agent_id]
@@ -305,7 +322,7 @@ class Runner:
             end = time.time()
             
             if episode % self.config["eval_interval"] == 0 and self.config["use_eval"]:
-                eval_rewards, eval_costs = self.eval()
+                eval_rewards, eval_costs = self.eval(eval_episodes=1, total_steps=total_num_steps)
 
             if len(done_episodes_rewards) != 0:
                 aver_episode_rewards = torch.stack(done_episodes_rewards).mean()
@@ -339,8 +356,8 @@ class Runner:
                 pbar.set_postfix({
                     'EpRet': f"{aver_episode_rewards.item():.2f}",
                     'EpCost': f"{aver_episode_costs.item():.2f}",
-                    'EvalRet': f"{eval_rewards:.2f}",
-                    'EvalCost': f"{eval_costs:.2f}",
+                    # 'EvalRet': f"{eval_rewards:.2f}",
+                    # 'EvalCost': f"{eval_costs:.2f}",
                 })
         pbar.close()
 
@@ -466,12 +483,19 @@ class Runner:
             self.policy[agent_id].critic.load_state_dict(policy_critic_state_dict)
 
     @torch.no_grad()
-    def eval(self, eval_episodes=1):
+    def eval(self, eval_episodes=1, total_steps=0):
         eval_episode = 0
         eval_episode_rewards = []
         eval_episode_costs = []
         one_episode_rewards = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
         one_episode_costs = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
+        
+        # Track best episode that beats global max for video recording
+        best_episode_frames = []
+        best_episode_reward = 0.0
+        best_episode_cost = 0.0
+        best_episode_num = 0
+        current_frames = []
 
         eval_obs, _, _ = self.eval_envs.reset()
 
@@ -498,7 +522,16 @@ class Runner:
             if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
                 zeros = torch.zeros(eval_actions_collector[-1].shape[0], 1)
                 eval_actions_collector[-1]=torch.cat((eval_actions_collector[-1], zeros), dim=1)
-
+            
+            # Capture frame for video (only for non-Isaac Gym envs)
+            if self.video_recorder.enabled and self.config["env_name"] not in isaac_gym_map:
+                try:
+                    if hasattr(self.eval_envs, 'render'):
+                        frame = self.eval_envs.render()
+                        if frame is not None and len(frame.shape) == 3:
+                            current_frames.append(frame.copy())
+                except Exception:
+                    pass
 
             eval_obs, _, eval_rewards, eval_costs, eval_dones, _, _ = self.eval_envs.step(
                 eval_actions_collector
@@ -522,12 +555,41 @@ class Runner:
             for eval_i in range(self.config["n_eval_rollout_threads"]):
                 if eval_dones_env[eval_i]:
                     eval_episode += 1
-                    eval_episode_rewards.append(one_episode_rewards[:, eval_i].mean().item())
+                    ep_reward = one_episode_rewards[:, eval_i].mean().item()
+                    ep_cost = one_episode_costs[:, eval_i].mean().item()
+                    eval_episode_rewards.append(ep_reward)
+                    eval_episode_costs.append(ep_cost)
+
+                    # Only record episodes that beat global max, and keep the best one among them
+                    if ep_reward > self.render_max_reward:
+                        if len(best_episode_frames) == 0 or ep_reward > best_episode_reward:
+                            best_episode_frames = current_frames.copy()
+                            best_episode_reward = ep_reward
+                            best_episode_cost = ep_cost
+                            best_episode_num = eval_episode
+                    
+                    # Clear current frames for next episode
+                    current_frames = []
+
                     one_episode_rewards[:, eval_i] = 0
-                    eval_episode_costs.append(one_episode_costs[:, eval_i].mean().item())
                     one_episode_costs[:, eval_i] = 0
 
             if eval_episode >= eval_episodes:
+                # Upload video for the best episode if any episode beat the global max
+                if len(best_episode_frames) > 0:
+                    self.render_max_reward = best_episode_reward
+                    self.config["render_max_reward"] = self.render_max_reward
+                    
+                    # Upload the best episode from this eval run
+                    if self.video_recorder.enabled:
+                        self.video_recorder.recorder.frames = best_episode_frames
+                        caption = f"Episode {best_episode_num} - Reward: {best_episode_reward:.2f}, Cost: {best_episode_cost:.2f}"
+                        self.video_recorder.recorder.upload_to_wandb(
+                            caption=caption,
+                            step=total_steps,
+                            key="eval/video"
+                        )
+                
                 return np.mean(eval_episode_rewards), np.mean(eval_episode_costs)
 
     @torch.no_grad()
