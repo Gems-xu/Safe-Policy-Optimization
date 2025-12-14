@@ -525,13 +525,14 @@ class Runner:
             
             # Capture frame for video (only for non-Isaac Gym envs)
             if self.video_recorder.enabled and self.config["env_name"] not in isaac_gym_map:
-                try:
-                    if hasattr(self.eval_envs, 'render'):
+                if hasattr(self.eval_envs, 'render'):
+                    try:
                         frame = self.eval_envs.render()
-                        if frame is not None and len(frame.shape) == 3:
-                            current_frames.append(frame.copy())
-                except Exception:
-                    pass
+                        if frame is not None:
+                            if isinstance(frame, np.ndarray) and len(frame.shape) == 3:
+                                current_frames.append(frame.copy())
+                    except Exception as e:
+                        pass
 
             eval_obs, _, eval_rewards, eval_costs, eval_dones, _, _ = self.eval_envs.step(
                 eval_actions_collector
@@ -615,6 +616,7 @@ def train(args, cfg_train):
         cfg_eval = copy.deepcopy(cfg_train)
         cfg_eval["seed"] = args.seed + 10000
         cfg_eval["n_rollout_threads"] = cfg_eval["n_eval_rollout_threads"]
+        cfg_eval["render_mode"] = "rgb_array"  # Enable rendering for evaluation
         eval_env = make_ma_mujoco_env(
         scenario=args.scenario,
         agent_conf=args.agent_conf,

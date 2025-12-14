@@ -550,6 +550,14 @@ class ShareVecEnv(ABC):
 
 def shareworker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
+    # Setup headless rendering in subprocess for servers without display
+    # This must be done before environment creation
+    try:
+        from safepo.common.video_recorder import setup_headless_rendering
+        setup_headless_rendering()
+    except Exception:
+        pass
+    
     env = env_fn_wrapper.x()
     while True:
         cmd, data = remote.recv()
@@ -570,11 +578,24 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
             ob = env.reset_task()
             remote.send(ob)
         elif cmd == 'render':
-            if data == 'rgb_array':
-                fr = env.render(mode=data)
-                remote.send(fr)
-            elif data == 'human':
-                env.render(mode=data)
+            # render() method no longer accepts mode parameter in gymnasium
+            # render_mode is set during environment initialization
+            try:
+                fr = env.render()
+                if data == 'rgb_array':
+                    if fr is not None:
+                        if isinstance(fr, np.ndarray) and len(fr.shape) == 3:
+                            remote.send(fr)
+                        else:
+                            remote.send(None)
+                    else:
+                        remote.send(None)
+                elif data == 'human':
+                    remote.send(None)
+            except Exception as e:
+                # In headless environments, rendering may fail.
+                # Send None gracefully in these cases.
+                remote.send(None)
         elif cmd == 'close':
             env.close()
             remote.close()

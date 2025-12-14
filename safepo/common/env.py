@@ -129,7 +129,9 @@ def make_ma_mujoco_env(scenario, agent_conf, seed, cfg_train):
         env: A multi-agent environment.
     """
     # Get render mode from cfg_train for video recording support
-    render_mode = cfg_train.get('render_mode', 'rgb_array')  # Enable rendering by default for eval
+    # Default to None (no rendering) for training environments
+    # Set render_mode='rgb_array' in config for evaluation environments
+    render_mode = cfg_train.get('render_mode', None)
     
     def get_env_fn(rank):
         def init_env():
