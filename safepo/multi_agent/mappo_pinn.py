@@ -47,9 +47,12 @@ class PINNActor(nn.Module):
     """
     Simplified Physics-Informed Neural Network Actor for multi-agent systems.
     
-    This version uses a simple MLP as the main policy network (like MAPPO),
-    with optional physics-based regularization. This ensures stable learning
-    while still incorporating physics priors.
+    This version uses the EXACT same architecture as MAPPO's MultiAgentActor
+    to ensure comparable performance. The network includes:
+    - LayerNorm on input features
+    - ELU activation functions
+    - LayerNorm after each hidden layer
+    - Sigmoid-based std like MAPPO's DiagGaussian
     
     Args:
         config (dict): Configuration parameters
@@ -75,33 +78,80 @@ class PINNActor(nn.Module):
         else:
             self.act_dim = action_space.n
         
-        # Config parameters
+        # Config parameters - match MAPPO exactly
         self.n_agents = config.get("n_agents", 1)
-        self.hidden_size = config.get("hidden_size", 256)
-        self.use_pinn_physics = config.get("use_pinn_physics", False)  # Disabled by default for stability
+        self.hidden_size = config.get("hidden_size", 512)
+        self._use_feature_normalization = config.get("use_feature_normalization", True)
+        self._use_orthogonal = config.get("use_orthogonal", True)
+        self._layer_N = config.get("layer_N", 2)
+        self._gain = config.get("gain", 0.01)
+        self._actor_gain = config.get("actor_gain", 0.01)
+        self.std_x_coef = config.get("std_x_coef", 1.0)
+        self.std_y_coef = config.get("std_y_coef", 0.5)
         
-        # Main policy network - simple MLP like MAPPO
-        self.mean_net = nn.Sequential(
-            nn.Linear(self.obs_dim, self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, self.hidden_size),
-            nn.ReLU(),
-            nn.Linear(self.hidden_size, self.act_dim)
-        ).to(self.device)
+        # Feature normalization (like MAPPO)
+        if self._use_feature_normalization:
+            self.feature_norm = nn.LayerNorm(self.obs_dim)
         
-        # Learnable log_std parameter
-        self.log_std = nn.Parameter(torch.zeros(self.act_dim, device=self.device))
+        # Initialize method
+        init_method = nn.init.orthogonal_ if self._use_orthogonal else nn.init.xavier_uniform_
+        gain = nn.init.calculate_gain('relu')
         
-        # Initialize weights properly
-        for layer in self.mean_net:
-            if isinstance(layer, nn.Linear):
-                nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
-                nn.init.constant_(layer.bias, 0.0)
-        # Initialize final layer with small weights
-        final_layer = self.mean_net[-1]
-        nn.init.orthogonal_(final_layer.weight, gain=0.01)
+        def init_(m):
+            def _init(m, method, bias_fn, g):
+                method(m.weight, gain=g)
+                bias_fn(m.bias)
+                return m
+            return _init(m, init_method, lambda x: nn.init.constant_(x, 0), gain)
+        
+        # MLP layers with LayerNorm and ELU (exactly like MAPPO's MLPLayer)
+        self.fc1 = nn.Sequential(
+            init_(nn.Linear(self.obs_dim, self.hidden_size)),
+            nn.ELU(),
+            nn.LayerNorm(self.hidden_size)
+        )
+        
+        self.fc_hidden = nn.ModuleList([
+            nn.Sequential(
+                init_(nn.Linear(self.hidden_size, self.hidden_size)),
+                nn.ELU(),
+                nn.LayerNorm(self.hidden_size)
+            ) for _ in range(self._layer_N)
+        ])
+        
+        # Output layer for action mean (with small gain like MAPPO)
+        def init_final_(m):
+            def _init(m, method, bias_fn, g):
+                method(m.weight, gain=g)
+                bias_fn(m.bias)
+                return m
+            return _init(m, init_method, lambda x: nn.init.constant_(x, 0), self._actor_gain)
+        
+        self.fc_mean = init_final_(nn.Linear(self.hidden_size, self.act_dim))
+        
+        # Learnable log_std parameter (like MAPPO's DiagGaussian)
+        # Initialize to std_x_coef so initial std = sigmoid(1) * 0.5 ≈ 0.37
+        self.log_std = nn.Parameter(torch.ones(self.act_dim, device=self.device) * self.std_x_coef)
         
         self.to(device)
+    
+    def _forward_base(self, obs):
+        """Forward through base network."""
+        x = obs
+        if self._use_feature_normalization:
+            x = self.feature_norm(x)
+        
+        x = self.fc1(x)
+        for fc in self.fc_hidden:
+            x = fc(x)
+        return x
+    
+    def _get_action_dist(self, actor_features):
+        """Get action distribution from actor features."""
+        action_mean = self.fc_mean(actor_features)
+        # Use sigmoid-based std like MAPPO's DiagGaussian
+        action_std = torch.sigmoid(self.log_std / self.std_x_coef) * self.std_y_coef
+        return action_mean, action_std
     
     def forward(self, obs, rnn_states, masks, available_actions=None, deterministic=False):
         """
@@ -134,11 +184,11 @@ class PINNActor(nn.Module):
             batch_size = obs.shape[0]
             n_agents = 1
         
-        # Compute action mean
-        action_mean = self.mean_net(obs_flat)
+        # Forward through base network
+        actor_features = self._forward_base(obs_flat)
         
-        # Get std
-        action_std = torch.exp(torch.clamp(self.log_std, -20, 2))
+        # Get action distribution parameters
+        action_mean, action_std = self._get_action_dist(actor_features)
         
         # Create distribution
         dist = Normal(action_mean, action_std)
@@ -146,10 +196,10 @@ class PINNActor(nn.Module):
         if deterministic:
             actions = action_mean
         else:
-            actions = dist.rsample()
+            actions = dist.sample()
         
-        # Compute log probabilities
-        action_log_probs = dist.log_prob(actions).sum(dim=-1, keepdim=True)
+        # Compute log probabilities (like MAPPO's FixedNormal.log_probs - NO sum!)
+        action_log_probs = dist.log_prob(actions)
         
         # Reshape back if needed
         if len(original_shape) == 3:
@@ -190,33 +240,34 @@ class PINNActor(nn.Module):
             batch_size = obs.shape[0]
             n_agents = 1
         
-        # Compute action mean
-        action_mean = self.mean_net(obs_flat)
+        # Forward through base network
+        actor_features = self._forward_base(obs_flat)
         
-        # Get std
-        action_std = torch.exp(torch.clamp(self.log_std, -20, 2))
+        # Get action distribution parameters
+        action_mean, action_std = self._get_action_dist(actor_features)
         
         # Create distribution
         dist = Normal(action_mean, action_std)
         
-        # CRITICAL: Use actual action, not mean!
-        action_log_probs = dist.log_prob(action_flat).sum(dim=-1, keepdim=True)
-        dist_entropy = dist.entropy().sum(dim=-1)
+        # Compute log probabilities (like MAPPO's FixedNormal.log_probs)
+        action_log_probs = dist.log_prob(action_flat)
         
-        # Apply active masks if provided
+        # Compute entropy
         if active_masks is not None:
             active_masks = check(active_masks).to(**self.tpdv)
             if active_masks.dim() == 3:
-                active_masks = active_masks.reshape(-1, 1)
-            if active_masks.shape[0] == action_log_probs.shape[0]:
-                action_log_probs = action_log_probs * active_masks
-                dist_entropy = dist_entropy * active_masks.squeeze(-1)
+                active_masks_flat = active_masks.reshape(-1, 1)
+            else:
+                active_masks_flat = active_masks
+            dist_entropy = (dist.entropy().sum(dim=-1, keepdim=True) * active_masks_flat).sum() / active_masks_flat.sum()
+        else:
+            dist_entropy = dist.entropy().mean()
         
         # Reshape back if needed
         if n_agents > 1:
             action_log_probs = action_log_probs.reshape(batch_size, n_agents, -1)
         
-        return action_log_probs, dist_entropy.mean()
+        return action_log_probs, dist_entropy
 
 
 class MAPPO_PINN_Policy:
