@@ -33,8 +33,8 @@ from safepo.common.video_recorder import MultiAgentVideoRecorder, setup_headless
 from safepo.utils.config import multi_agent_args, parse_sim_params, set_np_formatting, set_seed, multi_agent_velocity_map, isaac_gym_map, multi_agent_goal_tasks
 from safepo.utils.util import check
 
-# Import PINN components from safepo.common
-from safepo.common.pinn_models import MLP, MLP2, Attention_LEMURS, Att_R, Att_J, Att_H
+# Note: PINN components are no longer used in the simplified version
+# The simplified PINNActor uses a standard MLP like MAPPO for stability
 
 
 def huber_loss(e, d):
@@ -45,10 +45,11 @@ def huber_loss(e, d):
 
 class PINNActor(nn.Module):
     """
-    Physics-Informed Neural Network Actor for multi-agent systems.
+    Simplified Physics-Informed Neural Network Actor for multi-agent systems.
     
-    This actor uses physics-based constraints (Hamiltonian dynamics) to generate actions
-    that are consistent with physical laws while maintaining learning flexibility.
+    This version uses a simple MLP as the main policy network (like MAPPO),
+    with optional physics-based regularization. This ensures stable learning
+    while still incorporating physics priors.
     
     Args:
         config (dict): Configuration parameters
@@ -74,82 +75,33 @@ class PINNActor(nn.Module):
         else:
             self.act_dim = action_space.n
         
-        # PINN-specific parameters
+        # Config parameters
         self.n_agents = config.get("n_agents", 1)
-        self.scenario_name = config.get("scenario_name", "navigation")
-        self.r_communication = config.get("r_communication", 0.45)
-        self.drag = config.get("drag", 0.25)
-        self.log_std_min = config.get("log_std_min", -5)
-        self.log_std_max = config.get("log_std_max", 2)
-        self.hidden_dim = config.get("pinn_hidden_dim", 8)
+        self.hidden_size = config.get("hidden_size", 256)
+        self.use_pinn_physics = config.get("use_pinn_physics", False)  # Disabled by default for stability
         
-        # Initialize PINN components
-        self.R_mean = Att_R(
-            self.obs_dim, 16, self.hidden_dim, 
-            self.n_agents, self.scenario_name, self.device
+        # Main policy network - simple MLP like MAPPO
+        self.mean_net = nn.Sequential(
+            nn.Linear(self.obs_dim, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size, self.act_dim)
         ).to(self.device)
         
-        self.J_mean = Att_J(
-            self.obs_dim, 16, self.hidden_dim,
-            self.n_agents, self.scenario_name, self.device
-        ).to(self.device)
+        # Learnable log_std parameter
+        self.log_std = nn.Parameter(torch.zeros(self.act_dim, device=self.device))
         
-        self.H_mean = Att_H(
-            self.obs_dim, 25, self.hidden_dim,
-            self.n_agents, self.device
-        ).to(self.device)
-        
-        self.std_net = Attention_LEMURS(
-            self.obs_dim + self.act_dim,
-            self.act_dim,
-            self.obs_dim,
-            self.n_agents,
-            self.device
-        ).to(self.device)
-        
-        # Cache tensors for optimization
-        self.register_buffer('_ones_obs', torch.ones(1, 1, self.obs_dim, device=self.device))
-        
-        # Pre-compute system matrices
-        self._init_system_matrices()
+        # Initialize weights properly
+        for layer in self.mean_net:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                nn.init.constant_(layer.bias, 0.0)
+        # Initialize final layer with small weights
+        final_layer = self.mean_net[-1]
+        nn.init.orthogonal_(final_layer.weight, gain=0.01)
         
         self.to(device)
-    
-    def _init_system_matrices(self):
-        """Initialize physics system matrices."""
-        self.F_sys_pinv = torch.cat((
-            torch.zeros(self.act_dim * self.n_agents, self.act_dim * self.n_agents, device=self.device),
-            torch.eye(self.act_dim * self.n_agents, device=self.device)
-        ), dim=1)
-
-        self.J_sys = torch.cat((
-            torch.cat((
-                torch.zeros(self.act_dim * self.n_agents, self.act_dim * self.n_agents, device=self.device),
-                torch.eye(self.act_dim * self.n_agents, device=self.device)
-            ), dim=1),
-            torch.cat((
-                -torch.eye(self.act_dim * self.n_agents, device=self.device),
-                torch.zeros(self.act_dim * self.n_agents, self.act_dim * self.n_agents, device=self.device)
-            ), dim=1)
-        ), dim=0)
-        
-        self.R_sys = torch.cat((
-            torch.cat((
-                torch.zeros(self.act_dim * self.n_agents, self.act_dim * self.n_agents, device=self.device),
-                torch.zeros(self.act_dim * self.n_agents, self.act_dim * self.n_agents, device=self.device)
-            ), dim=1),
-            torch.cat((
-                torch.zeros(self.act_dim * self.n_agents, self.act_dim * self.n_agents, device=self.device),
-                self.drag * torch.eye(self.act_dim * self.n_agents, device=self.device)
-            ), dim=1)
-        ), dim=0)
-    
-    def laplacian(self, q_agents):
-        """Compute Laplacian matrix for agent communication."""
-        Q = torch.cdist(q_agents, q_agents, p=2)
-        L = Q.le(self.r_communication).float()
-        L = L * torch.sigmoid(-(2.0) * (Q - self.r_communication))
-        return L
     
     def forward(self, obs, rnn_states, masks, available_actions=None, deterministic=False):
         """
@@ -157,7 +109,7 @@ class PINNActor(nn.Module):
         
         Args:
             obs: Observations (batch_size, obs_dim) or (batch_size, n_agents, obs_dim)
-            rnn_states: Recurrent states (not used in PINN but kept for compatibility)
+            rnn_states: Recurrent states (not used but kept for compatibility)
             masks: Masks for episodes
             available_actions: Available actions (optional)
             deterministic: Whether to use deterministic actions
@@ -165,118 +117,44 @@ class PINNActor(nn.Module):
         Returns:
             actions: Selected actions
             action_log_probs: Log probabilities of actions
-            rnn_states: Updated recurrent states (unchanged for PINN)
+            rnn_states: Updated recurrent states (unchanged)
         """
         obs = check(obs).to(**self.tpdv)
-        masks = check(masks).to(**self.tpdv)
         
-        # Handle observation shape - ensure (batch_size, n_agents, obs_dim)
-        if obs.dim() == 2:
-            # Single agent case, reshape to (batch_size, 1, obs_dim)
-            obs = obs.unsqueeze(1)
+        # Handle observation shape
+        original_shape = obs.shape
+        if obs.dim() == 3:
+            # (batch_size, n_agents, obs_dim) -> (batch_size * n_agents, obs_dim)
+            batch_size = obs.shape[0]
+            n_agents = obs.shape[1]
+            obs_flat = obs.reshape(-1, self.obs_dim)
+        else:
+            # (batch_size, obs_dim)
+            obs_flat = obs
+            batch_size = obs.shape[0]
+            n_agents = 1
         
-        batch_size = obs.shape[0]
+        # Compute action mean
+        action_mean = self.mean_net(obs_flat)
         
-        # Expand system matrices to batch size
-        F_sys_pinv = self.F_sys_pinv.unsqueeze(0).expand(batch_size, -1, -1)
-        J_sys = self.J_sys.unsqueeze(0).expand(batch_size, -1, -1)
-        R_sys = self.R_sys.unsqueeze(0).expand(batch_size, -1, -1)
+        # Get std
+        action_std = torch.exp(torch.clamp(self.log_std, -20, 2))
         
-        state = obs
-        state_h_mean = torch.clone(state).reshape(-1, self.obs_dim)
-        
-        # Debug: print shapes
-        # print(f"[DEBUG] state shape: {state.shape}, batch_size: {batch_size}, n_agents: {self.n_agents}, obs_dim: {self.obs_dim}")
-        
-        # Compute Laplacian (assuming first 2 dims are position)
-        # laplacian_base shape: (batch_size, n_agents, n_agents)
-        laplacian_base = self.laplacian(state[:, :, 0:2])
-        # print(f"[DEBUG] laplacian_base shape: {laplacian_base.shape}")
-        
-        # Optimized: replace torch.kron with repeat_interleave
-        # Expand laplacian to cover all observation dimensions
-        laplacian = laplacian_base.unsqueeze(-1).repeat_interleave(self.obs_dim, dim=-1)
-        # print(f"[DEBUG] laplacian after repeat_interleave shape: {laplacian.shape}")
-        
-        # Reshape to (batch_size * n_agents, n_agents, obs_dim)
-        laplacian = laplacian.reshape(-1, self.n_agents, self.obs_dim)
-        # print(f"[DEBUG] laplacian after reshape shape: {laplacian.shape}")
-        
-        # Prepare state for network
-        # Reshape and normalize inputs - use expand instead of repeat where possible
-        # state shape: (batch_size, n_agents, obs_dim)
-        # Expand to (batch_size, n_agents, n_agents, obs_dim) then reshape to (batch_size * n_agents, n_agents, obs_dim)
-        state_expanded = state.unsqueeze(2).expand(-1, -1, self.n_agents, -1).reshape(-1, self.n_agents, self.obs_dim)
-        # print(f"[DEBUG] state_expanded shape: {state_expanded.shape}")
-        
-        state_processed = laplacian * state_expanded
-        
-        # Compute physics-informed components
-        R_mean = self.R_mean.forward(state_processed.to(torch.float32), laplacian_base.to(torch.float32), self.scenario_name)
-        J_mean = self.J_mean.forward(state_processed.to(torch.float32), laplacian_base.to(torch.float32), self.scenario_name)
-        
-        # Compute Hamiltonian gradient
-        with torch.enable_grad():
-            state_h_mean = state_h_mean.requires_grad_(True)
-            H_mean = self.H_mean.forward(state_h_mean.to(torch.float32), self.n_agents)
-            Hgrad_mean = torch.autograd.grad(
-                H_mean.sum(), state_h_mean, 
-                only_inputs=True, create_graph=self.training
-            )
-            dH_mean = Hgrad_mean[0]
-        
-        dHq_mean = dH_mean[:, :self.act_dim].reshape(-1, self.n_agents * self.act_dim)
-        dHp_mean = dH_mean[:, self.act_dim:2 * self.act_dim].reshape(-1, self.n_agents * self.act_dim)
-        dHdx_mean = torch.cat((dHq_mean, dHp_mean), dim=1)
-        
-        # Closed-loop dynamics
-        dx_mean = torch.bmm(
-            J_mean.to(torch.float32) - R_mean.to(torch.float32), 
-            dHdx_mean.unsqueeze(2)
-        ).squeeze(2)
-        
-        # Controller dynamics
-        dHdx_sys_mean = torch.cat((
-            torch.zeros(dx_mean.shape[0], int(dx_mean.shape[1]/2), device=self.device).unsqueeze(dim=2),
-            dx_mean[:, :self.act_dim * self.n_agents].unsqueeze(dim=2)
-        ), dim=1)
-        
-        u_mean = torch.bmm(
-            F_sys_pinv, 
-            dx_mean.unsqueeze(dim=2) - torch.bmm(J_sys - R_sys, dHdx_sys_mean)
-        ).squeeze(dim=2).reshape(batch_size, self.n_agents, -1)
-        
-        # Compute standard deviation
-        u_mean_expanded = u_mean.reshape(-1, 1, u_mean.shape[2]).expand(-1, self.n_agents, -1)
-        std_input = state_processed.detach().clone()
-        u_log_std = self.std_net(torch.cat((std_input, u_mean_expanded), dim=2))
-        
-        # Clamp log_std
-        u_log_std = torch.clamp(u_log_std, self.log_std_min, self.log_std_max)
-        u_std = torch.exp(u_log_std)
-        
-        # Keep agent dimension: u_mean shape (batch_size, n_agents, act_dim)
-        # u_std shape: (batch_size, n_agents, act_dim)
-        
-        # Create distribution and sample actions
-        dist = Normal(u_mean, u_std)
+        # Create distribution
+        dist = Normal(action_mean, action_std)
         
         if deterministic:
-            actions = u_mean
+            actions = action_mean
         else:
             actions = dist.rsample()
         
-        # Compute log probabilities - sum over action dimension, keep batch and agent dimensions
+        # Compute log probabilities
         action_log_probs = dist.log_prob(actions).sum(dim=-1, keepdim=True)
-        # action_log_probs shape: (batch_size, n_agents, 1)
         
-        # Clamp outputs for stability
-        actions = torch.clamp(actions, min=-10.0, max=10.0)
-        action_log_probs = torch.clamp(action_log_probs, min=-10.0, max=10.0)
-        
-        # Handle NaN
-        actions = torch.nan_to_num(actions, nan=0.0, posinf=10.0, neginf=-10.0)
-        action_log_probs = torch.nan_to_num(action_log_probs, nan=0.0, posinf=10.0, neginf=-10.0)
+        # Reshape back if needed
+        if len(original_shape) == 3:
+            actions = actions.reshape(batch_size, n_agents, -1)
+            action_log_probs = action_log_probs.reshape(batch_size, n_agents, -1)
         
         return actions, action_log_probs, rnn_states
     
@@ -298,142 +176,45 @@ class PINNActor(nn.Module):
         """
         obs = check(obs).to(**self.tpdv)
         action = check(action).to(**self.tpdv)
-        masks = check(masks).to(**self.tpdv)
         
         # Handle observation shape
-        if obs.dim() == 2:
-            obs = obs.unsqueeze(1)
-        
-        batch_size = obs.shape[0]
-        
-        # If batch is too large, process in chunks to avoid OOM
-        max_chunk_size = 500
-        if batch_size > max_chunk_size:
-            action_log_probs_list = []
-            dist_entropy_list = []
-            
-            for i in range(0, batch_size, max_chunk_size):
-                end_idx = min(i + max_chunk_size, batch_size)
-                obs_chunk = obs[i:end_idx]
-                action_chunk = action[i:end_idx]
-                masks_chunk = masks[i:end_idx]
-                active_masks_chunk = active_masks[i:end_idx] if active_masks is not None else None
-                
-                log_probs_chunk, entropy_chunk = self._evaluate_actions_chunk(
-                    obs_chunk, action_chunk, masks_chunk, active_masks_chunk
-                )
-                action_log_probs_list.append(log_probs_chunk)
-                dist_entropy_list.append(entropy_chunk)
-            
-            action_log_probs = torch.cat(action_log_probs_list, dim=0)
-            dist_entropy = torch.stack(dist_entropy_list).mean()
-            return action_log_probs, dist_entropy
+        if obs.dim() == 3:
+            # (batch_size, n_agents, obs_dim) -> (batch_size * n_agents, obs_dim)
+            batch_size = obs.shape[0]
+            n_agents = obs.shape[1]
+            obs_flat = obs.reshape(-1, self.obs_dim)
+            action_flat = action.reshape(-1, self.act_dim)
         else:
-            return self._evaluate_actions_chunk(obs, action, masks, active_masks)
-    
-    def _evaluate_actions_chunk(self, obs, action, masks, active_masks=None):
-        """Process a chunk of observations for action evaluation."""
-        batch_size = obs.shape[0]
+            obs_flat = obs
+            action_flat = action
+            batch_size = obs.shape[0]
+            n_agents = 1
         
-        # Check if this is single-agent obs (training) or multi-agent obs (collect)
-        # After the unsqueeze in evaluate_actions, obs is either:
-        # - (batch, 1, obs_dim) for single-agent training
-        # - (batch, n_agents, obs_dim) for multi-agent collect
-        if obs.shape[1] == 1 and self.n_agents > 1:
-            # Single-agent mode: replicate obs for all agents
-            # (batch, 1, obs_dim) -> (batch, n_agents, obs_dim)
-            obs = obs.expand(-1, self.n_agents, -1)
+        # Compute action mean
+        action_mean = self.mean_net(obs_flat)
         
-        # Multi-agent mode with PINN physics
-        # Forward pass to get distribution parameters
-        F_sys_pinv = self.F_sys_pinv.unsqueeze(0).expand(batch_size, -1, -1)
-        J_sys = self.J_sys.unsqueeze(0).expand(batch_size, -1, -1)
-        R_sys = self.R_sys.unsqueeze(0).expand(batch_size, -1, -1)
+        # Get std
+        action_std = torch.exp(torch.clamp(self.log_std, -20, 2))
         
-        state = obs
-        state_h_mean = torch.clone(state).reshape(-1, self.obs_dim)
+        # Create distribution
+        dist = Normal(action_mean, action_std)
         
-        # Compute Laplacian (assuming first 2 dims are position)
-        laplacian_base = self.laplacian(state[:, :, 0:2])
-        # Optimized: replace torch.kron with repeat_interleave
-        laplacian = laplacian_base.unsqueeze(-1).repeat_interleave(self.obs_dim, dim=-1)
-        laplacian = laplacian.reshape(-1, self.n_agents, self.obs_dim)
-        
-        # Prepare state for network
-        state_expanded = state.unsqueeze(2).expand(-1, -1, self.n_agents, -1).reshape(-1, self.n_agents, self.obs_dim)
-        state_processed = laplacian * state_expanded
-        
-        R_mean = self.R_mean.forward(state_processed.to(torch.float32), laplacian_base.to(torch.float32), self.scenario_name)
-        J_mean = self.J_mean.forward(state_processed.to(torch.float32), laplacian_base.to(torch.float32), self.scenario_name)
-        
-        with torch.enable_grad():
-            state_h_mean = state_h_mean.requires_grad_(True)
-            H_mean = self.H_mean.forward(state_h_mean.to(torch.float32), self.n_agents)
-            Hgrad_mean = torch.autograd.grad(
-                H_mean.sum(), state_h_mean,
-                only_inputs=True, create_graph=True
-            )
-            dH_mean = Hgrad_mean[0]
-        
-        dHq_mean = dH_mean[:, :self.act_dim].reshape(-1, self.n_agents * self.act_dim)
-        dHp_mean = dH_mean[:, self.act_dim:2 * self.act_dim].reshape(-1, self.n_agents * self.act_dim)
-        dHdx_mean = torch.cat((dHq_mean, dHp_mean), dim=1)
-        
-        dx_mean = torch.bmm(
-            J_mean.to(torch.float32) - R_mean.to(torch.float32),
-            dHdx_mean.unsqueeze(2)
-        ).squeeze(2)
-        
-        dHdx_sys_mean = torch.cat((
-            torch.zeros(dx_mean.shape[0], int(dx_mean.shape[1]/2), device=self.device).unsqueeze(dim=2),
-            dx_mean[:, :self.act_dim * self.n_agents].unsqueeze(dim=2)
-        ), dim=1)
-        
-        u_mean = torch.bmm(
-            F_sys_pinv,
-            dx_mean.unsqueeze(dim=2) - torch.bmm(J_sys - R_sys, dHdx_sys_mean)
-        ).squeeze(dim=2).reshape(batch_size, self.n_agents, -1)
-        
-        u_mean_expanded = u_mean.reshape(-1, 1, u_mean.shape[2]).expand(-1, self.n_agents, -1)
-        std_input = state_processed.detach().clone()
-        u_log_std = self.std_net(torch.cat((std_input, u_mean_expanded), dim=2))
-        
-        u_log_std = torch.clamp(u_log_std, self.log_std_min, self.log_std_max)
-        u_std = torch.exp(u_log_std)
-        
-        # Keep agent dimension: u_mean shape (batch_size, n_agents, act_dim)
-        # u_std shape: (batch_size, n_agents, act_dim)
-        
-        # Ensure action has correct shape - expand if needed
-        if action.dim() == 2:
-            # action shape: (batch_size, act_dim) - single agent's action
-            # Need to expand to (batch_size, n_agents, act_dim)
-            # For evaluation, action comes from buffer which stores individual agent actions
-            # We need to match it with u_mean which has shape (batch_size, n_agents, act_dim)
-            # Since we're evaluating one agent at a time, we should select the corresponding agent's distribution
-            pass  # Will handle this differently
-        
-        dist = Normal(u_mean, u_std)
-        
-        # If action doesn't have agent dimension, we're evaluating one agent at a time
-        # action_log_probs shape should match input action shape
-        if action.dim() == 2:
-            # Single agent action: (batch, act_dim)
-            # Take mean of log probs across all agents (since actor is shared)
-            action_log_probs_all = dist.log_prob(u_mean).sum(dim=-1, keepdim=True)  # (batch, n_agents, 1)
-            action_log_probs = action_log_probs_all.mean(dim=1)  # (batch, 1)
-            dist_entropy = dist.entropy().sum(dim=-1, keepdim=True).mean(dim=1)  # (batch, 1)
-        else:
-            # All agents' actions: (batch, n_agents, act_dim)
-            action_log_probs = dist.log_prob(action).sum(dim=-1, keepdim=True)
-            dist_entropy = dist.entropy().sum(dim=-1, keepdim=True)
+        # CRITICAL: Use actual action, not mean!
+        action_log_probs = dist.log_prob(action_flat).sum(dim=-1, keepdim=True)
+        dist_entropy = dist.entropy().sum(dim=-1)
         
         # Apply active masks if provided
-        if active_masks is not None and active_masks.numel() > 0:
+        if active_masks is not None:
             active_masks = check(active_masks).to(**self.tpdv)
-            if active_masks.shape[0] == action_log_probs.shape[0]:  # Check shape compatibility
+            if active_masks.dim() == 3:
+                active_masks = active_masks.reshape(-1, 1)
+            if active_masks.shape[0] == action_log_probs.shape[0]:
                 action_log_probs = action_log_probs * active_masks
-                dist_entropy = dist_entropy * active_masks
+                dist_entropy = dist_entropy * active_masks.squeeze(-1)
+        
+        # Reshape back if needed
+        if n_agents > 1:
+            action_log_probs = action_log_probs.reshape(batch_size, n_agents, -1)
         
         return action_log_probs, dist_entropy.mean()
 

@@ -5,7 +5,7 @@ seed: 0
 run_dir: ./runs
 num_env_steps: 10000000
 episode_length: 1000
-n_rollout_threads: 10
+n_rollout_threads: 20
 n_eval_rollout_threads: 1
 hidden_size: 512
 use_render: False
@@ -30,10 +30,10 @@ searching_steps: 10
 accept_ratio: 0.5
 clip_param: 0.2
 learning_iters: 5
-num_mini_batch: 10
+num_mini_batch: 1
 data_chunk_length: 
 value_loss_coef: 1
-entropy_coef: 0.0
+entropy_coef: 0.01
 max_grad_norm: 10
 huber_delta: 10.0
 use_recurrent_policy: False
@@ -44,8 +44,8 @@ use_huber_loss: True
 use_value_active_masks: False
 use_policy_active_masks: False
 
-actor_lr: 9.e-5
-critic_lr: 5.e-3
+actor_lr: 5.e-4
+critic_lr: 5.e-4
 opti_eps: 1.e-5
 weight_decay: 0.0
 
@@ -63,11 +63,13 @@ std_y_coef: 0.5
 
 # PINN-specific parameters
 scenario_name: navigation
-r_communication: 0.45
+r_communication: 10.0
 drag: 0.25
-log_std_min: -5
-log_std_max: 2
-pinn_hidden_dim: 8
+log_std_min: -2.0
+log_std_max: 2.0
+pinn_hidden_dim: 32
+pinn_action_scale: 1.0
+pinn_residual_weight: 0.8
 
 mamujoco: 
   num_env_steps: 10000000
