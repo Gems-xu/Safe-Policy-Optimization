@@ -12,17 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""MAPPO with Physics-Informed Neural Network (PINN) Actor."""
+"""
+MAPPO-PINN: MAPPO with Port-Hamiltonian Neural Network Actor.
 
+This algorithm integrates Physics-Informed Neural Networks (PINN) based on 
+Port-Hamiltonian systems into MAPPO's actor network.
+
+Port-Hamiltonian System:
+    ẋ = (J(x) - R(x)) ∇H(x) + g(x)u
+    
+Where:
+    - x = (q, p) is the state (position, momentum/velocity)
+    - J(x): Skew-symmetric interconnection matrix (energy-conserving)
+    - R(x): Symmetric positive semi-definite dissipation matrix (energy-dissipating)
+    - H(x): Hamiltonian (total energy)
+    - g(x): Input matrix
+    - u: Control input (action)
+
+For Point agents in SafetyMultiGoal environments:
+    - Observation: 152-dim (accelerometer, velocimeter, gyro, magnetometer, lidars)
+    - velocimeter (indices 3-5): velocity (vx, vy, vz)
+    - Action: 2-dim (forward force, turning velocity)
+"""
+
+import copy
+import numpy as np
+try: 
+    import isaacgym
+except:
+    pass
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import os
 import sys
 import time
-import copy
-import numpy as np
-import torch
-import torch.nn as nn
 from tqdm import tqdm
-from torch.distributions import Normal
 
 from safepo.common.env import make_ma_mujoco_env, make_ma_isaac_env, make_ma_multi_goal_env
 from safepo.common.popart import PopArt
@@ -31,11 +56,11 @@ from safepo.common.buffer import SeparatedReplayBuffer
 from safepo.common.logger import EpochLogger
 from safepo.common.video_recorder import MultiAgentVideoRecorder, setup_headless_rendering
 from safepo.utils.config import multi_agent_args, parse_sim_params, set_np_formatting, set_seed, multi_agent_velocity_map, isaac_gym_map, multi_agent_goal_tasks
-from safepo.utils.util import check
 
-# Note: PINN components are no longer used in the simplified version
-# The simplified PINNActor uses a standard MLP like MAPPO for stability
 
+def check(input):
+    output = torch.from_numpy(input) if type(input) == np.ndarray else input
+    return output
 
 def huber_loss(e, d):
     a = (abs(e) <= d).float()
@@ -43,243 +68,454 @@ def huber_loss(e, d):
     return a*e**2/2 + b*d*(abs(e)-d/2)
 
 
-class PINNActor(nn.Module):
+# =============================================================================
+# Port-Hamiltonian PINN Actor for Point Agents
+# =============================================================================
+
+class PortHamiltonianPINNActor(nn.Module):
     """
-    Simplified Physics-Informed Neural Network Actor for multi-agent systems.
+    Physics-Informed Neural Network Actor based on Port-Hamiltonian Systems.
     
-    This version uses the EXACT same architecture as MAPPO's MultiAgentActor
-    to ensure comparable performance. The network includes:
-    - LayerNorm on input features
-    - ELU activation functions
-    - LayerNorm after each hidden layer
-    - Sigmoid-based std like MAPPO's DiagGaussian
-    
-    Args:
-        config (dict): Configuration parameters
-        obs_space: Observation space
-        action_space: Action space  
-        device (torch.device): Device to run on
+    Port-Hamiltonian dynamics:
+        ẋ = (J - R) ∇H(x) + g(x)u
+        
+    For Point agent:
+        - State x includes velocity from observation
+        - J is skew-symmetric (energy conserving interconnection)
+        - R is symmetric positive semi-definite (dissipation)
+        - H is the Hamiltonian (energy function)
+        - Control u is the action output
+        
+    The network learns:
+        1. H_net: Hamiltonian function H(obs) -> scalar energy
+        2. J_net: Skew-symmetric interconnection J(obs) 
+        3. R_net: Dissipation matrix R(obs), enforced to be positive semi-definite
+        4. Policy_net: Maps physics-informed features to action distribution
     """
     
-    def __init__(self, config, obs_space, action_space, device=torch.device("cpu")):
-        super(PINNActor, self).__init__()
+    def __init__(self, config, obs_space, act_space, device=torch.device("cpu")):
+        super(PortHamiltonianPINNActor, self).__init__()
+        
         self.config = config
         self.device = device
-        self.tpdv = dict(dtype=torch.float32, device=device)
+        self.obs_dim = obs_space.shape[0]  # 152 for Point MultiGoal
+        self.act_dim = act_space.shape[0]  # 2 for Point
         
-        # Extract dimensions
-        if hasattr(obs_space, 'shape'):
-            self.obs_dim = obs_space.shape[0]
-        else:
-            self.obs_dim = obs_space.n
-            
-        if hasattr(action_space, 'shape'):
-            self.act_dim = action_space.shape[0]
-        else:
-            self.act_dim = action_space.n
-        
-        # Config parameters - match MAPPO exactly
-        self.n_agents = config.get("n_agents", 1)
-        self.hidden_size = config.get("hidden_size", 512)
-        self._use_feature_normalization = config.get("use_feature_normalization", True)
-        self._use_orthogonal = config.get("use_orthogonal", True)
-        self._layer_N = config.get("layer_N", 2)
-        self._gain = config.get("gain", 0.01)
-        self._actor_gain = config.get("actor_gain", 0.01)
+        # Configuration
+        self.hidden_size = config.get("hidden_size", 256)
+        self.physics_hidden = config.get("physics_hidden", 64)
+        self.state_dim = config.get("pinn_state_dim", 4)  # (vx, vy, ax, ay) or similar
         self.std_x_coef = config.get("std_x_coef", 1.0)
         self.std_y_coef = config.get("std_y_coef", 0.5)
         
-        # Feature normalization (like MAPPO)
-        if self._use_feature_normalization:
-            self.feature_norm = nn.LayerNorm(self.obs_dim)
+        # Physics state extraction indices (for Point agent observation)
+        # obs[0:3] = accelerometer (ax, ay, az)
+        # obs[3:6] = velocimeter (vx, vy, vz)  <- velocity!
+        # obs[6:9] = gyro (angular velocity)
+        # obs[9:12] = magnetometer (orientation)
+        self.vel_indices = [3, 4]  # vx, vy
+        self.acc_indices = [0, 1]  # ax, ay
         
-        # Initialize method
-        init_method = nn.init.orthogonal_ if self._use_orthogonal else nn.init.xavier_uniform_
-        gain = nn.init.calculate_gain('relu')
+        # ===================
+        # Physics Networks (Port-Hamiltonian)
+        # ===================
         
-        def init_(m):
-            def _init(m, method, bias_fn, g):
-                method(m.weight, gain=g)
-                bias_fn(m.bias)
-                return m
-            return _init(m, init_method, lambda x: nn.init.constant_(x, 0), gain)
-        
-        # MLP layers with LayerNorm and ELU (exactly like MAPPO's MLPLayer)
-        self.fc1 = nn.Sequential(
-            init_(nn.Linear(self.obs_dim, self.hidden_size)),
+        # Hamiltonian Network: H(x) -> scalar energy
+        # For Point agent: H = 0.5 * m * ||v||^2 (kinetic) + potential terms
+        self.H_net = nn.Sequential(
+            nn.Linear(self.state_dim, self.physics_hidden),
             nn.ELU(),
-            nn.LayerNorm(self.hidden_size)
+            nn.Linear(self.physics_hidden, self.physics_hidden),
+            nn.ELU(),
+            nn.Linear(self.physics_hidden, 1)  # Scalar Hamiltonian
         )
         
-        self.fc_hidden = nn.ModuleList([
-            nn.Sequential(
-                init_(nn.Linear(self.hidden_size, self.hidden_size)),
-                nn.ELU(),
-                nn.LayerNorm(self.hidden_size)
-            ) for _ in range(self._layer_N)
-        ])
+        # J Network: Learns skew-symmetric interconnection matrix
+        # Output: upper triangular elements, then construct skew-symmetric J
+        self.J_dim = self.state_dim * (self.state_dim - 1) // 2  # Upper triangular elements
+        self.J_net = nn.Sequential(
+            nn.Linear(self.state_dim, self.physics_hidden),
+            nn.ELU(),
+            nn.Linear(self.physics_hidden, self.J_dim)
+        )
         
-        # Output layer for action mean (with small gain like MAPPO)
-        def init_final_(m):
-            def _init(m, method, bias_fn, g):
-                method(m.weight, gain=g)
-                bias_fn(m.bias)
-                return m
-            return _init(m, init_method, lambda x: nn.init.constant_(x, 0), self._actor_gain)
+        # R Network: Learns dissipation matrix (positive semi-definite)
+        # Output: elements of lower triangular L, then R = L @ L^T
+        self.R_tril_dim = self.state_dim * (self.state_dim + 1) // 2
+        self.R_net = nn.Sequential(
+            nn.Linear(self.state_dim, self.physics_hidden),
+            nn.ELU(),
+            nn.Linear(self.physics_hidden, self.R_tril_dim)
+        )
         
-        self.fc_mean = init_final_(nn.Linear(self.hidden_size, self.act_dim))
+        # ===================
+        # Feature Extraction (Standard MLP like MAPPO)
+        # ===================
         
-        # Learnable log_std parameter (like MAPPO's DiagGaussian)
-        # Initialize to std_x_coef so initial std = sigmoid(1) * 0.5 ≈ 0.37
-        self.log_std = nn.Parameter(torch.ones(self.act_dim, device=self.device) * self.std_x_coef)
+        # Feature normalization (like MAPPO)
+        self.feature_norm = nn.LayerNorm(self.obs_dim)
+        
+        # Base network for non-physics features
+        self.base_net = nn.Sequential(
+            nn.Linear(self.obs_dim, self.hidden_size),
+            nn.ELU(),
+            nn.LayerNorm(self.hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.ELU(),
+            nn.LayerNorm(self.hidden_size),
+        )
+        
+        # ===================
+        # Physics-Policy Integration
+        # ===================
+        
+        # Combine physics features with learned features
+        # Physics features: H, grad_H (state_dim), J-R matrix info (flattened)
+        physics_feature_dim = 1 + self.state_dim  # H + grad_H
+        combined_dim = self.hidden_size + physics_feature_dim
+        
+        self.policy_integration = nn.Sequential(
+            nn.Linear(combined_dim, self.hidden_size),
+            nn.ELU(),
+            nn.LayerNorm(self.hidden_size),
+        )
+        
+        # Action mean output
+        self.action_mean = nn.Linear(self.hidden_size, self.act_dim)
+        
+        # Log std (learnable, like MAPPO)
+        self.log_std = nn.Parameter(torch.zeros(1, self.act_dim))
+        
+        # Initialize weights
+        self._init_weights()
         
         self.to(device)
     
-    def _forward_base(self, obs):
-        """Forward through base network."""
-        x = obs
-        if self._use_feature_normalization:
-            x = self.feature_norm(x)
+    def _init_weights(self):
+        """Initialize network weights using orthogonal initialization."""
+        def init_layer(m, gain=np.sqrt(2)):
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=gain)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
         
-        x = self.fc1(x)
-        for fc in self.fc_hidden:
-            x = fc(x)
-        return x
+        # Physics networks with smaller gain for stability
+        for net in [self.H_net, self.J_net, self.R_net]:
+            for m in net:
+                init_layer(m, gain=0.01)
+        
+        # Base network with standard gain
+        for m in self.base_net:
+            init_layer(m)
+        
+        for m in self.policy_integration:
+            init_layer(m)
+        
+        # Action output with small gain
+        init_layer(self.action_mean, gain=0.01)
     
-    def _get_action_dist(self, actor_features):
-        """Get action distribution from actor features."""
-        action_mean = self.fc_mean(actor_features)
-        # Use sigmoid-based std like MAPPO's DiagGaussian
-        action_std = torch.sigmoid(self.log_std / self.std_x_coef) * self.std_y_coef
-        return action_mean, action_std
-    
-    def forward(self, obs, rnn_states, masks, available_actions=None, deterministic=False):
+    def _extract_physics_state(self, obs):
         """
-        Forward pass to generate actions.
+        Extract physics-relevant state from observation.
+        For Point agent: velocity (vx, vy) and acceleration (ax, ay)
         
         Args:
-            obs: Observations (batch_size, obs_dim) or (batch_size, n_agents, obs_dim)
-            rnn_states: Recurrent states (not used but kept for compatibility)
-            masks: Masks for episodes
-            available_actions: Available actions (optional)
-            deterministic: Whether to use deterministic actions
+            obs: [batch, obs_dim] observation tensor
             
         Returns:
-            actions: Selected actions
-            action_log_probs: Log probabilities of actions
-            rnn_states: Updated recurrent states (unchanged)
+            state: [batch, state_dim] physics state
         """
-        obs = check(obs).to(**self.tpdv)
+        # Extract velocity and acceleration
+        vel = obs[:, self.vel_indices]  # [batch, 2] - vx, vy
+        acc = obs[:, self.acc_indices]  # [batch, 2] - ax, ay
         
-        # Handle observation shape
-        original_shape = obs.shape
-        if obs.dim() == 3:
-            # (batch_size, n_agents, obs_dim) -> (batch_size * n_agents, obs_dim)
-            batch_size = obs.shape[0]
-            n_agents = obs.shape[1]
-            obs_flat = obs.reshape(-1, self.obs_dim)
+        # Combine into physics state
+        state = torch.cat([vel, acc], dim=-1)  # [batch, 4]
+        return state
+    
+    def _construct_J_matrix(self, J_elements, batch_size):
+        """
+        Construct skew-symmetric matrix J from upper triangular elements.
+        J = -J^T (antisymmetric)
+        
+        Args:
+            J_elements: [batch, J_dim] upper triangular elements
+            batch_size: batch size
+            
+        Returns:
+            J: [batch, state_dim, state_dim] skew-symmetric matrix
+        """
+        J = torch.zeros(batch_size, self.state_dim, self.state_dim, device=self.device)
+        
+        # Fill upper triangular (excluding diagonal)
+        idx = 0
+        for i in range(self.state_dim):
+            for j in range(i + 1, self.state_dim):
+                J[:, i, j] = J_elements[:, idx]
+                J[:, j, i] = -J_elements[:, idx]  # Skew-symmetric: J[j,i] = -J[i,j]
+                idx += 1
+        
+        return J
+    
+    def _construct_R_matrix(self, R_tril_elements, batch_size):
+        """
+        Construct positive semi-definite dissipation matrix R = L @ L^T.
+        
+        Args:
+            R_tril_elements: [batch, R_tril_dim] lower triangular elements
+            batch_size: batch size
+            
+        Returns:
+            R: [batch, state_dim, state_dim] positive semi-definite matrix
+        """
+        # Create lower triangular matrix L
+        L = torch.zeros(batch_size, self.state_dim, self.state_dim, device=self.device)
+        
+        idx = 0
+        for i in range(self.state_dim):
+            for j in range(i + 1):
+                L[:, i, j] = R_tril_elements[:, idx]
+                idx += 1
+        
+        # Ensure positive diagonal for numerical stability
+        L_diag = torch.diagonal(L, dim1=-2, dim2=-1)
+        L_diag_soft = F.softplus(L_diag) + 1e-4
+        L = L - torch.diag_embed(torch.diagonal(L, dim1=-2, dim2=-1)) + torch.diag_embed(L_diag_soft)
+        
+        # R = L @ L^T (guaranteed positive semi-definite)
+        R = torch.bmm(L, L.transpose(-1, -2))
+        
+        return R
+    
+    def _compute_hamiltonian_gradient(self, obs, state):
+        """
+        Compute Hamiltonian and its gradient w.r.t. state.
+        
+        Args:
+            obs: [batch, obs_dim] observation
+            state: [batch, state_dim] physics state
+            
+        Returns:
+            H: [batch, 1] Hamiltonian value
+            grad_H: [batch, state_dim] gradient of H w.r.t. state
+        """
+        # Check if we're in no_grad mode (inference)
+        if not torch.is_grad_enabled():
+            # In inference mode, compute H and approximate gradient
+            with torch.enable_grad():
+                state_requires_grad = state.clone().requires_grad_(True)
+                H = self.H_net(state_requires_grad)
+                
+                # Compute gradient of H w.r.t. state
+                grad_H = torch.autograd.grad(
+                    outputs=H.sum(),
+                    inputs=state_requires_grad,
+                    create_graph=False,  # Don't need graph in inference
+                    retain_graph=False
+                )[0]
+            # Detach for inference
+            return H.detach(), grad_H.detach()
         else:
-            # (batch_size, obs_dim)
-            obs_flat = obs
-            batch_size = obs.shape[0]
-            n_agents = 1
+            # In training mode, keep gradients for backprop
+            state_requires_grad = state.clone().requires_grad_(True)
+            H = self.H_net(state_requires_grad)
+            
+            # Compute gradient of H w.r.t. state
+            grad_H = torch.autograd.grad(
+                outputs=H.sum(),
+                inputs=state_requires_grad,
+                create_graph=True,
+                retain_graph=True
+            )[0]
+            
+            return H, grad_H
+    
+    def _compute_port_hamiltonian_dynamics(self, obs, state):
+        """
+        Compute Port-Hamiltonian dynamics: ẋ = (J - R) ∇H
         
-        # Forward through base network
-        actor_features = self._forward_base(obs_flat)
+        This provides physics-consistent features for the policy.
         
-        # Get action distribution parameters
-        action_mean, action_std = self._get_action_dist(actor_features)
+        Args:
+            obs: [batch, obs_dim] observation
+            state: [batch, state_dim] physics state
+            
+        Returns:
+            H: Hamiltonian value
+            grad_H: Gradient of Hamiltonian
+            dynamics: (J - R) ∇H term
+        """
+        batch_size = state.shape[0]
+        
+        # Get Hamiltonian and gradient
+        H, grad_H = self._compute_hamiltonian_gradient(obs, state)
+        
+        # Get J and R matrices
+        J_elements = self.J_net(state)
+        R_elements = self.R_net(state)
+        
+        J = self._construct_J_matrix(J_elements, batch_size)
+        R = self._construct_R_matrix(R_elements, batch_size)
+        
+        # Compute dynamics: (J - R) ∇H
+        J_minus_R = J - R
+        dynamics = torch.bmm(J_minus_R, grad_H.unsqueeze(-1)).squeeze(-1)
+        
+        return H, grad_H, dynamics
+    
+    def forward(self, obs, rnn_states=None, masks=None, available_actions=None, deterministic=False):
+        """
+        Forward pass: compute action from observation.
+        
+        Args:
+            obs: [batch, obs_dim] observation tensor
+            rnn_states: RNN hidden states (unused, for compatibility)
+            masks: Episode masks (unused)
+            available_actions: Available actions mask (unused)
+            deterministic: Whether to sample or use mean action
+            
+        Returns:
+            actions: [batch, act_dim] actions
+            action_log_probs: [batch, act_dim] log probabilities
+            rnn_states: Unchanged RNN states
+        """
+        obs = check(obs).to(self.device)
+        
+        # Extract physics state
+        state = self._extract_physics_state(obs)
+        
+        # Compute Port-Hamiltonian features
+        H, grad_H, _ = self._compute_port_hamiltonian_dynamics(obs, state)
+        
+        # Extract base features (standard MLP path)
+        obs_normalized = self.feature_norm(obs)
+        base_features = self.base_net(obs_normalized)
+        
+        # Combine physics and learned features
+        physics_features = torch.cat([H, grad_H], dim=-1)  # [batch, 1 + state_dim]
+        combined_features = torch.cat([base_features, physics_features], dim=-1)
+        
+        # Policy integration
+        policy_features = self.policy_integration(combined_features)
+        
+        # Compute action mean and std
+        action_mean = self.action_mean(policy_features)
+        action_std = torch.sigmoid(self.log_std / self.std_x_coef) * self.std_y_coef
+        action_std = action_std.expand_as(action_mean)
         
         # Create distribution
-        dist = Normal(action_mean, action_std)
+        dist = torch.distributions.Normal(action_mean, action_std)
         
         if deterministic:
-            actions = action_mean
+            action = action_mean
         else:
-            actions = dist.sample()
+            action = dist.rsample()  # Reparameterization trick
         
-        # Compute log probabilities (like MAPPO's FixedNormal.log_probs - NO sum!)
-        action_log_probs = dist.log_prob(actions)
+        # Compute log probability
+        action_log_probs = dist.log_prob(action)  # Per-dimension, no sum (like MAPPO)
         
-        # Reshape back if needed
-        if len(original_shape) == 3:
-            actions = actions.reshape(batch_size, n_agents, -1)
-            action_log_probs = action_log_probs.reshape(batch_size, n_agents, -1)
+        # Return same rnn_states for compatibility
+        if rnn_states is None:
+            rnn_states = torch.zeros(obs.shape[0], 1, 1, device=self.device)
         
-        return actions, action_log_probs, rnn_states
+        return action, action_log_probs, rnn_states
     
     def evaluate_actions(self, obs, rnn_states, action, masks, available_actions=None, active_masks=None):
         """
-        Evaluate actions for training.
+        Evaluate given actions for PPO update.
         
         Args:
-            obs: Observations
-            rnn_states: Recurrent states
-            action: Actions to evaluate
+            obs: [batch, obs_dim] observations
+            rnn_states: RNN states (unused)
+            action: [batch, act_dim] actions to evaluate
             masks: Episode masks
-            available_actions: Available actions (optional)
-            active_masks: Active masks for multi-agent (optional)
+            available_actions: Available actions (unused)
+            active_masks: Active agent masks
             
         Returns:
-            action_log_probs: Log probabilities of actions
-            dist_entropy: Entropy of the distribution
+            action_log_probs: Log probability of actions
+            dist_entropy: Entropy of action distribution
         """
-        obs = check(obs).to(**self.tpdv)
-        action = check(action).to(**self.tpdv)
+        obs = check(obs).to(self.device)
+        action = check(action).to(self.device)
         
-        # Handle observation shape
-        if obs.dim() == 3:
-            # (batch_size, n_agents, obs_dim) -> (batch_size * n_agents, obs_dim)
-            batch_size = obs.shape[0]
-            n_agents = obs.shape[1]
-            obs_flat = obs.reshape(-1, self.obs_dim)
-            action_flat = action.reshape(-1, self.act_dim)
-        else:
-            obs_flat = obs
-            action_flat = action
-            batch_size = obs.shape[0]
-            n_agents = 1
+        # Extract physics state
+        state = self._extract_physics_state(obs)
         
-        # Forward through base network
-        actor_features = self._forward_base(obs_flat)
+        # Compute Port-Hamiltonian features
+        H, grad_H, _ = self._compute_port_hamiltonian_dynamics(obs, state)
         
-        # Get action distribution parameters
-        action_mean, action_std = self._get_action_dist(actor_features)
+        # Extract base features
+        obs_normalized = self.feature_norm(obs)
+        base_features = self.base_net(obs_normalized)
         
-        # Create distribution
-        dist = Normal(action_mean, action_std)
+        # Combine features
+        physics_features = torch.cat([H, grad_H], dim=-1)
+        combined_features = torch.cat([base_features, physics_features], dim=-1)
         
-        # Compute log probabilities (like MAPPO's FixedNormal.log_probs)
-        action_log_probs = dist.log_prob(action_flat)
+        # Policy integration
+        policy_features = self.policy_integration(combined_features)
+        
+        # Compute action distribution
+        action_mean = self.action_mean(policy_features)
+        action_std = torch.sigmoid(self.log_std / self.std_x_coef) * self.std_y_coef
+        action_std = action_std.expand_as(action_mean)
+        
+        dist = torch.distributions.Normal(action_mean, action_std)
+        
+        # Compute log prob of given action
+        action_log_probs = dist.log_prob(action)  # Per-dimension (like MAPPO)
         
         # Compute entropy
-        if active_masks is not None:
-            active_masks = check(active_masks).to(**self.tpdv)
-            if active_masks.dim() == 3:
-                active_masks_flat = active_masks.reshape(-1, 1)
-            else:
-                active_masks_flat = active_masks
-            dist_entropy = (dist.entropy().sum(dim=-1, keepdim=True) * active_masks_flat).sum() / active_masks_flat.sum()
-        else:
-            dist_entropy = dist.entropy().mean()
-        
-        # Reshape back if needed
-        if n_agents > 1:
-            action_log_probs = action_log_probs.reshape(batch_size, n_agents, -1)
+        dist_entropy = dist.entropy().mean()
         
         return action_log_probs, dist_entropy
-
-
-class MAPPO_PINN_Policy:
-    """MAPPO Policy with PINN Actor."""
     
+    def get_physics_info(self, obs):
+        """
+        Get Port-Hamiltonian physics information for analysis/logging.
+        
+        Returns:
+            dict with H, grad_H, J, R matrices
+        """
+        obs = check(obs).to(self.device)
+        state = self._extract_physics_state(obs)
+        batch_size = state.shape[0]
+        
+        H, grad_H = self._compute_hamiltonian_gradient(obs, state)
+        
+        J_elements = self.J_net(state)
+        R_elements = self.R_net(state)
+        
+        J = self._construct_J_matrix(J_elements, batch_size)
+        R = self._construct_R_matrix(R_elements, batch_size)
+        
+        return {
+            'H': H.detach(),
+            'grad_H': grad_H.detach(),
+            'J': J.detach(),
+            'R': R.detach(),
+            'state': state.detach()
+        }
+
+
+# =============================================================================
+# MAPPO-PINN Policy with Port-Hamiltonian Actor
+# =============================================================================
+
+class MAPPOPINNPointPolicy:
+    """MAPPO policy with Port-Hamiltonian PINN Actor for Point agents."""
+
     def __init__(self, config, obs_space, cent_obs_space, act_space):
         self.config = config
         self.obs_space = obs_space
         self.act_space = act_space
         self.share_obs_space = cent_obs_space
 
-        self.actor = PINNActor(config, self.obs_space, self.act_space, self.config["device"])
+        # Use Port-Hamiltonian PINN Actor
+        self.actor = PortHamiltonianPINNActor(config, self.obs_space, self.act_space, self.config["device"])
+        
+        # Use standard Critic (like MAPPO)
         self.critic = Critic(config, self.share_obs_space, self.config["device"])
 
         self.actor_optimizer = torch.optim.Adam(
@@ -295,11 +531,14 @@ class MAPPO_PINN_Policy:
             weight_decay=self.config["weight_decay"]
         )
 
-    def get_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, masks, 
-                    available_actions=None, deterministic=False):
-        actions, action_log_probs, rnn_states_actor = self.actor(
-            obs, rnn_states_actor, masks, available_actions, deterministic
-        )
+    def get_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, masks, available_actions=None,
+                    deterministic=False):
+        actions, action_log_probs, rnn_states_actor = self.actor(obs,
+                                                                 rnn_states_actor,
+                                                                 masks,
+                                                                 available_actions,
+                                                                 deterministic)
+
         values, rnn_states_critic = self.critic(cent_obs, rnn_states_critic, masks)
         return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic
 
@@ -309,9 +548,13 @@ class MAPPO_PINN_Policy:
 
     def evaluate_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, action, masks,
                          available_actions=None, active_masks=None):
-        action_log_probs, dist_entropy = self.actor.evaluate_actions(
-            obs, rnn_states_actor, action, masks, available_actions, active_masks
-        )
+        action_log_probs, dist_entropy = self.actor.evaluate_actions(obs,
+                                                                     rnn_states_actor,
+                                                                     action,
+                                                                     masks,
+                                                                     available_actions,
+                                                                     active_masks)
+
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         return values, action_log_probs, dist_entropy
 
@@ -320,19 +563,23 @@ class MAPPO_PINN_Policy:
         return actions, rnn_states_actor
 
 
-class MAPPO_PINN_Trainer():
-    """MAPPO Trainer with PINN Actor."""
-    
+# =============================================================================
+# MAPPO-PINN Trainer (same as MAPPO)
+# =============================================================================
+
+class MAPPOPINNPointTrainer():
+
     def __init__(self, config, policy):
+        
         self.config = config
         self.tpdv = dict(dtype=torch.float32, device=self.config["device"])
         self.policy = policy
+
         self.value_normalizer = PopArt(1, device=self.config["device"])
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
-        value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(
-            -self.config["clip_param"], self.config["clip_param"]
-        )
+        value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.config["clip_param"],
+                                                                                    self.config["clip_param"])
         error_clipped = self.value_normalizer(return_batch) - value_pred_clipped
         error_original = self.value_normalizer(return_batch) - values
 
@@ -340,43 +587,36 @@ class MAPPO_PINN_Trainer():
         value_loss_original = huber_loss(error_original, self.config["huber_delta"])
 
         value_loss = torch.max(value_loss_original, value_loss_clipped)
+
         return value_loss.mean()
 
     def ppo_update(self, sample):
-        """PPO update step.
-        
-        Args:
-            sample: Batch sample from buffer
-        """
         share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
         value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, \
         adv_targ, available_actions_batch, _ = sample
-        
         old_action_log_probs_batch, adv_targ, value_preds_batch, return_batch, active_masks_batch = [
             check(x).to(**self.tpdv) for x in [
                 old_action_log_probs_batch, adv_targ, value_preds_batch, return_batch, active_masks_batch
             ]
         ]
 
-        # Use single-agent obs for training (PINN constraints only in collect/inference)
-        values, action_log_probs, dist_entropy = self.policy.evaluate_actions(
-            share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch,
-            actions_batch, masks_batch, available_actions_batch, active_masks_batch
-        )
-        
+        values, action_log_probs, dist_entropy = self.policy.evaluate_actions(share_obs_batch,
+                                                                              obs_batch,
+                                                                              rnn_states_batch,
+                                                                              rnn_states_critic_batch,
+                                                                              actions_batch,
+                                                                              masks_batch,
+                                                                              available_actions_batch,
+                                                                              active_masks_batch)
         imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
 
         surr1 = imp_weights * adv_targ
-        surr2 = torch.clamp(
-            imp_weights, 
-            1.0 - self.config["clip_param"], 
-            1.0 + self.config["clip_param"]
-        ) * adv_targ
+        surr2 = torch.clamp(imp_weights, 1.0 - self.config["clip_param"], 1.0 + self.config["clip_param"]) * adv_targ
 
         if self.config["use_policy_active_masks"]:
-            policy_action_loss = (-torch.sum(
-                torch.min(surr1, surr2), dim=-1, keepdim=True
-            ) * active_masks_batch).sum() / active_masks_batch.sum()
+            policy_action_loss = (-torch.sum(torch.min(surr1, surr2),
+                                             dim=-1,
+                                             keepdim=True) * active_masks_batch).sum() / active_masks_batch.sum()
         else:
             policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
 
@@ -384,28 +624,19 @@ class MAPPO_PINN_Trainer():
 
         self.policy.actor_optimizer.zero_grad()
         (policy_loss - dist_entropy * self.config["entropy_coef"]).backward()
-        actor_grad_norm = nn.utils.clip_grad_norm_(
-            self.policy.actor.parameters(), self.config["max_grad_norm"]
-        )
+        actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.config["max_grad_norm"])
         self.policy.actor_optimizer.step()
 
         value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
         self.policy.critic_optimizer.zero_grad()
         (value_loss * self.config["value_loss_coef"]).backward()
-        critic_grad_norm = nn.utils.clip_grad_norm_(
-            self.policy.critic.parameters(), self.config["max_grad_norm"]
-        )
+        critic_grad_norm = nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.config["max_grad_norm"])
+
         self.policy.critic_optimizer.step()
 
         return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights
 
     def train(self, buffer, logger):
-        """Train with PPO algorithm.
-        
-        Args:
-            buffer: Replay buffer for this agent
-            logger: Logger for metrics
-        """
         advantages = buffer.returns[:-1] - self.value_normalizer.denormalize(buffer.value_preds[:-1])
         advantages_copy = advantages.clone()
         mean_advantages = torch.mean(advantages_copy)
@@ -413,17 +644,11 @@ class MAPPO_PINN_Trainer():
         advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
 
         for _ in range(self.config["learning_iters"]):
-            if self.config.get("data_chunk_length") is not None:
-                data_generator = buffer.recurrent_generator(advantages, self.config["num_mini_batch"], self.config["data_chunk_length"])
-            else:
-                data_generator = buffer.feed_forward_generator(advantages, self.config["num_mini_batch"])
+            data_generator = buffer.feed_forward_generator(advantages, self.config["num_mini_batch"])
 
             for sample in data_generator:
-                # Train using single-agent obs from mini-batch
-                # PINN physics constraints are applied during collect/inference, not training
-                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights = \
-                    self.ppo_update(sample)
-            
+                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights \
+                    = self.ppo_update(sample)
             logger.store(
                 **{
                     "Loss/Loss_reward_critic": value_loss.item(),
@@ -443,19 +668,24 @@ class MAPPO_PINN_Trainer():
         self.policy.critic.eval()
 
 
+# =============================================================================
+# Runner (same as MAPPO, but uses PINN Policy/Trainer)
+# =============================================================================
+
 class Runner:
-    """Runner for MAPPO with PINN."""
-    
-    def __init__(self, vec_env, vec_eval_env, config, model_dir=""):
+
+    def __init__(self,
+                 vec_env,
+                 vec_eval_env,
+                 config,
+                 model_dir=""
+                 ):
         self.envs = vec_env
         self.eval_envs = vec_eval_env
         self.config = config
         self.model_dir = model_dir
 
         self.num_agents = self.envs.num_agents
-        
-        # Add n_agents to config for PINN
-        self.config["n_agents"] = self.num_agents
 
         # Track the best eval reward for conditional video rendering
         self.render_max_reward = float(self.config.get("render_max_reward", float("-inf")))
@@ -470,14 +700,13 @@ class Runner:
         
         # Initialize logger with wandb
         self.logger = EpochLogger(
-            log_dir=config["log_dir"],
-            seed=str(config["seed"]),
+            log_dir = config["log_dir"],
+            seed = str(config["seed"]),
             use_wandb=config.get("use_wandb", True),
             wandb_project=config.get("wandb_project", "safepo"),
             wandb_config=config,
             verbose=False,
         )
-        
         self.save_dir = str(config["log_dir"]+'/models_seed{}'.format(self.config["seed"]))
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
@@ -492,28 +721,15 @@ class Runner:
             max_episode_length=config.get("episode_length", 1000)
         )
         
+        # Create PINN policies for each agent
         self.policy = []
-        # For PINN, we use a single shared actor for all agents
-        # since PINN needs all agents' observations to compute physics constraints
-        shared_actor = PINNActor(config, self.envs.observation_space[0], self.envs.action_space[0], config["device"])
-        
         for agent_id in range(self.num_agents):
             share_observation_space = self.envs.share_observation_space[agent_id]
-            po = MAPPO_PINN_Policy(
-                config,
-                self.envs.observation_space[agent_id],
-                share_observation_space,
-                self.envs.action_space[agent_id]
-            )
-            # Share the same actor across all agents
-            po.actor = shared_actor
-            # Re-initialize optimizer to include shared actor parameters
-            po.actor_optimizer = torch.optim.Adam(
-                po.actor.parameters(),
-                lr=config["actor_lr"],
-                eps=config["opti_eps"],
-                weight_decay=config["weight_decay"]
-            )
+            po = MAPPOPINNPointPolicy(config,
+                        self.envs.observation_space[agent_id],
+                        share_observation_space,
+                        self.envs.action_space[agent_id]
+                        )
             self.policy.append(po)
 
         if self.model_dir != "":
@@ -522,15 +738,13 @@ class Runner:
         self.trainer = []
         self.buffer = []
         for agent_id in range(self.num_agents):
-            tr = MAPPO_PINN_Trainer(config, self.policy[agent_id])
+            tr = MAPPOPINNPointTrainer(config, self.policy[agent_id])
             share_observation_space = self.envs.share_observation_space[agent_id]
 
-            bu = SeparatedReplayBuffer(
-                config,
-                self.envs.observation_space[agent_id],
-                share_observation_space,
-                self.envs.action_space[agent_id]
-            )
+            bu = SeparatedReplayBuffer(config,
+                                       self.envs.observation_space[agent_id],
+                                       share_observation_space,
+                                       self.envs.action_space[agent_id])
             self.buffer.append(bu)
             self.trainer.append(tr)
 
@@ -542,11 +756,11 @@ class Runner:
 
         train_episode_rewards = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
         train_episode_costs = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
-        eval_rewards = 0.0
-        eval_costs = 0.0
-        
-        pbar = tqdm(range(episodes), desc="Training MAPPO-PINN", ncols=100)
+        eval_rewards=0.0
+        eval_costs=0.0
+        pbar = tqdm(range(episodes), desc="MAPPO-PINN-Point Training", ncols=100)
         for episode in pbar:
+
             done_episodes_rewards = []
             done_episodes_costs = []
 
@@ -575,7 +789,6 @@ class Runner:
                        rnn_states, rnn_states_critic
 
                 self.insert(data)
-                
             self.compute()
             self.train()
 
@@ -593,7 +806,6 @@ class Runner:
                 aver_episode_rewards = torch.stack(done_episodes_rewards).mean()
                 aver_episode_costs = torch.stack(done_episodes_costs).mean()
                 self.return_aver_cost(aver_episode_costs)
-                
                 self.logger.store(
                     **{
                         "Metrics/EpRet": aver_episode_rewards.item(),
@@ -623,7 +835,6 @@ class Runner:
                     'EpRet': f"{aver_episode_rewards.item():.2f}",
                     'EpCost': f"{aver_episode_costs.item():.2f}",
                 })
-                
         pbar.close()
 
     def return_aver_cost(self, aver_episode_costs):
@@ -636,7 +847,7 @@ class Runner:
 
         for agent_id in range(self.num_agents):
             self.buffer[agent_id].share_obs[0].copy_(share_obs[:, agent_id])
-            if 'Frank' in self.config['env_name']:
+            if 'Frank'in self.config['env_name']:
                 self.buffer[agent_id].obs[0].copy_(obs[agent_id])
             else:
                 self.buffer[agent_id].obs[0].copy_(obs[:, agent_id])
@@ -648,50 +859,23 @@ class Runner:
         action_log_prob_collector = []
         rnn_state_collector = []
         rnn_state_critic_collector = []
-        
-        # Collect all agents' observations for PINN
-        all_obs = torch.stack([self.buffer[agent_id].obs[step] for agent_id in range(self.num_agents)], dim=1)
-        # all_obs shape: (n_rollout_threads, n_agents, obs_dim)
-        
         for agent_id in range(self.num_agents):
             self.trainer[agent_id].prep_rollout()
-            # For value estimation, use centralized observation
-            value, rnn_state_critic = self.trainer[agent_id].policy.critic(
-                self.buffer[agent_id].share_obs[step],
-                self.buffer[agent_id].rnn_states_critic[step],
-                self.buffer[agent_id].masks[step]
-            )
-            
-            # For action generation, use PINN with all agents' observations
-            if agent_id == 0:  # Only call PINN once for all agents
-                all_actions, all_action_log_probs, all_rnn_states = self.trainer[agent_id].policy.actor(
-                    all_obs,
-                    self.buffer[agent_id].rnn_states[step],
-                    self.buffer[agent_id].masks[step],
-                    deterministic=False
-                )
-            
-            # Extract action for this specific agent
-            if all_actions.dim() == 3:  # (batch, n_agents, action_dim)
-                action = all_actions[:, agent_id, :]
-                action_log_prob = all_action_log_probs[:, agent_id, :]
-            elif all_actions.dim() == 2 and self.n_agents > 1:  # (batch, action_dim) - shouldn't happen
-                action = all_actions
-                action_log_prob = all_action_log_probs
-            else:  # Single agent or already extracted
-                action = all_actions
-                action_log_prob = all_action_log_probs
-            
+            value, action, action_log_prob, rnn_state, rnn_state_critic \
+                = self.trainer[agent_id].policy.get_actions(self.buffer[agent_id].share_obs[step],
+                                                            self.buffer[agent_id].obs[step],
+                                                            self.buffer[agent_id].rnn_states[step],
+                                                            self.buffer[agent_id].rnn_states_critic[step],
+                                                            self.buffer[agent_id].masks[step])
             value_collector.append(value.detach())
             action_collector.append(action.detach())
+
             action_log_prob_collector.append(action_log_prob.detach())
-            rnn_state_collector.append(self.buffer[agent_id].rnn_states[step].detach())
+            rnn_state_collector.append(rnn_state.detach())
             rnn_state_critic_collector.append(rnn_state_critic.detach())
-            
         if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
             zeros = torch.zeros(action_collector[-1].shape[0], 1)
-            action_collector[-1] = torch.cat((action_collector[-1], zeros), dim=1)
-            
+            action_collector[-1]=torch.cat((action_collector[-1], zeros), dim=1)
         values = torch.transpose(torch.stack(value_collector), 1, 0)
         rnn_states = torch.transpose(torch.stack(rnn_state_collector), 1, 0)
         rnn_states_critic = torch.transpose(torch.stack(rnn_state_critic_collector), 1, 0)
@@ -705,58 +889,60 @@ class Runner:
         dones_env = torch.all(dones, axis=1)
 
         rnn_states[dones_env == True] = torch.zeros(
-            (dones_env == True).sum(), self.num_agents, self.config["recurrent_N"], 
-            self.config["hidden_size"], device=self.config["device"]
-        )
+            (dones_env == True).sum(), self.num_agents, self.config["recurrent_N"], self.config["hidden_size"], device=self.config["device"])
         rnn_states_critic[dones_env == True] = torch.zeros(
-            (dones_env == True).sum(), self.num_agents, *self.buffer[0].rnn_states_critic.shape[2:], 
-            device=self.config["device"]
-        )
+            (dones_env == True).sum(), self.num_agents, *self.buffer[0].rnn_states_critic.shape[2:], device=self.config["device"])
 
         masks = torch.ones(self.config["n_rollout_threads"], self.num_agents, 1, device=self.config["device"])
-        masks[dones_env == True] = torch.zeros(
-            (dones_env == True).sum(), self.num_agents, 1, device=self.config["device"]
-        )
+        masks[dones_env == True] = torch.zeros((dones_env == True).sum(), self.num_agents, 1, device=self.config["device"])
 
         active_masks = torch.ones(self.config["n_rollout_threads"], self.num_agents, 1, device=self.config["device"])
         active_masks[dones == True] = torch.zeros((dones == True).sum(), 1, device=self.config["device"])
-        active_masks[dones_env == True] = torch.ones(
-            (dones_env == True).sum(), self.num_agents, 1, device=self.config["device"]
-        )
+        active_masks[dones_env == True] = torch.ones((dones_env == True).sum(), self.num_agents, 1, device=self.config["device"])
 
         if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
-            actions[1] = actions[1][:, :8]
-            
+            actions[1]=actions[1][:, :8]
         for agent_id in range(self.num_agents):
-            if 'Frank' in self.config['env_name']:
+            if 'Frank'in self.config['env_name']:
                 obs_to_insert = obs[agent_id]
             else:
                 obs_to_insert = obs[:, agent_id]
-            self.buffer[agent_id].insert(
-                share_obs[:, agent_id], obs_to_insert, rnn_states[:, agent_id],
-                rnn_states_critic[:, agent_id], actions[agent_id],
-                action_log_probs[agent_id],
-                values[:, agent_id], rewards[:, agent_id].unsqueeze(-1), 
-                masks[:, agent_id], None,
-                active_masks[:, agent_id], None
-            )
+            self.buffer[agent_id].insert(share_obs[:, agent_id], obs_to_insert, rnn_states[:, agent_id],
+                                         rnn_states_critic[:, agent_id], actions[agent_id],
+                                         action_log_probs[agent_id],
+                                         values[:, agent_id], rewards[:, agent_id].unsqueeze(-1), masks[:, agent_id], None,
+                                         active_masks[:, agent_id], None)
 
     def train(self):
         action_dim = 1
-        factor = torch.ones(
-            self.config["episode_length"], self.config["n_rollout_threads"], 
-            action_dim, device=self.config["device"]
-        )
+        factor = torch.ones(self.config["episode_length"], self.config["n_rollout_threads"], action_dim, device=self.config["device"])
 
         for agent_id in torch.randperm(self.num_agents):
-            action_dim = self.buffer[agent_id].actions.shape[-1]
+            action_dim=self.buffer[agent_id].actions.shape[-1]
 
             self.trainer[agent_id].prep_training()
             self.buffer[agent_id].update_factor(factor)
-            
-            # Train without all_obs - PINN constraints only used during collect/inference
-            # This avoids the batch size mismatch issue between full buffer and mini-batches
+            available_actions = None if self.buffer[agent_id].available_actions is None \
+                else self.buffer[agent_id].available_actions[:-1].reshape(-1, *self.buffer[agent_id].available_actions.shape[2:])
+
+            old_actions_logprob, _ =self.trainer[agent_id].policy.actor.evaluate_actions(self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
+                                                        self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
+                                                        self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
+                                                        self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
+                                                        available_actions,
+                                                        self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
             self.trainer[agent_id].train(self.buffer[agent_id], logger=self.logger)
+
+            new_actions_logprob, _ =self.trainer[agent_id].policy.actor.evaluate_actions(self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
+                                                        self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
+                                                        self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
+                                                        self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
+                                                        available_actions,
+                                                        self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
+
+            action_prod = torch.prod(torch.exp(new_actions_logprob.detach()-old_actions_logprob.detach()).reshape(self.config["episode_length"],self.config["n_rollout_threads"],action_dim), dim=-1, keepdim=True)
+            factor = factor*action_prod.detach()
+            self.buffer[agent_id].after_update()
 
     def save(self):
         for agent_id in range(self.num_agents):
@@ -780,56 +966,49 @@ class Runner:
         one_episode_rewards = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
         one_episode_costs = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
         
+        # Track best episode that beats global max for video recording
         best_episode_frames = []
-        best_episode_reward = float("-inf")
+        best_episode_reward = 0.0
         best_episode_cost = 0.0
         best_episode_num = 0
         current_frames = []
 
         eval_obs, _, _ = self.eval_envs.reset()
 
-        eval_rnn_states = torch.zeros(
-            self.config["n_eval_rollout_threads"], self.num_agents, self.config["recurrent_N"], 
-            self.config["hidden_size"], device=self.config["device"]
-        )
-        eval_masks = torch.ones(
-            self.config["n_eval_rollout_threads"], self.num_agents, 1, device=self.config["device"]
-        )
+        eval_rnn_states = torch.zeros(self.config["n_eval_rollout_threads"], self.num_agents, self.config["recurrent_N"], self.config["hidden_size"],
+                                   device=self.config["device"])
+        eval_masks = torch.ones(self.config["n_eval_rollout_threads"], self.num_agents, 1, device=self.config["device"])
 
         while True:
-            # Collect all agents' observations for PINN
-            if 'Frank' in self.config['env_name']:
-                all_eval_obs = torch.stack([eval_obs[agent_id] for agent_id in range(self.num_agents)], dim=1)
-            else:
-                all_eval_obs = eval_obs
-            
-            # Use shared actor for all agents
-            self.trainer[0].prep_rollout()
-            eval_actions, _, updated_rnn_states = self.trainer[0].policy.actor(
-                all_eval_obs,
-                eval_rnn_states,
-                eval_masks,
-                available_actions=None,
-                deterministic=True
-            )
-            eval_rnn_states = updated_rnn_states
-            
-            # Split actions for each agent
-            eval_actions_collector = [eval_actions[:, agent_id] for agent_id in range(self.num_agents)]
+            eval_actions_collector = []
+            for agent_id in range(self.num_agents):
+                self.trainer[agent_id].prep_rollout()
+                if 'Frank'in self.config['env_name']:
+                    obs_to_eval = eval_obs[agent_id]
+                else:
+                    obs_to_eval = eval_obs[:, agent_id]
+                eval_actions, temp_rnn_state = \
+                    self.trainer[agent_id].policy.act(obs_to_eval,
+                                                      eval_rnn_states[:, agent_id],
+                                                      eval_masks[:, agent_id],
+                                                      deterministic=True)
+                eval_rnn_states[:, agent_id] = temp_rnn_state
+                eval_actions_collector.append(eval_actions)
 
             if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
                 zeros = torch.zeros(eval_actions_collector[-1].shape[0], 1)
-                eval_actions_collector[-1] = torch.cat((eval_actions_collector[-1], zeros), dim=1)
+                eval_actions_collector[-1]=torch.cat((eval_actions_collector[-1], zeros), dim=1)
             
             # Capture frame for video (only for non-Isaac Gym envs)
             if self.video_recorder.enabled and self.config["env_name"] not in isaac_gym_map:
-                try:
-                    if hasattr(self.eval_envs, 'render'):
+                if hasattr(self.eval_envs, 'render'):
+                    try:
                         frame = self.eval_envs.render()
-                        if frame is not None and len(frame.shape) == 3:
-                            current_frames.append(frame.copy())
-                except Exception:
-                    pass
+                        if frame is not None:
+                            if isinstance(frame, np.ndarray) and len(frame.shape) == 3:
+                                current_frames.append(frame.copy())
+                    except Exception as e:
+                        pass
 
             eval_obs, _, eval_rewards, eval_costs, eval_dones, _, _ = self.eval_envs.step(
                 eval_actions_collector
@@ -844,16 +1023,11 @@ class Runner:
             eval_dones_env = torch.all(eval_dones, dim=1)
 
             eval_rnn_states[eval_dones_env == True] = torch.zeros(
-                (eval_dones_env == True).sum(), self.num_agents, self.config["recurrent_N"], 
-                self.config["hidden_size"], device=self.config["device"]
-            )
+                (eval_dones_env == True).sum(), self.num_agents, self.config["recurrent_N"], self.config["hidden_size"], device=self.config["device"])
 
-            eval_masks = torch.ones(
-                self.config["n_eval_rollout_threads"], self.num_agents, 1, device=self.config["device"]
-            )
-            eval_masks[eval_dones_env == True] = torch.zeros(
-                (eval_dones_env == True).sum(), self.num_agents, 1, device=self.config["device"]
-            )
+            eval_masks = torch.ones(self.config["n_eval_rollout_threads"], self.num_agents, 1, device=self.config["device"])
+            eval_masks[eval_dones_env == True] = torch.zeros((eval_dones_env == True).sum(), self.num_agents, 1,
+                                                          device=self.config["device"])
 
             for eval_i in range(self.config["n_eval_rollout_threads"]):
                 if eval_dones_env[eval_i]:
@@ -893,43 +1067,39 @@ class Runner:
                             key="eval/video"
                         )
                 
-                eval_episode_rewards = np.array(eval_episode_rewards)
-                eval_episode_costs = np.array(eval_episode_costs)
-                return eval_episode_rewards.mean(), eval_episode_costs.mean()
+                return np.mean(eval_episode_rewards), np.mean(eval_episode_costs)
 
     @torch.no_grad()
     def compute(self):
         for agent_id in range(self.num_agents):
             self.trainer[agent_id].prep_rollout()
-            next_value = self.trainer[agent_id].policy.get_values(
-                self.buffer[agent_id].share_obs[-1],
-                self.buffer[agent_id].rnn_states_critic[-1],
-                self.buffer[agent_id].masks[-1]
-            )
+            next_value = self.trainer[agent_id].policy.get_values(self.buffer[agent_id].share_obs[-1],
+                                                                self.buffer[agent_id].rnn_states_critic[-1],
+                                                                self.buffer[agent_id].masks[-1])
             next_value = next_value.detach()
             self.buffer[agent_id].compute_returns(next_value, self.trainer[agent_id].value_normalizer)
 
 
 def train(args, cfg_train):
-    """Main training function."""
-    agent_index = [[[0, 1, 2, 3, 4, 5]], [[0, 1, 2, 3, 4, 5]]]
-    
+    agent_index = [[[0, 1, 2, 3, 4, 5]],
+                   [[0, 1, 2, 3, 4, 5]]]
     if args.task in multi_agent_velocity_map:
         env = make_ma_mujoco_env(
-            scenario=args.scenario,
-            agent_conf=args.agent_conf,
-            seed=args.seed,
-            cfg_train=cfg_train,
-        )
+        scenario=args.scenario,
+        agent_conf=args.agent_conf,
+        seed=args.seed,
+        cfg_train=cfg_train,
+    )
         cfg_eval = copy.deepcopy(cfg_train)
         cfg_eval["seed"] = args.seed + 10000
         cfg_eval["n_rollout_threads"] = cfg_eval["n_eval_rollout_threads"]
+        cfg_eval["render_mode"] = "rgb_array"  # Enable rendering for evaluation
         eval_env = make_ma_mujoco_env(
-            scenario=args.scenario,
-            agent_conf=args.agent_conf,
-            seed=cfg_eval['seed'],
-            cfg_train=cfg_eval,
-        )
+        scenario=args.scenario,
+        agent_conf=args.agent_conf,
+        seed=cfg_eval['seed'],
+        cfg_train=cfg_eval,
+    )
     elif args.task in isaac_gym_map:
         sim_params = parse_sim_params(args, cfg_env, cfg_train)
         env = make_ma_isaac_env(args, cfg_env, cfg_train, sim_params, agent_index)
@@ -942,7 +1112,7 @@ def train(args, cfg_train):
         cfg_eval["seed"] = args.seed + 10000
         cfg_eval["n_rollout_threads"] = cfg_eval["n_eval_rollout_threads"]
         eval_env = make_ma_multi_goal_env(task=args.task, seed=args.seed + 10000, cfg_train=cfg_eval)
-    else:
+    else: 
         raise NotImplementedError
     
     torch.set_num_threads(4)
@@ -958,7 +1128,6 @@ if __name__ == '__main__':
     set_np_formatting()
     args, cfg_env, cfg_train = multi_agent_args(algo="mappo_pinn")
     set_seed(cfg_train.get("seed", -1), cfg_train.get("torch_deterministic", False))
-    
     if args.write_terminal:
         train(args=args, cfg_train=cfg_train)
     else:
@@ -971,13 +1140,19 @@ if __name__ == '__main__':
         if not os.path.exists(cfg_train['log_dir']):
             os.makedirs(cfg_train['log_dir'], exist_ok=True)
         with open(
-            os.path.join(f"{cfg_train['log_dir']}", terminal_log_name),
+            os.path.join(
+                f"{cfg_train['log_dir']}",
+                terminal_log_name,
+            ),
             "w",
             encoding="utf-8",
         ) as f_out:
             sys.stdout = f_out
             with open(
-                os.path.join(f"{cfg_train['log_dir']}", error_log_name),
+                os.path.join(
+                    f"{cfg_train['log_dir']}",
+                    error_log_name,
+                ),
                 "w",
                 encoding="utf-8",
             ) as f_error:
