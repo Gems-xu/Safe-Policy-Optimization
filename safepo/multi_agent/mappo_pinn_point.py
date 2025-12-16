@@ -103,18 +103,20 @@ class PortHamiltonianPINNActor(nn.Module):
         
         # Configuration
         self.hidden_size = config.get("hidden_size", 256)
-        self.physics_hidden = config.get("physics_hidden", 64)
-        self.state_dim = config.get("pinn_state_dim", 4)  # (vx, vy, ax, ay) or similar
+        self.physics_hidden = config.get("physics_hidden", 128)  # Increased from 64
+        self.state_dim = config.get("pinn_state_dim", 8)  # Expanded: (vx, vy, ax, ay, wz, cos_theta, sin_theta, speed)
         self.std_x_coef = config.get("std_x_coef", 1.0)
         self.std_y_coef = config.get("std_y_coef", 0.5)
         
         # Physics state extraction indices (for Point agent observation)
         # obs[0:3] = accelerometer (ax, ay, az)
         # obs[3:6] = velocimeter (vx, vy, vz)  <- velocity!
-        # obs[6:9] = gyro (angular velocity)
-        # obs[9:12] = magnetometer (orientation)
+        # obs[6:9] = gyro (wx, wy, wz) <- angular velocity
+        # obs[9:12] = magnetometer (mx, my, mz) <- orientation
         self.vel_indices = [3, 4]  # vx, vy
         self.acc_indices = [0, 1]  # ax, ay
+        self.gyro_index = 8  # wz (rotation around z-axis)
+        self.mag_indices = [9, 10]  # mx, my for cos/sin theta
         
         # ===================
         # Physics Networks (Port-Hamiltonian)
@@ -125,8 +127,10 @@ class PortHamiltonianPINNActor(nn.Module):
         self.H_net = nn.Sequential(
             nn.Linear(self.state_dim, self.physics_hidden),
             nn.ELU(),
+            nn.LayerNorm(self.physics_hidden),
             nn.Linear(self.physics_hidden, self.physics_hidden),
             nn.ELU(),
+            nn.LayerNorm(self.physics_hidden),
             nn.Linear(self.physics_hidden, 1)  # Scalar Hamiltonian
         )
         
@@ -136,6 +140,7 @@ class PortHamiltonianPINNActor(nn.Module):
         self.J_net = nn.Sequential(
             nn.Linear(self.state_dim, self.physics_hidden),
             nn.ELU(),
+            nn.LayerNorm(self.physics_hidden),
             nn.Linear(self.physics_hidden, self.J_dim)
         )
         
@@ -145,6 +150,7 @@ class PortHamiltonianPINNActor(nn.Module):
         self.R_net = nn.Sequential(
             nn.Linear(self.state_dim, self.physics_hidden),
             nn.ELU(),
+            nn.LayerNorm(self.physics_hidden),
             nn.Linear(self.physics_hidden, self.R_tril_dim)
         )
         
@@ -170,12 +176,15 @@ class PortHamiltonianPINNActor(nn.Module):
         # ===================
         
         # Combine physics features with learned features
-        # Physics features: H, grad_H (state_dim), J-R matrix info (flattened)
-        physics_feature_dim = 1 + self.state_dim  # H + grad_H
+        # Physics features: H (1), grad_H (state_dim), dynamics (state_dim)
+        physics_feature_dim = 1 + self.state_dim + self.state_dim  # H + grad_H + dynamics
         combined_dim = self.hidden_size + physics_feature_dim
         
         self.policy_integration = nn.Sequential(
             nn.Linear(combined_dim, self.hidden_size),
+            nn.ELU(),
+            nn.LayerNorm(self.hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size),
             nn.ELU(),
             nn.LayerNorm(self.hidden_size),
         )
@@ -217,20 +226,41 @@ class PortHamiltonianPINNActor(nn.Module):
     def _extract_physics_state(self, obs):
         """
         Extract physics-relevant state from observation.
-        For Point agent: velocity (vx, vy) and acceleration (ax, ay)
+        For Point agent: Extended state including velocity, acceleration, angular velocity, orientation
+        
+        State components (8-dim):
+            - vx, vy: linear velocity
+            - ax, ay: linear acceleration  
+            - wz: angular velocity around z-axis
+            - cos_theta, sin_theta: orientation from magnetometer
+            - speed: ||v|| magnitude
         
         Args:
             obs: [batch, obs_dim] observation tensor
             
         Returns:
-            state: [batch, state_dim] physics state
+            state: [batch, state_dim] physics state (8-dim)
         """
-        # Extract velocity and acceleration
+        # Extract velocity
         vel = obs[:, self.vel_indices]  # [batch, 2] - vx, vy
+        
+        # Extract acceleration
         acc = obs[:, self.acc_indices]  # [batch, 2] - ax, ay
         
-        # Combine into physics state
-        state = torch.cat([vel, acc], dim=-1)  # [batch, 4]
+        # Extract angular velocity (rotation around z-axis)
+        wz = obs[:, self.gyro_index:self.gyro_index+1]  # [batch, 1]
+        
+        # Extract orientation from magnetometer (cos, sin of heading angle)
+        mag = obs[:, self.mag_indices]  # [batch, 2] - mx, my
+        # Normalize to get cos/sin theta
+        mag_norm = torch.norm(mag, dim=-1, keepdim=True).clamp(min=1e-6)
+        orientation = mag / mag_norm  # [batch, 2] - cos_theta, sin_theta
+        
+        # Compute speed magnitude
+        speed = torch.norm(vel, dim=-1, keepdim=True)  # [batch, 1]
+        
+        # Combine into 8-dim physics state
+        state = torch.cat([vel, acc, wz, orientation, speed], dim=-1)  # [batch, 8]
         return state
     
     def _construct_J_matrix(self, J_elements, batch_size):
@@ -384,15 +414,16 @@ class PortHamiltonianPINNActor(nn.Module):
         # Extract physics state
         state = self._extract_physics_state(obs)
         
-        # Compute Port-Hamiltonian features
-        H, grad_H, _ = self._compute_port_hamiltonian_dynamics(obs, state)
+        # Compute Port-Hamiltonian features (including dynamics)
+        H, grad_H, dynamics = self._compute_port_hamiltonian_dynamics(obs, state)
         
         # Extract base features (standard MLP path)
         obs_normalized = self.feature_norm(obs)
         base_features = self.base_net(obs_normalized)
         
         # Combine physics and learned features
-        physics_features = torch.cat([H, grad_H], dim=-1)  # [batch, 1 + state_dim]
+        # Include H, grad_H, and dynamics for richer physics representation
+        physics_features = torch.cat([H, grad_H, dynamics], dim=-1)  # [batch, 1 + state_dim + state_dim]
         combined_features = torch.cat([base_features, physics_features], dim=-1)
         
         # Policy integration
@@ -442,15 +473,15 @@ class PortHamiltonianPINNActor(nn.Module):
         # Extract physics state
         state = self._extract_physics_state(obs)
         
-        # Compute Port-Hamiltonian features
-        H, grad_H, _ = self._compute_port_hamiltonian_dynamics(obs, state)
+        # Compute Port-Hamiltonian features (including dynamics)
+        H, grad_H, dynamics = self._compute_port_hamiltonian_dynamics(obs, state)
         
         # Extract base features
         obs_normalized = self.feature_norm(obs)
         base_features = self.base_net(obs_normalized)
         
-        # Combine features
-        physics_features = torch.cat([H, grad_H], dim=-1)
+        # Combine features (same as forward)
+        physics_features = torch.cat([H, grad_H, dynamics], dim=-1)
         combined_features = torch.cat([base_features, physics_features], dim=-1)
         
         # Policy integration
