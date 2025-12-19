@@ -88,11 +88,21 @@ class BarrierPHSPINNActor(nn.Module):
         self.std_x_coef = config.get("std_x_coef", 1.0)
         self.std_y_coef = config.get("std_y_coef", 0.5)
         
-        # Barrier potential parameters
-        self.r_safe = config.get("barrier_r_safe", 0.3)  # Safe distance threshold
-        self.barrier_epsilon = config.get("barrier_epsilon", 0.01)  # Numerical stability
-        self.barrier_clip_max = config.get("barrier_clip_max", 50.0)  # Clip for stability
+        # Barrier potential parameters (Enhanced for safety)
+        self.r_safe = config.get("barrier_r_safe", 0.5)  # Safe distance threshold (increased)
+        self.barrier_epsilon = config.get("barrier_epsilon", 0.005)  # Numerical stability (reduced for steeper barrier)
+        self.barrier_clip_max = config.get("barrier_clip_max", 100.0)  # Clip for stability (increased)
         self.num_lidar_bins = config.get("num_lidar_bins", 16)  # Lidar bins per obstacle type
+        
+        # Enhanced safety parameters
+        self.barrier_k_scale = config.get("barrier_k_scale", 2.0)  # Amplify barrier stiffness
+        self.barrier_gradient_scale = config.get("barrier_gradient_scale", 1.5)  # Amplify barrier gradient influence
+        self.barrier_decay_rate = config.get("barrier_decay_rate", 2.0)  # Power for distance decay (higher = sharper)
+        self.min_barrier_k = config.get("min_barrier_k", 0.5)  # Minimum barrier stiffness
+        
+        # Cost-aware safety: penalize actions in dangerous zones
+        self.cost_aware_weight = config.get("cost_aware_weight", 0.3)  # Weight for cost-aware policy shaping
+        self.danger_zone_threshold = config.get("danger_zone_threshold", 0.8)  # Lidar threshold for danger
         
         # Physics state extraction indices (for Point agent observation)
         # obs[0:3] = accelerometer (ax, ay, az)
@@ -286,12 +296,15 @@ class BarrierPHSPINNActor(nn.Module):
     
     def _compute_barrier_potential(self, obs):
         """
-        Compute Barrier Lyapunov Function (BLF) based potential.
+        Compute Enhanced Barrier Lyapunov Function (BLF) based potential.
         
-        H_barrier = k / ((d - r_safe)^2 + ε)
+        H_barrier = k_scaled / ((d - r_safe)^decay_rate + ε)
         
-        As distance d → r_safe, H_barrier → k/ε (large but finite for numerical stability)
-        In theory, ε → 0 gives infinite barrier, but we use small ε for training.
+        Enhanced with:
+        1. Adaptive stiffness scaling (barrier_k_scale)
+        2. Configurable decay rate for sharper barriers
+        3. Cost-aware danger zone detection
+        4. Multi-bin lidar aggregation for robust obstacle detection
         
         Args:
             obs: [batch, obs_dim] observation tensor
@@ -300,55 +313,63 @@ class BarrierPHSPINNActor(nn.Module):
             H_barrier: [batch, 1] barrier potential
             grad_H_barrier: [batch, 2] gradient w.r.t. velocity (approximation)
         """
-        # Get adaptive stiffness from network
-        k = self.barrier_k_net(obs)  # [batch, 1], positive due to Softplus
+        # Get adaptive stiffness from network and scale it
+        k_base = self.barrier_k_net(obs)  # [batch, 1], positive due to Softplus
+        k = torch.clamp(k_base * self.barrier_k_scale + self.min_barrier_k, min=self.min_barrier_k)  # Scaled stiffness
         
-        # Extract minimum distance from lidar
-        _, min_dist = self._extract_lidar_info(obs)  # [batch, 1]
+        # Extract lidar info and minimum distance
+        lidar_obs, min_dist = self._extract_lidar_info(obs)  # [batch, 1]
         
-        # Compute barrier potential: H = k / ((d - r_safe)^2 + ε)
-        # When d < r_safe, the denominator is small, making H large
-        dist_margin = min_dist - self.r_safe  # [batch, 1]
-        denominator = dist_margin ** 2 + self.barrier_epsilon
+        # Enhanced distance margin calculation
+        dist_margin = torch.clamp(min_dist - self.r_safe, min=0.01)  # Prevent negative margins
+        
+        # Use configurable decay rate for sharper/softer barriers
+        denominator = torch.pow(dist_margin, self.barrier_decay_rate) + self.barrier_epsilon
         
         H_barrier = k / denominator  # [batch, 1]
+        
+        # Danger zone bonus: extra penalty when very close to obstacles
+        danger_mask = (lidar_obs.max(dim=-1, keepdim=True)[0] > self.danger_zone_threshold).float()
+        danger_bonus = danger_mask * self.barrier_clip_max * 0.5  # Add significant penalty in danger zone
+        H_barrier = H_barrier + danger_bonus
         
         # Clip for numerical stability during training
         H_barrier = torch.clamp(H_barrier, max=self.barrier_clip_max)
         
         # Compute gradient approximation w.r.t. velocity direction
-        # Gradient points away from obstacles (repulsive)
-        # Use velocity direction as proxy for movement direction
         vel = obs[:, self.vel_indices]  # [batch, 2]
         vel_norm = torch.norm(vel, dim=-1, keepdim=True) + 1e-6
-        vel_direction = vel / vel_norm
         
-        # Gradient magnitude: dH/dd = -2k(d - r_safe) / ((d - r_safe)^2 + ε)^2
-        # Points opposite to obstacle direction (which we approximate as velocity direction when approaching)
-        grad_magnitude = 2 * k * torch.abs(dist_margin) / (denominator ** 2 + 1e-6)
-        grad_magnitude = torch.clamp(grad_magnitude, max=10.0)  # Clip gradient
+        # Enhanced gradient magnitude with decay rate
+        # dH/dd = -k * decay_rate * (d - r_safe)^(decay_rate-1) / ((d - r_safe)^decay_rate + ε)^2
+        grad_magnitude = k * self.barrier_decay_rate * torch.pow(dist_margin, self.barrier_decay_rate - 1)
+        grad_magnitude = grad_magnitude / (denominator ** 2 + 1e-6)
+        grad_magnitude = grad_magnitude * self.barrier_gradient_scale  # Apply gradient scaling
+        grad_magnitude = torch.clamp(grad_magnitude, max=20.0)  # Increased clip for stronger gradients
         
-        # If moving toward obstacle (small distance), gradient opposes movement
-        # This is a simplification - ideally we'd have explicit obstacle positions
-        # For now, use lidar-weighted direction
-        lidar_obs, _ = self._extract_lidar_info(obs)
-        
-        # Compute weighted direction from lidar (approximate obstacle direction)
+        # Use lidar-weighted direction for obstacle avoidance
         num_bins = lidar_obs.shape[-1]
         angles = torch.linspace(0, 2 * np.pi, num_bins + 1, device=self.device)[:-1]
         angles = angles.unsqueeze(0).expand(obs.shape[0], -1)  # [batch, num_bins]
         
-        # Weighted sum of directions based on lidar readings (higher = closer = stronger repulsion)
-        weights = lidar_obs  # [batch, num_bins]
+        # Weighted sum of directions based on lidar readings
+        # Use squared weights to emphasize closer obstacles
+        weights = lidar_obs ** 2  # [batch, num_bins] - squared for emphasis
         weights_sum = weights.sum(dim=-1, keepdim=True) + 1e-6
         
         obstacle_dir_x = (weights * torch.cos(angles)).sum(dim=-1, keepdim=True) / weights_sum
         obstacle_dir_y = (weights * torch.sin(angles)).sum(dim=-1, keepdim=True) / weights_sum
         
-        # Gradient points away from obstacles
+        # Gradient points away from obstacles (repulsive)
         grad_H_barrier_x = -grad_magnitude * obstacle_dir_x
         grad_H_barrier_y = -grad_magnitude * obstacle_dir_y
         grad_H_barrier = torch.cat([grad_H_barrier_x, grad_H_barrier_y], dim=-1)  # [batch, 2]
+        
+        # Add velocity-opposing component when in danger zone
+        # This creates additional resistance to moving toward obstacles
+        vel_direction = vel / vel_norm
+        danger_vel_penalty = danger_mask * self.cost_aware_weight * vel_direction
+        grad_H_barrier = grad_H_barrier - danger_vel_penalty * 5.0  # Oppose dangerous movement
         
         return H_barrier, grad_H_barrier
     
@@ -465,10 +486,12 @@ class BarrierPHSPINNActor(nn.Module):
     
     def _compute_total_hamiltonian_gradient(self, obs, state):
         """
-        Compute total Hamiltonian and its gradient.
+        Compute total Hamiltonian and its gradient with enhanced safety weighting.
         
         H_total = H_task + H_barrier
-        ∇H_total = ∇H_task + ∇H_barrier
+        ∇H_total = ∇H_task + λ * ∇H_barrier  (λ > 1 for safety priority)
+        
+        The barrier gradient is given higher weight to prioritize safety over task performance.
         
         Args:
             obs: [batch, obs_dim] observation
@@ -482,12 +505,18 @@ class BarrierPHSPINNActor(nn.Module):
         # Compute task potential and gradient
         H_task, grad_H_task = self._compute_task_potential(obs)
         
-        # Compute barrier potential and gradient
+        # Compute barrier potential and gradient (enhanced)
         H_barrier, grad_H_barrier = self._compute_barrier_potential(obs)
         
-        # Combine gradients (clip barrier gradient for stability)
-        grad_H_barrier_clipped = torch.clamp(grad_H_barrier, min=-5.0, max=5.0)
-        grad_H_total = grad_H_task + grad_H_barrier_clipped
+        # Adaptive safety weighting: increase barrier influence when H_barrier is high
+        # This creates stronger avoidance behavior near obstacles
+        barrier_weight = 1.0 + torch.clamp(H_barrier / 20.0, max=2.0)  # [1.0, 3.0]
+        
+        # Clip barrier gradient with higher limits for enhanced safety
+        grad_H_barrier_clipped = torch.clamp(grad_H_barrier, min=-10.0, max=10.0)
+        
+        # Combine gradients with adaptive barrier weighting
+        grad_H_total = grad_H_task + barrier_weight * grad_H_barrier_clipped
         
         return H_task, H_barrier, grad_H_total
     
