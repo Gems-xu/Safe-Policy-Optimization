@@ -469,7 +469,7 @@ class Runner:
                 
             end = time.time()
             
-            if episode % self.config["eval_interval"] == 0 and self.config["use_eval"]:
+            if (episode % self.config["eval_interval"] == 0 or episode == episodes - 1) and self.config["use_eval"]:
                 eval_rewards, eval_costs = self.eval(eval_episodes=1, total_steps=total_num_steps)
 
             if len(done_episodes_rewards) != 0:
