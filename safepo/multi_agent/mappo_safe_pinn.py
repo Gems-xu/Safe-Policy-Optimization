@@ -95,6 +95,7 @@ from safepo.common.buffer import SeparatedReplayBuffer
 from safepo.common.logger import EpochLogger
 from safepo.common.video_recorder import MultiAgentVideoRecorder, setup_headless_rendering
 from safepo.utils.config import multi_agent_args, parse_sim_params, set_np_formatting, set_seed, multi_agent_velocity_map, isaac_gym_map, multi_agent_goal_tasks
+from safepo.utils.visualize_barrier_potential import BarrierPotentialVisualizer
 
 # Import the modularized Barrier Port-Hamiltonian PINN Actor
 from safepo.multi_agent.barrier_phs_pinn_actor import BarrierPHSPINNActor
@@ -367,21 +368,6 @@ class Runner:
             os.makedirs(self.save_dir)
 
         self.logger.save_config(config)
-        
-        # Log barrier potential configuration parameters to Safe module
-        barrier_config = {
-            "barrier_r_safe": config.get("barrier_r_safe", 0.5),
-            "barrier_epsilon": config.get("barrier_epsilon", 0.005),
-            "barrier_clip_max": config.get("barrier_clip_max", 100.0),
-            "barrier_k_scale": config.get("barrier_k_scale", 2.0),
-            "barrier_gradient_scale": config.get("barrier_gradient_scale", 1.5),
-            "barrier_decay_rate": config.get("barrier_decay_rate", 2.0),
-            "min_barrier_k": config.get("min_barrier_k", 0.5),
-            "cost_aware_weight": config.get("cost_aware_weight", 0.3),
-            "danger_zone_threshold": config.get("danger_zone_threshold", 0.8),
-        }
-        for param_name, param_value in barrier_config.items():
-            self.logger.store(**{f"Safe/Config_{param_name}": param_value})
         
         # Initialize video recorder for evaluation
         self.video_recorder = MultiAgentVideoRecorder(
@@ -796,6 +782,73 @@ class Runner:
                             step=total_steps,
                             key="eval/video"
                         )
+                
+                # Visualize barrier potential and upload to wandb
+                if should_record_video and self.config["env_name"] in multi_agent_goal_tasks:
+                    try:
+                        # Create visualization directory: runs/<exp_name>/vizs/
+                        viz_dir = os.path.join(os.path.dirname(self.save_dir), "vizs")
+                        os.makedirs(viz_dir, exist_ok=True)
+                        
+                        # Pass the actual policy actor to avoid reloading with wrong obs_dim
+                        # The visualizer will use the already-loaded actor instead of creating a new one
+                        visualizer = BarrierPotentialVisualizer(
+                            model_dir=self.save_dir,
+                            task=self.config["env_name"],
+                            agent_id=0,
+                            device=self.config["device"]
+                        )
+                        
+                        # Override the actor with our already-loaded one to avoid dimension mismatch
+                        visualizer.actor = self.policy[0].actor
+                        
+                        visualizer.visualize_all(output_dir=viz_dir, verbose=False)
+                        
+                        # Upload all visualization images to wandb
+                        if self.logger.use_wandb:
+                            import wandb
+                            
+                            print(f"\n{'='*60}")
+                            print(f"[Barrier Viz] Visualization Upload Starting")
+                            print(f"{'='*60}")
+                            print(f"[Barrier Viz] Directory: {viz_dir}")
+                            print(f"[Barrier Viz] Files found: {os.listdir(viz_dir)}")
+                            print(f"[Barrier Viz] Total steps: {total_steps}")
+                            print(f"[Barrier Viz] wandb.run exists: {wandb.run is not None}")
+                            print(f"[Barrier Viz] logger.use_wandb: {self.logger.use_wandb}")
+                            
+                            # Build visualization dictionary - upload each image separately
+                            for img_file in sorted(os.listdir(viz_dir)):
+                                if img_file.endswith('.png'):
+                                    img_path = os.path.join(viz_dir, img_file)
+                                    img_key = os.path.splitext(img_file)[0]
+                                    
+                                    try:
+                                        # Upload to wandb Media section (images always go to Media, not Charts)
+                                        # Charts is for scalar metrics only
+                                        img_obj = wandb.Image(img_path, caption=img_key)
+                                        
+                                        # Try uploading via logger
+                                        if hasattr(self.logger, 'wandb_run') and self.logger.wandb_run is not None:
+                                            self.logger.wandb_run.log({f"barrier_viz/{img_key}": img_obj}, step=total_steps)
+                                            print(f"[Barrier Viz] ✓ Uploaded {img_key} via logger.wandb_run")
+                                        elif wandb.run is not None:
+                                            wandb.log({f"barrier_viz/{img_key}": img_obj}, step=total_steps)
+                                            print(f"[Barrier Viz] ✓ Uploaded {img_key} via wandb.log")
+                                        else:
+                                            print(f"[Barrier Viz] ✗ No active wandb run found for {img_key}")
+                                    except Exception as e:
+                                        print(f"[Barrier Viz] ✗ Failed to upload {img_key}: {str(e)}")
+                            
+                            print(f"{'='*60}")
+                            print(f"[Barrier Viz] Upload Complete - Check wandb 'Media' panel")
+                            print(f"[Barrier Viz] (Note: Images appear in Media, not Charts)")
+                            print(f"{'='*60}\n")
+                    
+                    except Exception as e:
+                        print(f"[Barrier Viz] Exception during visualization: {type(e).__name__}: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
                 
                 return np.mean(eval_episode_rewards), np.mean(eval_episode_costs)
 

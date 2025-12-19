@@ -58,6 +58,7 @@ Firstly, each algorithm is implemented strictly according to the original paper 
   - [Single-Agent](#single-agent)
   - [Multi-Agent](#multi-agent)
   - [Experiment Evaluation](#experiment-evaluation)
+  - [Barrier Potential Visualization](#barrier-potential-visualization)
 - [Machine Configuration](#machine-configuration)
 - [Ethical and Responsible Use](#ethical-and-responsible-use)
 - [PKU-Alignment Team](#pku-alignment-team)
@@ -310,6 +311,52 @@ To evaluate the performance of the algorithm, you can use the following command:
 ```bash
 cd safepo
 uv run python evaluate.py --benchmark-dir ./runs/benchmark
+```
+
+### Barrier Potential Visualization
+
+For **MAPPO-Safe-PINN** algorithm, we provide a comprehensive visualization tool to inspect the learned barrier potential and task potential fields. This helps verify the effectiveness of the Barrier Port-Hamiltonian framework.
+
+**Quick Start:**
+
+```bash
+# Visualize all potential fields (2D heatmaps, 3D surfaces, gradient vectors)
+./scripts/visualize_potential.sh -m runs/multi_goal/models_seed0
+
+# Only generate 2D heatmaps at high resolution
+./scripts/visualize_potential.sh -v 2d -r 200
+
+# Visualize 3D barrier potential surface
+./scripts/visualize_potential.sh -v 3d_barrier
+```
+
+**Example Output:**
+
+The tool generates multiple visualizations:
+- **2D Heatmaps**: Barrier, task, and total potential energy landscapes
+- **3D Surface Plots**: Interactive 3D visualization of potential "walls" and "valleys"
+- **Gradient Vector Fields**: Force directions showing repulsion from obstacles
+- **1D Slices**: Cross-sections showing barrier sharpness near safety boundaries
+
+All outputs are saved as high-quality PNG images in the `visualization_output/` directory.
+
+**For detailed usage and interpretation guide, see:**
+- 📖 [Visualization Guide](docs/VISUALIZATION_GUIDE.md) - Comprehensive tutorial
+- 🔬 [Barrier PHS Theory](Barrier_PHS.md) - Theoretical foundation
+
+**Python API:**
+
+```python
+from safepo.utils.visualize_barrier_potential import BarrierPotentialVisualizer
+
+visualizer = BarrierPotentialVisualizer(
+    model_dir='runs/multi_goal/models_seed0',
+    task='SafetyPointMultiGoal1-v0',
+    agent_id=0
+)
+
+# Generate all visualizations
+visualizer.visualize_all(output_dir='visualization_output')
 ```
 
 ## Machine Configuration
