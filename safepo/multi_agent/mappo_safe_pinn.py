@@ -96,6 +96,7 @@ from safepo.common.logger import EpochLogger
 from safepo.common.video_recorder import MultiAgentVideoRecorder, setup_headless_rendering
 from safepo.utils.config import multi_agent_args, parse_sim_params, set_np_formatting, set_seed, multi_agent_velocity_map, isaac_gym_map, multi_agent_goal_tasks
 from safepo.utils.visualize_barrier_potential import BarrierPotentialVisualizer
+from safepo.utils.barrier_potential_video_visualizer import BarrierPotentialVideoVisualizer, EvalPotentialFieldRecorder
 
 # Import the modularized Barrier Port-Hamiltonian PINN Actor
 from safepo.multi_agent.barrier_phs_pinn_actor import BarrierPHSPINNActor
@@ -576,6 +577,14 @@ class Runner:
                 self.logger.log_tabular("Misc/Entropy")
                 self.logger.log_tabular("Misc/Ratio")
                 
+                # Log auxiliary physics losses
+                self.logger.log_tabular("Loss/Aux_task_potential")
+                self.logger.log_tabular("Loss/Aux_barrier_k")
+                self.logger.log_tabular("Safe/H_task_mean")
+                self.logger.log_tabular("Safe/H_task_std")
+                self.logger.log_tabular("Safe/k_mean")
+                self.logger.log_tabular("Safe/k_std")
+                
                 # Log barrier physics parameters (Safe module)
                 for physics_key in barrier_info.keys():
                     self.logger.log_tabular(physics_key)
@@ -682,6 +691,56 @@ class Runner:
         
         return averaged_physics
 
+    def _extract_agent_positions(self):
+        """
+        Extract current agent positions from the environment.
+        
+        For SafetyMultiGoal environments, agents are Point/Car robots with positions
+        accessible via agent.pos_0 and agent.pos_1.
+        
+        Returns:
+            agent_positions: List of (x, y) tuples for all agents
+        """
+        agent_positions = []
+        
+        try:
+            if hasattr(self.eval_envs, 'envs') and len(self.eval_envs.envs) > 0:
+                env = self.eval_envs.envs[0]
+                
+                # For MultiGoalEnv wrapper
+                if hasattr(env, 'env') and hasattr(env.env, 'task'):
+                    task = env.env.task
+                    
+                    # Multi-agent: access pos_0 and pos_1
+                    if hasattr(task, 'agent'):
+                        agent = task.agent
+                        
+                        if hasattr(agent, 'pos_0'):
+                            pos_0 = agent.pos_0
+                            agent_positions.append((float(pos_0[0]), float(pos_0[1])))
+                        
+                        if hasattr(agent, 'pos_1'):
+                            pos_1 = agent.pos_1
+                            agent_positions.append((float(pos_1[0]), float(pos_1[1])))
+                
+                # Alternative: Direct task access
+                elif hasattr(env, 'task'):
+                    task = env.task
+                    if hasattr(task, 'agent'):
+                        agent = task.agent
+                        if hasattr(agent, 'pos_0'):
+                            pos_0 = agent.pos_0
+                            agent_positions.append((float(pos_0[0]), float(pos_0[1])))
+                        if hasattr(agent, 'pos_1'):
+                            pos_1 = agent.pos_1
+                            agent_positions.append((float(pos_1[0]), float(pos_1[1])))
+        
+        except Exception as e:
+            # Fallback: return empty (will use default)
+            pass
+        
+        return agent_positions
+
     def _extract_env_obstacles(self):
         """
         Extract obstacle and goal positions from the environment for visualization.
@@ -693,7 +752,7 @@ class Runner:
         """
         obstacle_positions = []
         goal_positions = []
-        hazard_radius = 0.2  # Default hazard radius in safety_gymnasium
+        hazard_radius = 0.25  # Default hazard radius in safety_gymnasium MultiGoal
         
         try:
             # Try to get environment information from eval_envs
@@ -701,10 +760,14 @@ class Runner:
             if hasattr(self.eval_envs, 'envs') and len(self.eval_envs.envs) > 0:
                 env = self.eval_envs.envs[0]
                 
-                # Try to access task hazards
-                if hasattr(env, 'task'):
+                # For MultiGoalEnv wrapper: env.env is the actual PettingZoo environment
+                task = None
+                if hasattr(env, 'env') and hasattr(env.env, 'task'):
+                    task = env.env.task
+                elif hasattr(env, 'task'):
                     task = env.task
-                    
+                
+                if task is not None:
                     # Get hazard positions
                     if hasattr(task, 'hazards') and hasattr(task.hazards, 'pos'):
                         hazards_pos = task.hazards.pos
@@ -712,7 +775,7 @@ class Runner:
                             for pos in hazards_pos:
                                 obstacle_positions.append((float(pos[0]), float(pos[1])))
                         if hasattr(task.hazards, 'size'):
-                            hazard_radius = task.hazards.size
+                            hazard_radius = float(task.hazards.size)
                     
                     # Get goal positions
                     if hasattr(task, 'goal_red') and hasattr(task.goal_red, 'pos'):
@@ -820,10 +883,11 @@ class Runner:
     @torch.no_grad()
     def eval(self, eval_episodes=1, total_steps=0):
         """
-        Evaluate policy performance with fixed-interval video rendering.
+        Evaluate policy performance with dynamic barrier potential field video rendering.
         
-        Renders video for the FIRST episode of each evaluation run (every eval_interval).
-        This provides consistent video recording without depending on reward improvements.
+        Renders side-by-side video showing environment frame and learned barrier potential
+        field for the FIRST episode of each evaluation run (every eval_interval).
+        This provides visual understanding of the agent's safety behavior.
         """
         self.eval_count += 1
         should_record_video = (
@@ -831,6 +895,9 @@ class Runner:
             and self.eval_count % self.video_record_freq == 0
             and self.config["env_name"] not in isaac_gym_map
         )
+        
+        # Check if this is a MultiGoal task (for potential field visualization)
+        is_multi_goal_task = self.config["env_name"] in multi_agent_goal_tasks
         
         eval_episode = 0
         eval_episode_rewards = []
@@ -840,9 +907,27 @@ class Runner:
         
         # Fixed-interval video: record first episode only
         first_episode_frames = []
+        potential_field_frames = []  # Combined frames with potential field
         first_episode_reward = 0.0
         first_episode_cost = 0.0
         recording_first_episode = should_record_video  # Start recording immediately for first episode
+        step_count = 0
+
+        # Initialize potential field visualizer for MultiGoal tasks
+        potential_visualizer = None
+        if should_record_video and is_multi_goal_task:
+            try:
+                obstacle_positions, goal_positions, hazard_radius = self._extract_env_obstacles()
+                potential_visualizer = BarrierPotentialVideoVisualizer(
+                    actor=self.policy[0].actor,
+                    world_bounds=(-2.5, 2.5, -2.5, 2.5),
+                    grid_resolution=50,
+                    device=self.config["device"],
+                    hazard_radius=hazard_radius,
+                )
+            except Exception as e:
+                print(f"[Barrier Viz] Failed to initialize visualizer: {e}")
+                potential_visualizer = None
 
         eval_obs, _, _ = self.eval_envs.reset()
 
@@ -873,10 +958,45 @@ class Runner:
             # Capture frame for first episode video (fixed-interval recording)
             if recording_first_episode and hasattr(self.eval_envs, 'render'):
                 try:
-                    frame = self.eval_envs.render()
+                    # Render with exception handling for OpenGL/EGL errors
+                    try:
+                        frame = self.eval_envs.render()
+                    except Exception as render_error:
+                        # Silently skip frame if render fails (especially EGL errors)
+                        frame = None
+                        
                     if frame is not None:
                         if isinstance(frame, np.ndarray) and len(frame.shape) == 3:
                             first_episode_frames.append(frame.copy())
+                            
+                            # Generate combined potential field frame for MultiGoal tasks
+                            if potential_visualizer is not None and is_multi_goal_task:
+                                try:
+                                    # Get current positions
+                                    obstacle_positions, goal_positions, _ = self._extract_env_obstacles()
+                                    agent_positions = self._extract_agent_positions()
+                                    
+                                    # Use fast analytical computation for real-time visualization
+                                    potential_field = potential_visualizer.compute_barrier_potential_field_fast(
+                                        obstacle_positions=np.array(obstacle_positions),
+                                        agent_positions=np.array(agent_positions) if agent_positions else None,
+                                    )
+                                    
+                                    # Render combined frame
+                                    combined_frame = potential_visualizer.render_combined_frame(
+                                        env_frame=frame.copy(),
+                                        potential_field=potential_field,
+                                        agent_positions=np.array(agent_positions) if agent_positions else None,
+                                        obstacle_positions=np.array(obstacle_positions),
+                                        goal_positions=np.array(goal_positions),
+                                        step=step_count,
+                                    )
+                                    potential_field_frames.append(combined_frame)
+                                except Exception as e:
+                                    # Fallback: just use the original frame
+                                    pass
+                            
+                            step_count += 1
                 except Exception as e:
                     pass
 
@@ -928,76 +1048,64 @@ class Runner:
                             key="eval/video"
                         )
                 
-                # Visualize barrier potential and upload to wandb
-                if should_record_video and self.config["env_name"] in multi_agent_goal_tasks:
+                # Upload potential field video for MultiGoal tasks to Viz module
+                if len(potential_field_frames) > 0 and should_record_video and is_multi_goal_task:
                     try:
-                        # Create visualization directory: runs/<exp_name>/vizs/
+                        # Create visualization directory
                         viz_dir = os.path.join(os.path.dirname(self.save_dir), "vizs")
                         os.makedirs(viz_dir, exist_ok=True)
                         
-                        # Extract environment obstacle information for accurate visualization
-                        obstacle_positions, goal_positions, hazard_radius = self._extract_env_obstacles()
+                        # Save video file locally
+                        video_path = os.path.join(viz_dir, f"potential_field_step{total_steps}.mp4")
+                        if potential_visualizer is not None:
+                            potential_visualizer.save_video(potential_field_frames, video_path, fps=30)
                         
-                        # Create visualizer with actual environment layout
-                        visualizer = BarrierPotentialVisualizer(
-                            model_dir=self.save_dir,
-                            task=self.config["env_name"],
-                            agent_id=0,
-                            device=self.config["device"],
-                            obstacle_positions=obstacle_positions,
-                            goal_positions=goal_positions,
-                            hazard_radius=hazard_radius
-                        )
-                        
-                        # Override the actor with our already-loaded one to avoid dimension mismatch
-                        visualizer.actor = self.policy[0].actor
-                        
-                        visualizer.visualize_all(output_dir=viz_dir, verbose=False)
-                        
-                        # Upload all visualization images to wandb
+                        # Upload to wandb Viz module (not Eval)
                         if self.logger.use_wandb:
                             import wandb
                             
-                            print(f"\n{'='*60}")
-                            print(f"[Barrier Viz] Visualization Upload Starting")
-                            print(f"{'='*60}")
-                            print(f"[Barrier Viz] Directory: {viz_dir}")
-                            print(f"[Barrier Viz] Obstacles: {len(obstacle_positions)} hazards")
-                            print(f"[Barrier Viz] Goals: {goal_positions}")
-                            print(f"[Barrier Viz] Total steps: {total_steps}")
-                            
-                            # Build visualization dictionary - upload each image separately
-                            for img_file in sorted(os.listdir(viz_dir)):
-                                if img_file.endswith('.png'):
-                                    img_path = os.path.join(viz_dir, img_file)
-                                    img_key = os.path.splitext(img_file)[0]
+                            try:
+                                # Stack frames and convert to (T, C, H, W) format for wandb
+                                # Input frames are (H, W, C), need to transpose to (C, H, W)
+                                video_array = np.stack(potential_field_frames, axis=0)  # (T, H, W, C)
+                                video_array = np.transpose(video_array, (0, 3, 1, 2))   # (T, C, H, W)
+                                
+                                caption = f"Barrier Potential Field - Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
+                                video_obj = wandb.Video(video_array, fps=30, format="mp4", caption=caption)
+                                
+                                # Upload to wandb Viz module (separate from Eval module)
+                                if hasattr(self.logger, 'wandb_run') and self.logger.wandb_run is not None:
+                                    self.logger.wandb_run.log({"Viz/potential_field_video": video_obj}, step=total_steps)
+                                elif wandb.run is not None:
+                                    wandb.log({"Viz/potential_field_video": video_obj}, step=total_steps)
                                     
-                                    try:
-                                        # Upload to wandb Media section (images always go to Media, not Charts)
-                                        # Charts is for scalar metrics only
-                                        img_obj = wandb.Image(img_path, caption=img_key)
-                                        
-                                        # Try uploading via logger
-                                        if hasattr(self.logger, 'wandb_run') and self.logger.wandb_run is not None:
-                                            self.logger.wandb_run.log({f"barrier_viz/{img_key}": img_obj}, step=total_steps)
-                                            print(f"[Barrier Viz] ✓ Uploaded {img_key} via logger.wandb_run")
-                                        elif wandb.run is not None:
-                                            wandb.log({f"barrier_viz/{img_key}": img_obj}, step=total_steps)
-                                            print(f"[Barrier Viz] ✓ Uploaded {img_key} via wandb.log")
-                                        else:
-                                            print(f"[Barrier Viz] ✗ No active wandb run found for {img_key}")
-                                    except Exception as e:
-                                        print(f"[Barrier Viz] ✗ Failed to upload {img_key}: {str(e)}")
-                            
-                            print(f"{'='*60}")
-                            print(f"[Barrier Viz] Upload Complete - Check wandb 'Media' panel")
-                            print(f"[Barrier Viz] (Note: Images appear in Media, not Charts)")
-                            print(f"{'='*60}\n")
+                            except Exception as e:
+                                # Silently ignore wandb upload errors
+                                pass
                     
                     except Exception as e:
-                        print(f"[Barrier Viz] Exception during visualization: {type(e).__name__}: {str(e)}")
+                        print(f"[Barrier Viz] Exception during video generation: {type(e).__name__}: {str(e)}")
                         import traceback
                         traceback.print_exc()
+                
+                # Clean up OpenGL context to avoid EGL errors on final render
+                try:
+                    # Close any matplotlib figures
+                    try:
+                        import matplotlib.pyplot as plt
+                        plt.close('all')
+                    except:
+                        pass
+                    
+                    # Close extra eval environments if available
+                    if hasattr(self.eval_envs, 'close_extra_envs'):
+                        self.eval_envs.close_extra_envs()
+                    
+                    # Force garbage collection to clean up OpenGL/EGL resources
+                    import gc
+                    gc.collect()
+                except Exception as e:
+                    pass  # Silently ignore cleanup errors
                 
                 return np.mean(eval_episode_rewards), np.mean(eval_episode_costs)
 
