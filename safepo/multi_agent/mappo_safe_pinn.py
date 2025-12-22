@@ -220,6 +220,10 @@ class MAPPOSafePINNTrainer():
         self.policy = policy
 
         self.value_normalizer = PopArt(1, device=self.config["device"])
+        
+        # Auxiliary loss weights for physics-informed training
+        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.01)
+        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.01)
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.config["clip_param"],
@@ -233,6 +237,76 @@ class MAPPOSafePINNTrainer():
         value_loss = torch.max(value_loss_original, value_loss_clipped)
 
         return value_loss.mean()
+
+    def compute_auxiliary_physics_loss(self, obs_batch):
+        """
+        Compute auxiliary losses to help train H_task and barrier_k networks.
+        
+        Key insight: Without direct supervision, these networks learn very slowly
+        through the policy gradient. We add auxiliary losses:
+        
+        1. Task potential should be lower near goals (based on goal lidar readings)
+        2. Barrier potential should be higher near obstacles (based on hazard lidar)
+        
+        Args:
+            obs_batch: [batch, obs_dim] observation tensor
+            
+        Returns:
+            aux_loss: Combined auxiliary loss
+            aux_info: Dict with individual loss components
+        """
+        batch_size = obs_batch.shape[0]
+        device = obs_batch.device
+        
+        # Get physics info from actor
+        actor = self.policy.actor
+        
+        # Compute potentials
+        H_task, _ = actor._compute_task_potential(obs_batch)
+        H_barrier, _ = actor._compute_barrier_potential(obs_batch)
+        
+        # Extract goal and hazard lidar readings
+        # Goal lidar: obs[12:28] (goal_red) - higher means closer to goal
+        goal_lidar = obs_batch[:, 12:28]
+        goal_proximity = goal_lidar.max(dim=-1, keepdim=True)[0]  # [batch, 1]
+        
+        # Hazard lidar: obs[44:60] - higher means closer to hazard
+        hazard_lidar_end = min(60, obs_batch.shape[-1])
+        if hazard_lidar_end > 44:
+            hazard_lidar = obs_batch[:, 44:hazard_lidar_end]
+            hazard_proximity = hazard_lidar.max(dim=-1, keepdim=True)[0]  # [batch, 1]
+        else:
+            hazard_proximity = torch.zeros(batch_size, 1, device=device)
+        
+        # === Auxiliary Loss 1: Task Potential ===
+        # H_task should be LOWER when close to goal (goal_proximity high)
+        # Loss: encourage H_task to be negatively correlated with goal proximity
+        # Target: H_task ≈ 1 - goal_proximity (normalized)
+        target_H_task = 1.0 - goal_proximity.clamp(0, 1)
+        task_potential_loss = F.mse_loss(torch.sigmoid(H_task), target_H_task)
+        
+        # === Auxiliary Loss 2: Barrier Awareness ===
+        # barrier_k should be HIGHER when close to hazards
+        # This encourages the network to learn hazard-aware stiffness
+        k = actor.barrier_k_net(obs_batch)  # [batch, 1]
+        # Target: k should increase with hazard proximity
+        target_k_scale = 0.5 + hazard_proximity.clamp(0, 1) * 2.0  # Range [0.5, 2.5]
+        barrier_k_loss = F.mse_loss(k, target_k_scale)
+        
+        # Combined auxiliary loss
+        aux_loss = (self.aux_task_potential_weight * task_potential_loss + 
+                    self.aux_barrier_potential_weight * barrier_k_loss)
+        
+        aux_info = {
+            'aux_task_loss': task_potential_loss.item(),
+            'aux_barrier_k_loss': barrier_k_loss.item(),
+            'H_task_mean': H_task.mean().item(),
+            'H_task_std': H_task.std().item(),
+            'k_mean': k.mean().item(),
+            'k_std': k.std().item(),
+        }
+        
+        return aux_loss, aux_info
 
     def ppo_update(self, sample):
         share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
@@ -265,9 +339,15 @@ class MAPPOSafePINNTrainer():
             policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
 
         policy_loss = policy_action_loss
+        
+        # Compute auxiliary physics loss for H_task and barrier_k networks
+        aux_loss, aux_info = self.compute_auxiliary_physics_loss(check(obs_batch).to(**self.tpdv))
+        
+        # Total actor loss = policy loss + auxiliary physics loss
+        total_actor_loss = policy_loss - dist_entropy * self.config["entropy_coef"] + aux_loss
 
         self.policy.actor_optimizer.zero_grad()
-        (policy_loss - dist_entropy * self.config["entropy_coef"]).backward()
+        total_actor_loss.backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.config["max_grad_norm"])
         self.policy.actor_optimizer.step()
 
@@ -278,7 +358,7 @@ class MAPPOSafePINNTrainer():
 
         self.policy.critic_optimizer.step()
 
-        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights
+        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info
 
     def train(self, buffer, logger):
         advantages = buffer.returns[:-1] - self.value_normalizer.denormalize(buffer.value_preds[:-1])
@@ -291,12 +371,18 @@ class MAPPOSafePINNTrainer():
             data_generator = buffer.feed_forward_generator(advantages, self.config["num_mini_batch"])
 
             for sample in data_generator:
-                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights \
+                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info \
                     = self.ppo_update(sample)
             logger.store(
                 **{
                     "Loss/Loss_reward_critic": value_loss.item(),
                     "Loss/Loss_actor": policy_loss.item(),
+                    "Loss/Aux_task_potential": aux_info['aux_task_loss'],
+                    "Loss/Aux_barrier_k": aux_info['aux_barrier_k_loss'],
+                    "Safe/H_task_mean": aux_info['H_task_mean'],
+                    "Safe/H_task_std": aux_info['H_task_std'],
+                    "Safe/k_mean": aux_info['k_mean'],
+                    "Safe/k_std": aux_info['k_std'],
                     "Misc/Reward_critic_norm": critic_grad_norm.item(),
                     "Misc/Entropy": dist_entropy.item(),
                     "Misc/Ratio": imp_weights.detach().mean().item(),
@@ -596,6 +682,65 @@ class Runner:
         
         return averaged_physics
 
+    def _extract_env_obstacles(self):
+        """
+        Extract obstacle and goal positions from the environment for visualization.
+        
+        Returns:
+            obstacle_positions: List of (x, y) tuples for hazards
+            goal_positions: List of (x, y) tuples for goals
+            hazard_radius: Radius of hazard obstacles
+        """
+        obstacle_positions = []
+        goal_positions = []
+        hazard_radius = 0.2  # Default hazard radius in safety_gymnasium
+        
+        try:
+            # Try to get environment information from eval_envs
+            # The underlying environment might have task info
+            if hasattr(self.eval_envs, 'envs') and len(self.eval_envs.envs) > 0:
+                env = self.eval_envs.envs[0]
+                
+                # Try to access task hazards
+                if hasattr(env, 'task'):
+                    task = env.task
+                    
+                    # Get hazard positions
+                    if hasattr(task, 'hazards') and hasattr(task.hazards, 'pos'):
+                        hazards_pos = task.hazards.pos
+                        if hazards_pos is not None:
+                            for pos in hazards_pos:
+                                obstacle_positions.append((float(pos[0]), float(pos[1])))
+                        if hasattr(task.hazards, 'size'):
+                            hazard_radius = task.hazards.size
+                    
+                    # Get goal positions
+                    if hasattr(task, 'goal_red') and hasattr(task.goal_red, 'pos'):
+                        goal_red_pos = task.goal_red.pos
+                        if goal_red_pos is not None:
+                            goal_positions.append((float(goal_red_pos[0]), float(goal_red_pos[1])))
+                    
+                    if hasattr(task, 'goal_blue') and hasattr(task.goal_blue, 'pos'):
+                        goal_blue_pos = task.goal_blue.pos
+                        if goal_blue_pos is not None:
+                            goal_positions.append((float(goal_blue_pos[0]), float(goal_blue_pos[1])))
+        
+        except Exception as e:
+            print(f"[Barrier Viz] Could not extract env obstacles: {e}")
+        
+        # Use defaults if extraction failed
+        if len(obstacle_positions) == 0:
+            # Default: 8 hazards evenly distributed (typical for MultiGoal1)
+            obstacle_positions = [
+                (0.8, 0.0), (-0.8, 0.0), (0.0, 0.8), (0.0, -0.8),
+                (0.6, 0.6), (-0.6, 0.6), (0.6, -0.6), (-0.6, -0.6)
+            ]
+        
+        if len(goal_positions) == 0:
+            goal_positions = [(1.2, 1.2), (-1.2, -1.2)]
+        
+        return obstacle_positions, goal_positions, hazard_radius
+
     def insert(self, data):
         obs, share_obs, rewards, dones, infos, \
         values, actions, action_log_probs, rnn_states, rnn_states_critic = data
@@ -790,13 +935,18 @@ class Runner:
                         viz_dir = os.path.join(os.path.dirname(self.save_dir), "vizs")
                         os.makedirs(viz_dir, exist_ok=True)
                         
-                        # Pass the actual policy actor to avoid reloading with wrong obs_dim
-                        # The visualizer will use the already-loaded actor instead of creating a new one
+                        # Extract environment obstacle information for accurate visualization
+                        obstacle_positions, goal_positions, hazard_radius = self._extract_env_obstacles()
+                        
+                        # Create visualizer with actual environment layout
                         visualizer = BarrierPotentialVisualizer(
                             model_dir=self.save_dir,
                             task=self.config["env_name"],
                             agent_id=0,
-                            device=self.config["device"]
+                            device=self.config["device"],
+                            obstacle_positions=obstacle_positions,
+                            goal_positions=goal_positions,
+                            hazard_radius=hazard_radius
                         )
                         
                         # Override the actor with our already-loaded one to avoid dimension mismatch
@@ -812,10 +962,9 @@ class Runner:
                             print(f"[Barrier Viz] Visualization Upload Starting")
                             print(f"{'='*60}")
                             print(f"[Barrier Viz] Directory: {viz_dir}")
-                            print(f"[Barrier Viz] Files found: {os.listdir(viz_dir)}")
+                            print(f"[Barrier Viz] Obstacles: {len(obstacle_positions)} hazards")
+                            print(f"[Barrier Viz] Goals: {goal_positions}")
                             print(f"[Barrier Viz] Total steps: {total_steps}")
-                            print(f"[Barrier Viz] wandb.run exists: {wandb.run is not None}")
-                            print(f"[Barrier Viz] logger.use_wandb: {self.logger.use_wandb}")
                             
                             # Build visualization dictionary - upload each image separately
                             for img_file in sorted(os.listdir(viz_dir)):

@@ -89,9 +89,16 @@ TASK_ACT_DIMS = {
 class BarrierPotentialVisualizer:
     """
     Visualize learned barrier potential and task potential fields.
+    
+    The visualizer can work in two modes:
+    1. Simulation mode: Uses synthetic lidar readings based on assumed obstacle positions
+    2. Environment mode: Uses real obstacle positions from the environment
+    
+    For accurate visualization, provide obstacle_positions and goal_positions when initializing.
     """
     
-    def __init__(self, model_dir, task, agent_id=0, device='cpu'):
+    def __init__(self, model_dir, task, agent_id=0, device='cpu', 
+                 obstacle_positions=None, goal_positions=None, hazard_radius=0.3):
         """
         Initialize visualizer.
         
@@ -100,11 +107,25 @@ class BarrierPotentialVisualizer:
             task: Environment task name (e.g., 'SafetyPointMultiGoal1-v0')
             agent_id: Which agent's policy to visualize
             device: Torch device
+            obstacle_positions: List of (x, y) tuples for obstacle/hazard positions
+            goal_positions: List of (x, y) tuples for goal positions
+            hazard_radius: Radius of each hazard (default 0.3)
         """
         self.model_dir = model_dir
         self.task = task
         self.agent_id = agent_id
         self.device = torch.device(device)
+        
+        # Environment information for realistic visualization
+        # Default: typical MultiGoal environment setup
+        self.obstacle_positions = obstacle_positions or [
+            (0.0, 1.0), (0.0, -1.0), (1.0, 0.0), (-1.0, 0.0)  # 4 hazards around center
+        ]
+        self.goal_positions = goal_positions or [
+            (1.5, 1.5),   # Goal Red
+            (-1.5, -1.5)  # Goal Blue
+        ]
+        self.hazard_radius = hazard_radius
         
         # Get observation and action dimensions from task name
         if task not in TASK_OBS_DIMS:
@@ -173,11 +194,10 @@ class BarrierPotentialVisualizer:
     
     def _create_dummy_observation(self, x, y, vx=0.0, vy=0.0):
         """
-        Create a dummy observation for a given position and velocity.
+        Create a realistic observation for a given position and velocity.
         
-        For Multi-Goal environments, we simulate lidar readings based on position
-        to create spatially-varying observations that the network can use to
-        learn position-dependent potentials.
+        This version simulates lidar readings based on actual obstacle positions
+        to create spatially-varying observations that reflect real environment structure.
         
         Observation structure (Multi-Goal):
         - obs[0:3]: accelerometer (ax, ay, az)
@@ -186,7 +206,7 @@ class BarrierPotentialVisualizer:
         - obs[9:12]: magnetometer  
         - obs[12:28]: goal_red lidar (16 bins) - agent 0's goal
         - obs[28:44]: goal_blue lidar (16 bins) - agent 1's goal
-        - obs[44:60]: hazard lidar (16 bins) - obstacles/boundaries
+        - obs[44:60]: hazard lidar (16 bins) - obstacles/hazards (CRITICAL for barrier)
         - obs[60:76]: vase lidar (16 bins) - additional obstacles
         - ... (remaining components)
         
@@ -204,44 +224,42 @@ class BarrierPotentialVisualizer:
         obs[3] = vx
         obs[4] = vy
         
-        # === Simulate Goal Lidar Readings ===
-        # For Multi-Goal, assume two goals at fixed positions
-        # Goal Red (agent 0): positioned at (1.5, 1.5) for example
-        # Goal Blue (agent 1): positioned at (-1.5, -1.5) for example
-        goal_red_pos = np.array([1.5, 1.5])
-        goal_blue_pos = np.array([-1.5, -1.5])
-        agent_pos = np.array([x, y])
-        
-        # Compute goal lidar readings (16 bins covering 360 degrees)
+        # === Lidar Configuration ===
         num_lidar_bins = 16
         angles = np.linspace(0, 2*np.pi, num_lidar_bins, endpoint=False)
+        agent_pos = np.array([x, y])
         
-        # Goal Red lidar (obs[12:28])
-        goal_red_lidar = self._compute_goal_lidar(agent_pos, goal_red_pos, angles, max_dist=3.0)
-        obs[12:28] = goal_red_lidar
+        # === Goal Lidar Readings (obs[12:28] and obs[28:44]) ===
+        if len(self.goal_positions) >= 1:
+            goal_red_pos = np.array(self.goal_positions[0])
+            goal_red_lidar = self._compute_goal_lidar(agent_pos, goal_red_pos, angles, max_dist=3.0)
+            obs[12:28] = goal_red_lidar
         
-        # Goal Blue lidar (obs[28:44])
-        goal_blue_lidar = self._compute_goal_lidar(agent_pos, goal_blue_pos, angles, max_dist=3.0)
-        obs[28:44] = goal_blue_lidar
+        if len(self.goal_positions) >= 2:
+            goal_blue_pos = np.array(self.goal_positions[1])
+            goal_blue_lidar = self._compute_goal_lidar(agent_pos, goal_blue_pos, angles, max_dist=3.0)
+            obs[28:44] = goal_blue_lidar
         
-        # === Simulate Hazard/Boundary Lidar ===
+        # === CRITICAL: Hazard/Obstacle Lidar (obs[44:60]) ===
+        # This is what the barrier potential network actually uses!
+        hazard_lidar = self._compute_hazard_lidar(agent_pos, angles, max_dist=3.0)
+        obs[44:60] = hazard_lidar
+        
+        # === Boundary Lidar (obs[60:76]) ===
         # Detect distance to boundaries in each direction
         boundary_lidar = np.zeros(num_lidar_bins, dtype=np.float32)
         for i, angle in enumerate(angles):
-            # Cast a ray in this direction and find distance to boundary
             dx = np.cos(angle)
             dy = np.sin(angle)
             
             # Find intersection with boundaries [-2.5, 2.5]
             t_min = float('inf')
             
-            # Check x boundaries
             if abs(dx) > 1e-6:
                 t_x_min = (self.x_min - x) / dx if dx < 0 else (self.x_max - x) / dx
                 if t_x_min > 0:
                     t_min = min(t_min, t_x_min)
             
-            # Check y boundaries  
             if abs(dy) > 1e-6:
                 t_y_min = (self.y_min - y) / dy if dy < 0 else (self.y_max - y) / dy
                 if t_y_min > 0:
@@ -250,20 +268,76 @@ class BarrierPotentialVisualizer:
             # Convert distance to lidar reading (closer = higher)
             if t_min < float('inf'):
                 dist = t_min
-                # Exponential decay: reading = exp(-gain * dist)
                 boundary_lidar[i] = np.exp(-0.5 * dist)
             else:
                 boundary_lidar[i] = 0.0
         
-        obs[44:60] = boundary_lidar  # Hazard lidar
-        
-        # Vase lidar: set to low values (no vases in this simplified visualization)
         if obs_dim > 76:
-            obs[60:76] = 0.05
+            obs[60:76] = boundary_lidar
         
         # Convert to tensor
         obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(self.device)
         return obs_tensor
+    
+    def _compute_hazard_lidar(self, agent_pos, angles, max_dist=3.0):
+        """
+        Compute hazard lidar readings based on actual obstacle positions.
+        
+        This is CRITICAL for barrier potential visualization - the barrier network
+        uses hazard lidar (obs[44:60]) to detect obstacles.
+        
+        Args:
+            agent_pos: [x, y] agent position
+            angles: Array of lidar angles (radians)
+            max_dist: Maximum detection distance
+            
+        Returns:
+            lidar_readings: Array of lidar values [0, 1] where 1 = very close to obstacle
+        """
+        num_bins = len(angles)
+        lidar = np.zeros(num_bins, dtype=np.float32)
+        
+        # For each lidar bin, find the closest obstacle
+        for i, angle in enumerate(angles):
+            ray_dir = np.array([np.cos(angle), np.sin(angle)])
+            min_dist = max_dist
+            
+            for obs_pos in self.obstacle_positions:
+                obs_pos = np.array(obs_pos)
+                
+                # Vector from agent to obstacle center
+                to_obs = obs_pos - agent_pos
+                
+                # Project onto ray direction
+                proj_dist = np.dot(to_obs, ray_dir)
+                
+                if proj_dist > 0:  # Obstacle is in front
+                    # Perpendicular distance to ray
+                    perp_dist = np.abs(np.cross(ray_dir, to_obs))
+                    
+                    if perp_dist < self.hazard_radius:
+                        # Ray hits the obstacle
+                        # Distance to obstacle surface
+                        hit_dist = proj_dist - np.sqrt(max(0, self.hazard_radius**2 - perp_dist**2))
+                        min_dist = min(min_dist, max(0, hit_dist))
+                
+                # Also check direct distance (for nearby obstacles not directly in ray path)
+                direct_dist = np.linalg.norm(to_obs) - self.hazard_radius
+                if direct_dist < 0.5:  # Very close
+                    # Add some reading even if not directly in ray
+                    angular_diff = np.abs(np.arctan2(to_obs[1], to_obs[0]) - angle)
+                    angular_diff = min(angular_diff, 2*np.pi - angular_diff)
+                    if angular_diff < np.pi / 8:  # Within 22.5 degrees
+                        min_dist = min(min_dist, max(0.01, np.linalg.norm(to_obs) - self.hazard_radius))
+            
+            # Convert distance to lidar reading
+            # Use exponential decay: closer = higher reading
+            if min_dist < max_dist:
+                lidar[i] = np.exp(-min_dist)
+            else:
+                lidar[i] = 0.0
+        
+        return lidar
     
     def _compute_goal_lidar(self, agent_pos, goal_pos, angles, max_dist=3.0):
         """
@@ -313,6 +387,25 @@ class BarrierPotentialVisualizer:
             lidar[i] = angular_response * dist_response
         
         return lidar
+    
+    def set_environment_info(self, obstacle_positions=None, goal_positions=None, hazard_radius=None):
+        """
+        Update environment information for visualization.
+        
+        This allows the visualizer to adapt to the actual environment layout
+        for more accurate potential field visualization.
+        
+        Args:
+            obstacle_positions: List of (x, y) tuples for obstacles
+            goal_positions: List of (x, y) tuples for goals
+            hazard_radius: Radius of each hazard
+        """
+        if obstacle_positions is not None:
+            self.obstacle_positions = obstacle_positions
+        if goal_positions is not None:
+            self.goal_positions = goal_positions
+        if hazard_radius is not None:
+            self.hazard_radius = hazard_radius
     
     @torch.no_grad()
     def compute_potential_grid(self, resolution=50, velocity=(0.0, 0.0)):
@@ -398,6 +491,7 @@ class BarrierPotentialVisualizer:
     def visualize_potential_2d(self, resolution=100, save_path=None, verbose=False):
         """
         Create 2D heatmap visualizations of barrier, task, and total potentials.
+        Includes obstacle and goal position markers.
         
         Args:
             resolution: Grid resolution
@@ -411,12 +505,30 @@ class BarrierPotentialVisualizer:
         # Create figure with subplots
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
         
+        # Helper function to add markers
+        def add_markers(ax):
+            # Add obstacle markers
+            for obs_pos in self.obstacle_positions:
+                circle = Circle(obs_pos, self.hazard_radius, fill=False, 
+                              color='red', linewidth=2, linestyle='--', label='Hazard')
+                ax.add_patch(circle)
+                ax.plot(obs_pos[0], obs_pos[1], 'rx', markersize=8, markeredgewidth=2)
+            
+            # Add goal markers
+            colors = ['green', 'blue']
+            for i, goal_pos in enumerate(self.goal_positions):
+                color = colors[i % len(colors)]
+                ax.plot(goal_pos[0], goal_pos[1], '*', color=color, 
+                       markersize=15, markeredgecolor='white', markeredgewidth=0.5)
+            ax.set_aspect('equal')
+        
         # Barrier potential
         im1 = axes[0].contourf(X, Y, H_barrier, levels=20, cmap='hot')
         axes[0].set_title('Barrier Potential $H_{barrier}(x, y)$', fontsize=14, fontweight='bold')
         axes[0].set_xlabel('X Position (m)', fontsize=12)
         axes[0].set_ylabel('Y Position (m)', fontsize=12)
         fig.colorbar(im1, ax=axes[0], label='Potential Energy')
+        add_markers(axes[0])
         axes[0].grid(True, alpha=0.3)
         
         # Task potential
@@ -425,6 +537,7 @@ class BarrierPotentialVisualizer:
         axes[1].set_xlabel('X Position (m)', fontsize=12)
         axes[1].set_ylabel('Y Position (m)', fontsize=12)
         fig.colorbar(im2, ax=axes[1], label='Potential Energy')
+        add_markers(axes[1])
         axes[1].grid(True, alpha=0.3)
         
         # Total potential
@@ -433,6 +546,7 @@ class BarrierPotentialVisualizer:
         axes[2].set_xlabel('X Position (m)', fontsize=12)
         axes[2].set_ylabel('Y Position (m)', fontsize=12)
         fig.colorbar(im3, ax=axes[2], label='Potential Energy')
+        add_markers(axes[2])
         axes[2].grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -444,7 +558,7 @@ class BarrierPotentialVisualizer:
             if verbose:
                 print(f"✓ Saved 2D potential fields to {filepath}")
         
-        plt.show()
+        plt.close(fig)  # Close to avoid display issues in training loop
     
     def visualize_potential_3d(self, resolution=50, potential_type='barrier', save_path=None, verbose=False):
         """
@@ -499,11 +613,12 @@ class BarrierPotentialVisualizer:
             if verbose:
                 print(f"✓ Saved 3D {potential_type} potential surface to {filepath}")
         
-        plt.show()
+        plt.close(fig)  # Close to avoid display issues in training loop
     
     def visualize_gradient_field(self, resolution=20, save_path=None, verbose=False):
         """
         Visualize gradient vector field showing force directions.
+        Includes obstacle and goal position markers.
         
         Args:
             resolution: Grid resolution for vector field
@@ -540,6 +655,15 @@ class BarrierPotentialVisualizer:
         ax.grid(True, alpha=0.3)
         ax.set_aspect('equal')
         
+        # Add obstacle and goal markers
+        for obs_pos in self.obstacle_positions:
+            circle = Circle(obs_pos, self.hazard_radius, fill=False, 
+                          color='white', linewidth=2, linestyle='--')
+            ax.add_patch(circle)
+        for i, goal_pos in enumerate(self.goal_positions):
+            ax.plot(goal_pos[0], goal_pos[1], '*', color='lime', 
+                   markersize=15, markeredgecolor='white', markeredgewidth=0.5)
+        
         if save_path:
             os.makedirs(save_path, exist_ok=True)
             filepath = os.path.join(save_path, 'gradient_vector_field.png')
@@ -547,7 +671,7 @@ class BarrierPotentialVisualizer:
             if verbose:
                 print(f"✓ Saved gradient vector field to {filepath}")
         
-        plt.show()
+        plt.close(fig)  # Close to avoid display issues in training loop
     
     def visualize_slice_comparison(self, y_slice=0.0, resolution=200, save_path=None, verbose=False):
         """
@@ -592,6 +716,12 @@ class BarrierPotentialVisualizer:
         ax.legend(fontsize=12)
         ax.grid(True, alpha=0.3)
         
+        # Add vertical lines for obstacle x-positions at this y-slice
+        for obs_pos in self.obstacle_positions:
+            if abs(obs_pos[1] - y_slice) < self.hazard_radius:
+                # Obstacle intersects this slice
+                ax.axvline(x=obs_pos[0], color='red', linestyle=':', alpha=0.5, label='Obstacle')
+        
         if save_path:
             os.makedirs(save_path, exist_ok=True)
             filepath = os.path.join(save_path, f'potential_slice_y{y_slice}.png')
@@ -599,8 +729,215 @@ class BarrierPotentialVisualizer:
             if verbose:
                 print(f"✓ Saved 1D potential slice to {filepath}")
         
-        plt.show()
+        plt.close(fig)  # Close to avoid display issues in training loop
     
+    @torch.no_grad()
+    def compute_network_statistics(self):
+        """
+        Compute statistics about the learned networks to diagnose training.
+        
+        Returns:
+            dict with statistics about H_task_net and barrier_k_net outputs
+        """
+        resolution = 30
+        x = np.linspace(self.x_min, self.x_max, resolution)
+        y = np.linspace(self.y_min, self.y_max, resolution)
+        
+        H_task_values = []
+        H_barrier_values = []
+        k_values = []
+        
+        for xi in x:
+            for yi in y:
+                obs = self._create_dummy_observation(xi, yi)
+                
+                H_task, _ = self.actor._compute_task_potential(obs)
+                H_barrier, _ = self.actor._compute_barrier_potential(obs)
+                k = self.actor.barrier_k_net(obs)
+                
+                H_task_values.append(H_task.item())
+                H_barrier_values.append(H_barrier.item())
+                k_values.append(k.item())
+        
+        stats = {
+            'H_task_mean': np.mean(H_task_values),
+            'H_task_std': np.std(H_task_values),
+            'H_task_min': np.min(H_task_values),
+            'H_task_max': np.max(H_task_values),
+            'H_task_range': np.max(H_task_values) - np.min(H_task_values),
+            'H_barrier_mean': np.mean(H_barrier_values),
+            'H_barrier_std': np.std(H_barrier_values),
+            'H_barrier_min': np.min(H_barrier_values),
+            'H_barrier_max': np.max(H_barrier_values),
+            'k_mean': np.mean(k_values),
+            'k_std': np.std(k_values),
+            'k_min': np.min(k_values),
+            'k_max': np.max(k_values),
+        }
+        return stats
+    
+    @torch.no_grad()
+    def visualize_diagnostic_summary(self, save_path=None, verbose=False):
+        """
+        Create a diagnostic summary showing network outputs and their ranges.
+        
+        This helps understand:
+        1. Whether H_task is learning (should have spatial variation)
+        2. Whether barrier_k is adapting (should vary near obstacles)
+        3. The actual value ranges of the potentials
+        """
+        stats = self.compute_network_statistics()
+        
+        # Create a 2x2 figure with diagnostic information
+        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+        
+        resolution = 50
+        x = np.linspace(self.x_min, self.x_max, resolution)
+        y = np.linspace(self.y_min, self.y_max, resolution)
+        X, Y = np.meshgrid(x, y)
+        
+        H_task_grid = np.zeros_like(X)
+        H_barrier_grid = np.zeros_like(X)
+        k_grid = np.zeros_like(X)
+        lidar_max_grid = np.zeros_like(X)
+        
+        for i in range(resolution):
+            for j in range(resolution):
+                obs = self._create_dummy_observation(X[i, j], Y[i, j])
+                
+                H_task, _ = self.actor._compute_task_potential(obs)
+                H_barrier, _ = self.actor._compute_barrier_potential(obs)
+                k = self.actor.barrier_k_net(obs)
+                
+                # Get lidar reading to show what the network "sees"
+                lidar_obs, _ = self.actor._extract_lidar_info(obs)
+                
+                H_task_grid[i, j] = H_task.item()
+                H_barrier_grid[i, j] = H_barrier.item()
+                k_grid[i, j] = k.item()
+                lidar_max_grid[i, j] = lidar_obs.max().item()
+        
+        # Helper to add obstacle/goal markers
+        def add_markers(ax):
+            for obs_pos in self.obstacle_positions:
+                circle = Circle(obs_pos, self.hazard_radius, fill=False, 
+                              color='red', linewidth=2, linestyle='--')
+                ax.add_patch(circle)
+            for goal_pos in self.goal_positions:
+                ax.plot(goal_pos[0], goal_pos[1], '*', color='lime', markersize=12)
+            ax.set_aspect('equal')
+        
+        # Plot 1: Lidar readings (what the network "sees")
+        im1 = axes[0, 0].contourf(X, Y, lidar_max_grid, levels=20, cmap='YlOrRd')
+        axes[0, 0].set_title(f'Lidar Max Reading (Network Input)\nRange: [{lidar_max_grid.min():.3f}, {lidar_max_grid.max():.3f}]', 
+                             fontsize=11, fontweight='bold')
+        fig.colorbar(im1, ax=axes[0, 0])
+        add_markers(axes[0, 0])
+        
+        # Plot 2: H_task (should show goal attraction)
+        im2 = axes[0, 1].contourf(X, Y, H_task_grid, levels=20, cmap='viridis')
+        axes[0, 1].set_title(f'Task Potential H_task\nRange: [{stats["H_task_min"]:.4f}, {stats["H_task_max"]:.4f}]\n'
+                             f'(Should be LOW at goals, HIGH elsewhere)', 
+                             fontsize=11, fontweight='bold')
+        fig.colorbar(im2, ax=axes[0, 1])
+        add_markers(axes[0, 1])
+        
+        # Plot 3: Barrier stiffness k
+        im3 = axes[1, 0].contourf(X, Y, k_grid, levels=20, cmap='plasma')
+        axes[1, 0].set_title(f'Barrier Stiffness k(obs)\nRange: [{stats["k_min"]:.4f}, {stats["k_max"]:.4f}]\n'
+                             f'(Should be HIGH near obstacles)', 
+                             fontsize=11, fontweight='bold')
+        fig.colorbar(im3, ax=axes[1, 0])
+        add_markers(axes[1, 0])
+        
+        # Plot 4: H_barrier (final barrier potential)
+        im4 = axes[1, 1].contourf(X, Y, H_barrier_grid, levels=20, cmap='hot')
+        axes[1, 1].set_title(f'Barrier Potential H_barrier\nRange: [{stats["H_barrier_min"]:.2f}, {stats["H_barrier_max"]:.2f}]\n'
+                             f'(Should be HIGH near obstacles)', 
+                             fontsize=11, fontweight='bold')
+        fig.colorbar(im4, ax=axes[1, 1])
+        add_markers(axes[1, 1])
+        
+        plt.suptitle('Barrier-PHS Network Diagnostic Summary\n'
+                     '(Red circles = hazards, Green stars = goals)', 
+                     fontsize=14, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        
+        if save_path:
+            os.makedirs(save_path, exist_ok=True)
+            filepath = os.path.join(save_path, 'diagnostic_summary.png')
+            plt.savefig(filepath, dpi=300, bbox_inches='tight')
+            if verbose:
+                print(f"✓ Saved diagnostic summary to {filepath}")
+                print(f"  H_task range: [{stats['H_task_min']:.4f}, {stats['H_task_max']:.4f}]")
+                print(f"  H_barrier range: [{stats['H_barrier_min']:.2f}, {stats['H_barrier_max']:.2f}]")
+                print(f"  k range: [{stats['k_min']:.4f}, {stats['k_max']:.4f}]")
+        
+        plt.close(fig)
+        return stats
+
+    @torch.no_grad()
+    def visualize_barrier_stiffness(self, resolution=50, save_path=None, verbose=False):
+        """
+        Visualize the learned barrier stiffness k(obs) from barrier_k_net.
+        
+        This shows how the network has learned to adapt barrier strength
+        based on position, which should change during training.
+        
+        Args:
+            resolution: Grid resolution
+            save_path: Directory to save figure
+            verbose: Whether to print progress messages
+        """
+        if verbose:
+            print(f"Computing barrier stiffness field at {resolution}x{resolution} resolution...")
+        
+        x = np.linspace(self.x_min, self.x_max, resolution)
+        y = np.linspace(self.y_min, self.y_max, resolution)
+        X, Y = np.meshgrid(x, y)
+        
+        K_values = np.zeros_like(X)
+        
+        for i in range(resolution):
+            for j in range(resolution):
+                obs = self._create_dummy_observation(X[i, j], Y[i, j])
+                
+                # Get raw barrier stiffness from network
+                k = self.actor.barrier_k_net(obs)
+                K_values[i, j] = k.item()
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        im = ax.contourf(X, Y, K_values, levels=20, cmap='plasma')
+        fig.colorbar(im, ax=ax, label='Barrier Stiffness k(x,y)')
+        
+        # Add obstacle and goal markers
+        for obs_pos in self.obstacle_positions:
+            circle = Circle(obs_pos, self.hazard_radius, fill=False, 
+                          color='white', linewidth=2, linestyle='--')
+            ax.add_patch(circle)
+            ax.plot(obs_pos[0], obs_pos[1], 'wx', markersize=8, markeredgewidth=2)
+        
+        for goal_pos in self.goal_positions:
+            ax.plot(goal_pos[0], goal_pos[1], '*', color='lime', 
+                   markersize=15, markeredgecolor='white', markeredgewidth=0.5)
+        
+        ax.set_title('Learned Barrier Stiffness k(x,y)\n(Higher values = stronger repulsion)', 
+                     fontsize=14, fontweight='bold')
+        ax.set_xlabel('X Position (m)', fontsize=12)
+        ax.set_ylabel('Y Position (m)', fontsize=12)
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        
+        if save_path:
+            os.makedirs(save_path, exist_ok=True)
+            filepath = os.path.join(save_path, 'barrier_stiffness.png')
+            plt.savefig(filepath, dpi=300, bbox_inches='tight')
+            if verbose:
+                print(f"✓ Saved barrier stiffness to {filepath}")
+        
+        plt.close(fig)
+
     def visualize_all(self, output_dir='vizs', verbose=False):
         """
         Generate all visualization plots and save to output directory.
@@ -628,9 +965,26 @@ class BarrierPotentialVisualizer:
         # 1D slices
         self.visualize_slice_comparison(y_slice=0.0, save_path=output_dir, verbose=verbose)
         
+        # Barrier stiffness visualization (shows learned k network output)
+        self.visualize_barrier_stiffness(resolution=50, save_path=output_dir, verbose=verbose)
+        
+        # Diagnostic summary (shows all network outputs with ranges)
+        stats = self.visualize_diagnostic_summary(save_path=output_dir, verbose=verbose)
+        
+        # Print diagnostic info
+        if verbose:
+            print("\n" + "=" * 60)
+            print("Network Statistics (useful for debugging):")
+            print("=" * 60)
+            print(f"  H_task:    range=[{stats['H_task_min']:.4f}, {stats['H_task_max']:.4f}], std={stats['H_task_std']:.4f}")
+            print(f"  H_barrier: range=[{stats['H_barrier_min']:.2f}, {stats['H_barrier_max']:.2f}], std={stats['H_barrier_std']:.2f}")
+            print(f"  k:         range=[{stats['k_min']:.4f}, {stats['k_max']:.4f}], std={stats['k_std']:.4f}")
+            print("=" * 60)
+        
         if verbose:
             print("=" * 60)
             print(f"✓ All visualizations saved to {output_dir}")
+            print("=" * 60)
             print("=" * 60)
 
 
