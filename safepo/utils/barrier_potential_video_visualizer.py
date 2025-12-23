@@ -26,7 +26,7 @@ Usage:
     visualizer = BarrierPotentialVideoVisualizer(
         actor=policy.actor,
         world_bounds=(-2.5, 2.5, -2.5, 2.5),
-        device='cuda:0'
+        device='cpu'
     )
     
     # During episode rollout
@@ -101,7 +101,7 @@ class BarrierPotentialVideoVisualizer:
         actor=None,
         world_bounds: Tuple[float, float, float, float] = (-2.5, 2.5, -2.5, 2.5),
         grid_resolution: int = 50,
-        device: str = "cuda:0",
+        device: str = "cpu",
         hazard_radius: float = 0.25,
     ):
         self.actor = actor
@@ -152,7 +152,7 @@ class BarrierPotentialVideoVisualizer:
         else:
             obs_template = torch.tensor(obs[0] if len(obs.shape) > 1 else obs, 
                                         dtype=torch.float32, device=self.device)
-        
+
         obs_dim = obs_template.shape[-1]
         potential_field = np.zeros((self.grid_resolution, self.grid_resolution))
         
@@ -573,7 +573,7 @@ class EvalPotentialFieldRecorder:
         actor,
         world_bounds: Tuple[float, float, float, float] = (-2.5, 2.5, -2.5, 2.5),
         grid_resolution: int = 50,
-        device: str = "cuda:0",
+        device: str = "cpu",
         hazard_radius: float = 0.25,
         output_dir: str = "./vizs",
     ):
