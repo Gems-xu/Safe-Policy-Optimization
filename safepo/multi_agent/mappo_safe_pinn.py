@@ -428,15 +428,15 @@ class Runner:
         
         # Initialize CUDA context early to avoid cuBLAS warning
         # This ensures the CUDA context is properly established before any operations
-        if "cuda" in str(self.config["device"]):
-            device = self.config["device"]
-            if isinstance(device, str) and ":" in device:
-                device_id = int(device.split(":")[1])
-            else:
-                device_id = 0
-            torch.cuda.set_device(device_id)
-            # Create a dummy tensor to fully initialize the CUDA context
-            _ = torch.zeros(1, device=self.config["device"])
+        # if "cuda" in str(self.config["device"]):
+        #     device = self.config["device"]
+        #     if isinstance(device, str) and ":" in device:
+        #         device_id = int(device.split(":")[1])
+        #     else:
+        #         device_id = 0
+        #     torch.cuda.set_device(device_id)
+        #     # Create a dummy tensor to fully initialize the CUDA context
+        #     _ = torch.zeros(1, device=self.config["device"])
 
         # Setup headless rendering for video recording
         setup_headless_rendering()
@@ -922,7 +922,7 @@ class Runner:
                     actor=self.policy[0].actor,
                     world_bounds=(-2.5, 2.5, -2.5, 2.5),
                     grid_resolution=50,
-                    device=self.config["device"],
+                    device='cpu',
                     hazard_radius=hazard_radius,
                 )
             except Exception as e:
@@ -939,21 +939,17 @@ class Runner:
             eval_actions_collector = []
             for agent_id in range(self.num_agents):
                 self.trainer[agent_id].prep_rollout()
-                if 'Frank'in self.config['env_name']:
-                    obs_to_eval = eval_obs[agent_id]
-                else:
-                    obs_to_eval = eval_obs[:, agent_id]
-                eval_actions, temp_rnn_state = \
-                    self.trainer[agent_id].policy.act(obs_to_eval,
+                obs_to_eval = eval_obs[:, agent_id]
+                eval_actions, temp_rnn_state = self.trainer[agent_id].policy.act(obs_to_eval,
                                                       eval_rnn_states[:, agent_id],
                                                       eval_masks[:, agent_id],
                                                       deterministic=True)
                 eval_rnn_states[:, agent_id] = temp_rnn_state
                 eval_actions_collector.append(eval_actions)
 
-            if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
-                zeros = torch.zeros(eval_actions_collector[-1].shape[0], 1)
-                eval_actions_collector[-1]=torch.cat((eval_actions_collector[-1], zeros), dim=1)
+            # if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
+            #     zeros = torch.zeros(eval_actions_collector[-1].shape[0], 1)
+            #     eval_actions_collector[-1]=torch.cat((eval_actions_collector[-1], zeros), dim=1)
             
             # Capture frame for first episode video (fixed-interval recording)
             if recording_first_episode and hasattr(self.eval_envs, 'render'):
@@ -1123,17 +1119,17 @@ class Runner:
 def train(args, cfg_train):
     # Initialize CUDA context early to avoid cuBLAS warning
     # Must happen before any model creation or tensor operations
-    device_str = cfg_train.get("device", "cpu")
-    if "cuda" in device_str:
-        if ":" in device_str:
-            device_id = int(device_str.split(":")[1])
-        else:
-            device_id = 0
-        torch.cuda.set_device(device_id)
-        # Warm up CUDA context with a small operation
-        _ = torch.zeros(1, device=device_str)
-        # Force synchronization to ensure context is fully initialized
-        torch.cuda.synchronize()
+    # device_str = cfg_train.get("device", "cuda:0")
+    # if "cuda" in device_str:
+    #     if ":" in device_str:
+    #         device_id = int(device_str.split(":")[1])
+    #     else:
+    #         device_id = 0
+    #     torch.cuda.set_device(device_id)
+    #     # Warm up CUDA context with a small operation
+    #     _ = torch.zeros(1, device=device_str)
+    #     # Force synchronization to ensure context is fully initialized
+    #     torch.cuda.synchronize()
     
     agent_index = [[[0, 1, 2, 3, 4, 5]],
                    [[0, 1, 2, 3, 4, 5]]]
@@ -1173,7 +1169,7 @@ def train(args, cfg_train):
     runner = Runner(env, eval_env, cfg_train, args.model_dir)
 
     if args.model_dir != "":
-        runner.eval(100000)
+        runner.eval(10)
     else:
         runner.run()
 

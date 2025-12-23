@@ -274,10 +274,10 @@ def multi_agent_args(algo):
     
     # device: only override if explicitly provided
     if '--device' in sys.argv:
-        cfg_train["device"] = args.device + ":" + str(args.device_id)
+        cfg_train["device"] = args.device
     elif 'device' not in cfg_train:
         # Set default only if not in config
-        cfg_train["device"] = args.device + ":" + str(args.device_id)
+        cfg_train["device"] = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Algorithm name (always set)
     cfg_train["algorithm_name"] = algo
