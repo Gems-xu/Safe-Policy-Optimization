@@ -1034,15 +1034,15 @@ class Runner:
 
             if eval_episode >= eval_episodes:
                 # Upload video for the first episode (fixed-interval recording)
-                if len(first_episode_frames) > 0 and should_record_video:
-                    if self.video_recorder.enabled:
-                        self.video_recorder.recorder.frames = first_episode_frames
-                        caption = f"Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
-                        self.video_recorder.recorder.upload_to_wandb(
-                            caption=caption,
-                            step=total_steps,
-                            key="eval/video"
-                        )
+                # if len(first_episode_frames) > 0 and should_record_video:
+                #     if self.video_recorder.enabled:
+                #         self.video_recorder.recorder.frames = first_episode_frames
+                #         caption = f"Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
+                #         self.video_recorder.recorder.upload_to_wandb(
+                #             caption=caption,
+                #             step=total_steps,
+                #             key="eval/video"
+                #         )
                 
                 # Upload potential field video for MultiGoal tasks to Viz module
                 if len(potential_field_frames) > 0 and should_record_video and is_multi_goal_task:
