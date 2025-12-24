@@ -438,7 +438,7 @@ def get_args(benchmark=False, use_rlg_config=False):
         {
             'name': '--rl_device',
             'type': str,
-            'default': 'cuda:0',
+            'default': 'cuda',
             'help': 'Choose CPU or GPU device for inferencing policy network',
         },
         {'name': '--logdir', 'type': str, 'default': 'log/'},
@@ -530,8 +530,8 @@ def get_args(benchmark=False, use_rlg_config=False):
 
     # allignment with examples
     # TODO
-    args.device_id = int(args.rl_device)
-    args.rl_device = 'cuda:' + str(args.rl_device)
+    # args.device_id = int(args.rl_device)
+    # args.rl_device = 'cuda:' + str(args.rl_device)
     args.device = args.sim_device_type if args.use_gpu_pipeline else 'cpu'
     if args.test:
         args.play = args.test
