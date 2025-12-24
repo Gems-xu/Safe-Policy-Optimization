@@ -33,7 +33,30 @@ from safety_gymnasium.tasks.safe_multi_agent.utils.task_utils import get_body_xv
 
 
 # Default location to look for xmls folder:
-BASE_DIR = os.path.join(os.path.dirname(safety_gymnasium.__file__), 'tasks/safe_multi_agent')
+def _get_base_dir():
+    """Get the base directory for safe_multi_agent tasks."""
+    if safety_gymnasium.__file__ is not None:
+        return os.path.join(os.path.dirname(safety_gymnasium.__file__), 'tasks/safe_multi_agent')
+    
+    import importlib.util
+    spec = importlib.util.find_spec('safety_gymnasium')
+    if spec:
+        if spec.submodule_search_locations:
+            for loc in spec.submodule_search_locations:
+                sg_dir = os.path.join(loc, 'safety_gymnasium')
+                if os.path.isdir(sg_dir):
+                    return os.path.join(sg_dir, 'tasks/safe_multi_agent')
+            return os.path.join(spec.submodule_search_locations[0], 'safety_gymnasium', 'tasks/safe_multi_agent')
+        elif spec.origin:
+            return os.path.join(os.path.dirname(spec.origin), 'tasks/safe_multi_agent')
+    
+    workspace = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+    candidate = os.path.join(workspace, 'safety_gymnasium', 'safety_gymnasium', 'tasks', 'safe_multi_agent')
+    if os.path.isdir(candidate):
+        return candidate
+    return os.path.join(os.getcwd(), 'safety_gymnasium', 'safety_gymnasium', 'tasks', 'safe_multi_agent')
+
+BASE_DIR = _get_base_dir()
 
 
 @dataclass

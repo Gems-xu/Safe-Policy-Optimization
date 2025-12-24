@@ -17,11 +17,25 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from multiprocessing import Pipe, Process
+import torch
+import torch.multiprocessing as mp
 
 from typing import Any
-import torch
 import numpy as np
+
+# Configure torch.multiprocessing start method
+# CUDA Safety Note:
+#   - 'spawn': Safest for CUDA, creates fresh Python interpreter for each subprocess
+#   - 'fork': Fast but may cause CUDA context issues
+#   - 'forkserver': Compromise between spawn and fork
+# 
+# Using 'spawn' for CUDA safety - registration issues are handled in safety_gymnasium
+try:
+    if mp.get_start_method(allow_none=True) is None:
+        mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    # Start method can only be set once
+    pass
 from gymnasium.vector.vector_env import VectorEnv
 from gymnasium.spaces import Box
 from gymnasium.wrappers.normalize import NormalizeObservation
@@ -112,9 +126,12 @@ class MultiGoalEnv():
             height: Render height  
             camera_name: Camera name for rendering
         """
+        # Import make function directly to work in spawn multiprocessing mode
+        from safety_gymnasium.utils.registration import make as sg_make
+        
         # Create the true multi-agent environment from safety_gymnasium
         # The task name is used directly (e.g., "SafetyPointMultiGoal1-v0")
-        self.env = safety_gymnasium.make(
+        self.env = sg_make(
             task, 
             render_mode='rgb_array',
             width=width,
@@ -550,6 +567,7 @@ class ShareVecEnv(ABC):
 
 def shareworker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
+    
     # Setup headless rendering in subprocess for servers without display
     # This must be done before environment creation
     try:
@@ -558,59 +576,103 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
     except Exception:
         pass
     
-    env = env_fn_wrapper.x()
+    # For spawn multiprocessing mode: ensure safety_gymnasium is properly initialized
+    # This fixes the issue where __file__ is None and environments aren't registered
+    try:
+        import sys
+        import importlib.util
+        
+        # Find the package location first
+        spec = importlib.util.find_spec('safety_gymnasium')
+        if spec and spec.origin:
+            sg_file = spec.origin
+            
+            # Remove all safety_gymnasium modules from sys.modules to force fresh import
+            modules_to_remove = [key for key in sys.modules.keys() if key.startswith('safety_gymnasium')]
+            for mod in modules_to_remove:
+                del sys.modules[mod]
+            
+            # Now import fresh - this will execute all __init__.py code
+            import safety_gymnasium
+            # Ensure __file__ is set
+            if safety_gymnasium.__file__ is None:
+                safety_gymnasium.__file__ = sg_file
+    except Exception as e:
+        # If this fails, continue anyway and hope for the best
+        pass
+    
+    # Initialize environment with error handling
+    try:
+        env = env_fn_wrapper.x()
+    except Exception as e:
+        # Send error back to main process
+        import traceback
+        error_msg = f"Error initializing environment: {str(e)}\n{traceback.format_exc()}"
+        remote.send(('error', error_msg))
+        remote.close()
+        return
+    
     while True:
-        cmd, data = remote.recv()
-        if cmd == 'step':
-            ob, s_ob, reward, cost, done, info, available_actions = env.step(data)
-            if 'bool' in done.__class__.__name__:
-                if done:
-                    ob, s_ob, available_actions = env.reset()
-            else:
-                if np.all(done):
-                    ob, s_ob, available_actions = env.reset()
+        try:
+            cmd, data = remote.recv()
+        except EOFError:
+            break
+        
+        try:
+            if cmd == 'step':
+                ob, s_ob, reward, cost, done, info, available_actions = env.step(data)
+                if 'bool' in done.__class__.__name__:
+                    if done:
+                        ob, s_ob, available_actions = env.reset()
+                else:
+                    if np.all(done):
+                        ob, s_ob, available_actions = env.reset()
 
-            remote.send((ob, s_ob, reward, cost, done, info, available_actions))
-        elif cmd == 'reset':
-            ob, s_ob, available_actions = env.reset()
-            remote.send((ob, s_ob, available_actions))
-        elif cmd == 'reset_task':
-            ob = env.reset_task()
-            remote.send(ob)
-        elif cmd == 'render':
-            # render() method no longer accepts mode parameter in gymnasium
-            # render_mode is set during environment initialization
-            try:
-                fr = env.render()
-                if data == 'rgb_array':
-                    if fr is not None:
-                        if isinstance(fr, np.ndarray) and len(fr.shape) == 3:
-                            remote.send(fr)
+                remote.send((ob, s_ob, reward, cost, done, info, available_actions))
+            elif cmd == 'reset':
+                ob, s_ob, available_actions = env.reset()
+                remote.send((ob, s_ob, available_actions))
+            elif cmd == 'reset_task':
+                ob = env.reset_task()
+                remote.send(ob)
+            elif cmd == 'render':
+                # render() method no longer accepts mode parameter in gymnasium
+                # render_mode is set during environment initialization
+                try:
+                    fr = env.render()
+                    if data == 'rgb_array':
+                        if fr is not None:
+                            if isinstance(fr, np.ndarray) and len(fr.shape) == 3:
+                                remote.send(fr)
+                            else:
+                                remote.send(None)
                         else:
                             remote.send(None)
-                    else:
+                    elif data == 'human':
                         remote.send(None)
-                elif data == 'human':
+                except Exception as e:
+                    # In headless environments, rendering may fail.
+                    # Send None gracefully in these cases.
                     remote.send(None)
-            except Exception as e:
-                # In headless environments, rendering may fail.
-                # Send None gracefully in these cases.
-                remote.send(None)
-        elif cmd == 'close':
-            env.close()
-            remote.close()
+            elif cmd == 'close':
+                env.close()
+                remote.close()
+                break
+            elif cmd == 'get_spaces':
+                remote.send((env.observation_spaces, env.share_observation_spaces, env.action_spaces))
+            elif cmd == 'get_num_agents':
+                remote.send(env.num_agents)
+            elif cmd == 'render_vulnerability':
+                fr = env.render_vulnerability(data)
+                remote.send(fr)
+            else:
+                raise NotImplementedError
+        except Exception as e:
+            # Catch and send any errors during command execution
+            import traceback
+            error_msg = f"Error in worker: {str(e)}\n{traceback.format_exc()}"
+            remote.send(('error', error_msg))
             break
-        elif cmd == 'get_spaces':
-            remote.send((env.observation_spaces, env.share_observation_spaces, env.action_spaces))
-        elif cmd == 'get_num_agents':
-            remote.send(env.num_agents)
-        elif cmd == 'render_vulnerability':
-            fr = env.render_vulnerability(data)
-            remote.send(fr)
-        elif cmd == 'get_num_agents':
-            remote.send(env.num_agents)
-        else:
-            raise NotImplementedError
 
 
 class ShareSubprocVecEnv(ShareVecEnv):
@@ -619,9 +681,9 @@ class ShareSubprocVecEnv(ShareVecEnv):
         self.closed = False
         self.device = device
         nenvs = len(env_fns)
-        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(nenvs)])
+        self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(nenvs)])
         self.ps = [
-            Process(target=shareworker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
+            mp.Process(target=shareworker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
             for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)
         ]
         for p in self.ps:
@@ -629,10 +691,19 @@ class ShareSubprocVecEnv(ShareVecEnv):
             p.start()
         for remote in self.work_remotes:
             remote.close()
+        
+        # Get environment info from first worker with error handling
         self.remotes[0].send(('get_num_agents', None))
-        self.num_agents = self.remotes[0].recv()
+        result = self.remotes[0].recv()
+        if isinstance(result, tuple) and result[0] == 'error':
+            raise RuntimeError(f"Worker process failed: {result[1]}")
+        self.num_agents = result
+        
         self.remotes[0].send(('get_spaces', None))
-        observation_space, share_observation_space, action_space = self.remotes[0].recv()
+        result = self.remotes[0].recv()
+        if isinstance(result, tuple) and len(result) == 2 and result[0] == 'error':
+            raise RuntimeError(f"Worker process failed: {result[1]}")
+        observation_space, share_observation_space, action_space = result
         ShareVecEnv.__init__(
             self, len(env_fns), observation_space, share_observation_space, action_space
         )

@@ -31,6 +31,72 @@ from safety_gymnasium.wrappers import SafeAutoResetWrapper, SafePassiveEnvChecke
 
 
 safe_registry = set()
+_registration_triggered = False
+
+
+def _get_package_dir():
+    """Get the safety_gymnasium package directory."""
+    import sys
+    import os
+    import importlib.util
+    
+    # Try to find the package location
+    spec = importlib.util.find_spec('safety_gymnasium')
+    if spec:
+        # For namespace packages (editable install), use submodule_search_locations
+        if spec.submodule_search_locations:
+            for loc in spec.submodule_search_locations:
+                # Check if this location contains the actual package
+                sg_dir = os.path.join(loc, 'safety_gymnasium')
+                if os.path.isdir(sg_dir) and os.path.isfile(os.path.join(sg_dir, '__init__.py')):
+                    return sg_dir
+            # Fallback: first location
+            first_loc = spec.submodule_search_locations[0]
+            sg_dir = os.path.join(first_loc, 'safety_gymnasium')
+            if os.path.isdir(sg_dir):
+                return sg_dir
+            return first_loc
+        elif spec.origin:
+            return os.path.dirname(spec.origin)
+    
+    # Last resort: use relative path from this file
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _ensure_registration():
+    """Ensure environments are registered (needed for spawn multiprocessing mode)."""
+    global _registration_triggered
+    if _registration_triggered:
+        return
+    _registration_triggered = True
+    
+    if len(safe_registry) == 0:
+        # In spawn mode, safe_registry is empty because __init__.py wasn't fully executed
+        # We need to manually trigger all registrations
+        import sys
+        import os
+        
+        sg_dir = _get_package_dir()
+        
+        # First, fix __file__ if it's None
+        import safety_gymnasium
+        if safety_gymnasium.__file__ is None:
+            init_file = os.path.join(sg_dir, '__init__.py')
+            if os.path.exists(init_file):
+                safety_gymnasium.__file__ = init_file
+        
+        # Execute the __init__.py file to trigger registrations
+        init_file = os.path.join(sg_dir, '__init__.py')
+        if os.path.exists(init_file):
+            # Read and execute the init file
+            with open(init_file, 'r') as f:
+                code = f.read()
+            # Create a namespace that includes the module
+            namespace = safety_gymnasium.__dict__.copy()
+            namespace['__file__'] = init_file
+            namespace['__name__'] = 'safety_gymnasium'
+            # Execute in the namespace
+            exec(compile(code, init_file, 'exec'), namespace)
 
 
 def register(**kwargs):
@@ -77,6 +143,9 @@ def make(
     Raises:
         Error: If the ``id`` doesn't exist in the :attr:`registry`
     """
+    # Ensure environments are registered (needed for spawn multiprocessing mode)
+    _ensure_registration()
+    
     if isinstance(id, EnvSpec):
         env_spec = id
         if not hasattr(env_spec, 'additional_wrappers'):
@@ -88,7 +157,30 @@ def make(
     else:
         # For string id's, load the environment spec from the registry then make the environment spec
         assert isinstance(id, str)
-        assert id in safe_registry, f'Environment {id} is not registered in safety-gymnasium.'
+        
+        # Check if environment is in safe_registry; if not, try to find it in gymnasium registry
+        # This handles the case where spawn mode doesn't properly populate safe_registry
+        if id not in safe_registry:
+            from gymnasium.envs.registration import registry as gym_registry
+            if id in gym_registry:
+                # Environment is registered in gymnasium but not in our safe_registry
+                # This can happen in spawn multiprocessing mode
+                safe_registry.add(id)
+            else:
+                # Try to force registration by importing safety_gymnasium fresh
+                import sys
+                modules_to_remove = [key for key in list(sys.modules.keys()) if key.startswith('safety_gymnasium')]
+                for mod in modules_to_remove:
+                    if mod != 'safety_gymnasium.utils.registration':  # Don't remove ourselves
+                        try:
+                            del sys.modules[mod]
+                        except KeyError:
+                            pass
+                # Import safety_gymnasium to trigger registrations
+                import safety_gymnasium
+                # Check again
+                if id not in safe_registry and id not in gym_registry:
+                    raise AssertionError(f'Environment {id} is not registered in safety-gymnasium.')
 
         # The environment name can include an unloaded module in "module:env_name" style
         env_spec = _find_spec(id)

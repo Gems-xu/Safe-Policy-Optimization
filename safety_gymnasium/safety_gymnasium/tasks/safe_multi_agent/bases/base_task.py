@@ -385,7 +385,15 @@ class BaseTask(Underlying):  # pylint: disable=too-many-instance-attributes,too-
         level = int(env_info[1])
 
         # load all config of meshes in specific environment from .yaml file
-        base_dir = os.path.dirname(safety_gymnasium.__file__)
+        if safety_gymnasium.__file__ is not None:
+            base_dir = os.path.dirname(safety_gymnasium.__file__)
+        else:
+            import importlib.util
+            spec = importlib.util.find_spec('safety_gymnasium')
+            if spec and spec.origin:
+                base_dir = os.path.dirname(spec.origin)
+            else:
+                base_dir = os.path.join(os.getcwd(), 'safety_gymnasium', 'safety_gymnasium')
         with open(os.path.join(base_dir, f'configs/{config_name}.yaml'), encoding='utf-8') as file:
             meshes_config = yaml.load(file, Loader=yaml.FullLoader)  # noqa: S506
 

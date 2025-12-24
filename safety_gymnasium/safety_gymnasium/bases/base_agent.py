@@ -32,7 +32,29 @@ from safety_gymnasium.utils.task_utils import get_body_xvelp, quat2mat
 from safety_gymnasium.world import Engine
 
 
-BASE_DIR = os.path.dirname(safety_gymnasium.__file__)
+def _get_base_dir():
+    """Get the base directory for safety_gymnasium package."""
+    if safety_gymnasium.__file__ is not None:
+        return os.path.dirname(safety_gymnasium.__file__)
+    
+    import importlib.util
+    spec = importlib.util.find_spec('safety_gymnasium')
+    if spec:
+        if spec.submodule_search_locations:
+            for loc in spec.submodule_search_locations:
+                sg_dir = os.path.join(loc, 'safety_gymnasium')
+                if os.path.isdir(sg_dir):
+                    return sg_dir
+            return spec.submodule_search_locations[0]
+        elif spec.origin:
+            return os.path.dirname(spec.origin)
+    
+    workspace = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if os.path.isfile(os.path.join(workspace, 'safety_gymnasium', 'safety_gymnasium', '__init__.py')):
+        return os.path.join(workspace, 'safety_gymnasium', 'safety_gymnasium')
+    return os.path.join(os.getcwd(), 'safety_gymnasium', 'safety_gymnasium')
+
+BASE_DIR = _get_base_dir()
 
 
 @dataclass
