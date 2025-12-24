@@ -308,7 +308,7 @@ class MultiAgentCritic(nn.Module):
     Args:
         config (dict): Configuration dictionary.
         cent_obs_space (gym.spaces.Space): Centralized observation space.
-        device (torch.device): Device to use for computations (default: cuda:0).
+        device (torch.device): Device to use for computations (default: cuda).
 
     Attributes:
         hidden_size (int): Size of the hidden layer.
@@ -319,7 +319,7 @@ class MultiAgentCritic(nn.Module):
         tpdv (dict): Dictionary for tensor properties.
     """
     
-    def __init__(self, config, cent_obs_space, device=torch.device("cuda:0")):
+    def __init__(self, config, cent_obs_space, device=torch.device("cuda")):
         super(MultiAgentCritic, self).__init__()
         self.hidden_size = config["hidden_size"]
         self._use_orthogonal = config["use_orthogonal"]

@@ -1287,12 +1287,12 @@ def compute_hand_reward(
 
     # Check env termination conditions, including maximum success number
     right_hand_base_dist = torch.norm(
-        right_hand_base_pos - torch.tensor([0.0, 0.0, 0.5], dtype=torch.float, device='cuda:0'),
+        right_hand_base_pos - torch.tensor([0.0, 0.0, 0.5], dtype=torch.float, device='cuda'),
         p=2,
         dim=-1,
     )
     left_hand_base_dist = torch.norm(
-        left_hand_base_pos - torch.tensor([0.0, -0.8, 0.5], dtype=torch.float, device='cuda:0'),
+        left_hand_base_pos - torch.tensor([0.0, -0.8, 0.5], dtype=torch.float, device='cuda'),
         p=2,
         dim=-1,
     )
