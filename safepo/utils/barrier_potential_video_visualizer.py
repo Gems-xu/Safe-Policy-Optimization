@@ -197,15 +197,17 @@ class BarrierPotentialVideoVisualizer:
         """
         potential_field = np.zeros((self.grid_resolution, self.grid_resolution))
         
-        # Get barrier parameters from actor if available
+        # Get barrier parameters from actor if available (v3.0 精准化)
         if self.actor is not None:
-            r_safe = getattr(self.actor, 'r_safe', 0.3)
-            barrier_epsilon = getattr(self.actor, 'barrier_epsilon', 0.01)
-            barrier_k = getattr(self.actor, 'barrier_k_scale', 2.0)
+            r_safe = getattr(self.actor, 'r_safe', 0.08)
+            barrier_epsilon = getattr(self.actor, 'barrier_epsilon', 0.1)
+            barrier_k = getattr(self.actor, 'barrier_k_scale', 0.3)
+            barrier_decay_rate = getattr(self.actor, 'barrier_decay_rate', 5.0)
         else:
-            r_safe = 0.3
-            barrier_epsilon = 0.01
-            barrier_k = 2.0
+            r_safe = 0.08
+            barrier_epsilon = 0.1
+            barrier_k = 0.3
+            barrier_decay_rate = 5.0
         
         # Combine obstacles and agents as repellers
         all_repellers = []
@@ -227,15 +229,107 @@ class BarrierPotentialVideoVisualizer:
                 # Distance to all repellers
                 dists = np.linalg.norm(all_repellers - pos, axis=1)
                 
-                # Barrier potential: k / ((d - r_safe)^2 + ε)
-                # Use hazard_radius for obstacles
+                # Barrier potential: k / ((d - r_safe - hazard_radius)^decay_rate + ε)
+                # Use decay_rate for faster falloff
                 margin = np.maximum(dists - self.hazard_radius - r_safe, 0.01)
-                H_barrier = barrier_k / (margin ** 2 + barrier_epsilon)
+                H_barrier = barrier_k / (np.power(margin, barrier_decay_rate) + barrier_epsilon)
                 
                 # Sum over all repellers
                 potential_field[i, j] = np.sum(H_barrier)
         
         return potential_field
+    
+    def compute_task_potential_field_fast(
+        self,
+        goal_positions: Optional[np.ndarray] = None,
+        task_potential_scale: float = 2.0,
+    ) -> np.ndarray:
+        """
+        Compute task potential field analytically.
+        
+        Task potential is attractive toward goals:
+        H_task = scale * distance_to_nearest_goal
+        
+        This creates a potential well (low/negative values) at goal positions,
+        guiding agents toward them.
+        
+        Args:
+            goal_positions: Goal positions, shape (n_goals, 2)
+            task_potential_scale: Scale factor for task potential
+            
+        Returns:
+            potential_field: 2D numpy array of shape (grid_resolution, grid_resolution)
+        """
+        potential_field = np.zeros((self.grid_resolution, self.grid_resolution))
+        
+        if goal_positions is None or len(goal_positions) == 0:
+            return potential_field
+        
+        goal_arr = np.array(goal_positions)
+        
+        # Compute task potential at each grid point
+        for i in range(self.grid_resolution):
+            for j in range(self.grid_resolution):
+                pos = np.array([self.X[i, j], self.Y[i, j]])
+                
+                # Distance to all goals
+                dists = np.linalg.norm(goal_arr - pos, axis=1)
+                
+                # Task potential: negative near goals (attractive)
+                # Use negative exponential for attractive potential
+                # H_task = min_dist (linear gradient toward goal)
+                # Or use exponential for smoother visualization
+                min_dist = np.min(dists)
+                
+                # Option 1: Linear potential (gradient field)
+                # H_task = task_potential_scale * min_dist
+                
+                # Option 2: Negative Gaussian (creates potential well)
+                # H_task = -task_potential_scale * exp(-min_dist^2 / (2 * sigma^2))
+                sigma = 1.0  # Width of the potential well
+                H_task = -task_potential_scale * np.exp(-min_dist**2 / (2 * sigma**2))
+                
+                potential_field[i, j] = H_task
+        
+        return potential_field
+    
+    def compute_total_potential_field_fast(
+        self,
+        obstacle_positions: Optional[np.ndarray] = None,
+        goal_positions: Optional[np.ndarray] = None,
+        agent_positions: Optional[np.ndarray] = None,
+        task_potential_scale: float = 2.0,
+    ) -> np.ndarray:
+        """
+        Compute total potential field: H_total = H_barrier + H_task
+        
+        This combines:
+        - Barrier potential (repulsive from obstacles) 
+        - Task potential (attractive to goals)
+        
+        Args:
+            obstacle_positions: Obstacle/hazard positions
+            goal_positions: Goal positions
+            agent_positions: Agent positions (optional repellers)
+            task_potential_scale: Scale for task potential
+            
+        Returns:
+            potential_field: 2D numpy array of shape (grid_resolution, grid_resolution)
+        """
+        H_barrier = self.compute_barrier_potential_field_fast(
+            obstacle_positions=obstacle_positions,
+            agent_positions=agent_positions,
+        )
+        
+        H_task = self.compute_task_potential_field_fast(
+            goal_positions=goal_positions,
+            task_potential_scale=task_potential_scale,
+        )
+        
+        # Total potential: barrier (positive/repulsive) + task (negative/attractive)
+        H_total = H_barrier + H_task
+        
+        return H_total
     
     def _create_synthetic_observation(
         self,
@@ -451,6 +545,201 @@ class BarrierPotentialVideoVisualizer:
         fig.canvas.draw()
         image = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
         
+        plt.close(fig)
+        
+        return image
+    
+    def render_all_potentials_frame(
+        self,
+        env_frame: np.ndarray,
+        obstacle_positions: Optional[np.ndarray] = None,
+        goal_positions: Optional[np.ndarray] = None,
+        agent_positions: Optional[np.ndarray] = None,
+        step: int = 0,
+        task_potential_scale: float = 2.0,
+        figsize: Tuple[int, int] = (20, 5),
+        dpi: int = 100,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Render all three potential fields: H_barrier, H_task, H_total
+        
+        Returns combined visualization frame and individual potential field images.
+        
+        Args:
+            env_frame: RGB image from environment render
+            obstacle_positions: Positions of obstacles
+            goal_positions: Goal positions
+            agent_positions: Agent positions
+            step: Current step number
+            task_potential_scale: Scale for task potential
+            figsize: Figure size in inches
+            dpi: Resolution
+            
+        Returns:
+            Tuple of (combined_image, barrier_image, task_image, total_image)
+        """
+        if not HAS_MATPLOTLIB:
+            h, w = env_frame.shape[:2]
+            empty = np.zeros((h, w, 3), dtype=np.uint8)
+            return empty, empty, empty, empty
+        
+        # Compute all potential fields
+        H_barrier = self.compute_barrier_potential_field_fast(
+            obstacle_positions=obstacle_positions,
+            agent_positions=agent_positions,
+        )
+        H_task = self.compute_task_potential_field_fast(
+            goal_positions=goal_positions,
+            task_potential_scale=task_potential_scale,
+        )
+        H_total = H_barrier + H_task
+        
+        # Create figure with 4 subplots
+        fig, axes = plt.subplots(1, 4, figsize=figsize, dpi=dpi)
+        
+        extent = [self.world_bounds[0], self.world_bounds[1], 
+                  self.world_bounds[2], self.world_bounds[3]]
+        
+        # === 1. Environment Frame ===
+        axes[0].imshow(env_frame)
+        axes[0].set_title(f'Environment (Step {step})', fontsize=12)
+        axes[0].axis('off')
+        
+        # === 2. Barrier Potential ===
+        vmax_barrier = np.percentile(H_barrier, 95) if H_barrier.max() > 0 else 1.0
+        im1 = axes[1].imshow(
+            H_barrier, extent=extent, origin='lower',
+            cmap='hot_r', vmin=0, vmax=max(vmax_barrier, 0.1), alpha=0.8
+        )
+        self._add_overlays(axes[1], obstacle_positions, goal_positions, agent_positions)
+        axes[1].set_title('Barrier Potential (H_barrier)', fontsize=12)
+        axes[1].set_xlabel('X Position')
+        axes[1].set_ylabel('Y Position')
+        axes[1].set_xlim(self.world_bounds[0], self.world_bounds[1])
+        axes[1].set_ylim(self.world_bounds[2], self.world_bounds[3])
+        axes[1].set_aspect('equal')
+        axes[1].grid(True, alpha=0.3)
+        cbar1 = plt.colorbar(im1, ax=axes[1], shrink=0.8)
+        cbar1.set_label('H_barrier', fontsize=9)
+        
+        # === 3. Task Potential ===
+        vmin_task = H_task.min()
+        vmax_task = max(H_task.max(), 0.1)
+        im2 = axes[2].imshow(
+            H_task, extent=extent, origin='lower',
+            cmap='coolwarm', vmin=vmin_task, vmax=vmax_task, alpha=0.8
+        )
+        self._add_overlays(axes[2], obstacle_positions, goal_positions, agent_positions)
+        axes[2].set_title('Task Potential (H_task)', fontsize=12)
+        axes[2].set_xlabel('X Position')
+        axes[2].set_ylabel('Y Position')
+        axes[2].set_xlim(self.world_bounds[0], self.world_bounds[1])
+        axes[2].set_ylim(self.world_bounds[2], self.world_bounds[3])
+        axes[2].set_aspect('equal')
+        axes[2].grid(True, alpha=0.3)
+        cbar2 = plt.colorbar(im2, ax=axes[2], shrink=0.8)
+        cbar2.set_label('H_task', fontsize=9)
+        
+        # === 4. Total Potential ===
+        vmin_total = H_total.min()
+        vmax_total = np.percentile(H_total, 95) if H_total.max() > 0 else 1.0
+        im3 = axes[3].imshow(
+            H_total, extent=extent, origin='lower',
+            cmap='RdYlGn_r', vmin=vmin_total, vmax=max(vmax_total, abs(vmin_total)), alpha=0.8
+        )
+        self._add_overlays(axes[3], obstacle_positions, goal_positions, agent_positions)
+        axes[3].set_title('Total Potential (H_total)', fontsize=12)
+        axes[3].set_xlabel('X Position')
+        axes[3].set_ylabel('Y Position')
+        axes[3].set_xlim(self.world_bounds[0], self.world_bounds[1])
+        axes[3].set_ylim(self.world_bounds[2], self.world_bounds[3])
+        axes[3].set_aspect('equal')
+        axes[3].grid(True, alpha=0.3)
+        cbar3 = plt.colorbar(im3, ax=axes[3], shrink=0.8)
+        cbar3.set_label('H_total', fontsize=9)
+        
+        plt.tight_layout()
+        
+        # Convert to numpy array
+        fig.canvas.draw()
+        combined_image = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+        plt.close(fig)
+        
+        # Generate individual potential images for wandb logging
+        barrier_image = self._render_single_potential(H_barrier, 'hot_r', 'Barrier Potential', 
+                                                       obstacle_positions, goal_positions, agent_positions, step)
+        task_image = self._render_single_potential(H_task, 'coolwarm', 'Task Potential',
+                                                    obstacle_positions, goal_positions, agent_positions, step)
+        total_image = self._render_single_potential(H_total, 'RdYlGn_r', 'Total Potential',
+                                                     obstacle_positions, goal_positions, agent_positions, step)
+        
+        return combined_image, barrier_image, task_image, total_image
+    
+    def _add_overlays(self, ax, obstacle_positions, goal_positions, agent_positions):
+        """Add obstacles, goals, and agents to axis."""
+        # Plot obstacles
+        if obstacle_positions is not None and len(obstacle_positions) > 0:
+            obs_arr = np.array(obstacle_positions)
+            ax.scatter(obs_arr[:, 0], obs_arr[:, 1],
+                      c='gray', s=100, marker='o', edgecolors='black', linewidths=1.5, zorder=5)
+            for pos in obstacle_positions:
+                circle = Circle(pos, self.hazard_radius, 
+                              fill=False, color='gray', linewidth=1, linestyle='--')
+                ax.add_patch(circle)
+        
+        # Plot agents
+        if agent_positions is not None and len(agent_positions) > 0:
+            agent_arr = np.array(agent_positions)
+            for i, pos in enumerate(agent_arr):
+                color = self.agent_colors[i % len(self.agent_colors)]
+                ax.scatter(pos[0], pos[1], c=color, s=100, marker='o',
+                          edgecolors='black', linewidths=1.5, zorder=6)
+        
+        # Plot goals
+        if goal_positions is not None and len(goal_positions) > 0:
+            goal_arr = np.array(goal_positions)
+            for i, pos in enumerate(goal_arr):
+                color = self.agent_colors[i % len(self.agent_colors)]
+                ax.scatter(pos[0], pos[1], c=color, s=80, marker='*',
+                          edgecolors='black', linewidths=1, zorder=5)
+    
+    def _render_single_potential(self, potential_field, cmap, title, 
+                                  obstacle_positions, goal_positions, agent_positions, step,
+                                  figsize=(6, 6), dpi=80) -> np.ndarray:
+        """Render a single potential field image for wandb logging."""
+        if not HAS_MATPLOTLIB:
+            return np.zeros((480, 480, 3), dtype=np.uint8)
+        
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+        
+        extent = [self.world_bounds[0], self.world_bounds[1], 
+                  self.world_bounds[2], self.world_bounds[3]]
+        
+        vmin = potential_field.min()
+        vmax = np.percentile(potential_field, 95) if potential_field.max() > abs(vmin) else abs(vmin)
+        
+        im = ax.imshow(
+            potential_field, extent=extent, origin='lower',
+            cmap=cmap, vmin=vmin, vmax=max(vmax, 0.1), alpha=0.8
+        )
+        
+        self._add_overlays(ax, obstacle_positions, goal_positions, agent_positions)
+        
+        ax.set_title(f'{title} (Step {step})', fontsize=12)
+        ax.set_xlabel('X Position')
+        ax.set_ylabel('Y Position')
+        ax.set_xlim(self.world_bounds[0], self.world_bounds[1])
+        ax.set_ylim(self.world_bounds[2], self.world_bounds[3])
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+        
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label(title.split()[0], fontsize=9)
+        
+        plt.tight_layout()
+        
+        fig.canvas.draw()
+        image = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
         plt.close(fig)
         
         return image

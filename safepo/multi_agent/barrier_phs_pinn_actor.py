@@ -88,21 +88,26 @@ class BarrierPHSPINNActor(nn.Module):
         self.std_x_coef = config.get("std_x_coef", 1.0)
         self.std_y_coef = config.get("std_y_coef", 0.5)
         
-        # Barrier potential parameters (Enhanced for safety)
-        self.r_safe = config.get("barrier_r_safe", 0.5)  # Safe distance threshold (increased)
-        self.barrier_epsilon = config.get("barrier_epsilon", 0.005)  # Numerical stability (reduced for steeper barrier)
-        self.barrier_clip_max = config.get("barrier_clip_max", 100.0)  # Clip for stability (increased)
+        # Barrier potential parameters (v3.0 精准化 - 极小化障碍势能边界)
+        self.r_safe = config.get("barrier_r_safe", 0.08)  # Safe distance threshold - 极小化到0.08
+        self.barrier_epsilon = config.get("barrier_epsilon", 0.1)  # Numerical stability - 增大到0.1
+        self.barrier_clip_max = config.get("barrier_clip_max", 20.0)  # Clip for stability
         self.num_lidar_bins = config.get("num_lidar_bins", 16)  # Lidar bins per obstacle type
         
-        # Enhanced safety parameters
-        self.barrier_k_scale = config.get("barrier_k_scale", 2.0)  # Amplify barrier stiffness
-        self.barrier_gradient_scale = config.get("barrier_gradient_scale", 1.5)  # Amplify barrier gradient influence
-        self.barrier_decay_rate = config.get("barrier_decay_rate", 2.0)  # Power for distance decay (higher = sharper)
-        self.min_barrier_k = config.get("min_barrier_k", 0.5)  # Minimum barrier stiffness
+        # Enhanced safety parameters (v3.0 精准化 - 极快衰减)
+        self.barrier_k_scale = config.get("barrier_k_scale", 0.3)  # Barrier stiffness - 减小到0.3
+        self.barrier_gradient_scale = config.get("barrier_gradient_scale", 0.3)  # Gradient influence
+        self.barrier_decay_rate = config.get("barrier_decay_rate", 5.0)  # Power for distance decay - 增大到5.0
+        self.min_barrier_k = config.get("min_barrier_k", 0.05)  # Minimum barrier stiffness
         
-        # Cost-aware safety: penalize actions in dangerous zones
-        self.cost_aware_weight = config.get("cost_aware_weight", 0.3)  # Weight for cost-aware policy shaping
-        self.danger_zone_threshold = config.get("danger_zone_threshold", 0.8)  # Lidar threshold for danger
+        # Cost-aware safety: penalize actions in dangerous zones (v3.0 精准化)
+        self.cost_aware_weight = config.get("cost_aware_weight", 0.02)  # Weight for cost-aware policy shaping
+        self.danger_zone_threshold = config.get("danger_zone_threshold", 0.98)  # Lidar threshold for danger
+        
+        # Safety layer for action correction (NEW)
+        self.use_safety_layer = config.get("use_safety_layer", True)
+        self.safety_gamma = config.get("safety_gamma", 0.1)
+        self.action_clip_margin = config.get("action_clip_margin", 0.1)
         
         # Physics state extraction indices (for Point agent observation)
         # obs[0:3] = accelerometer (ax, ay, az)
@@ -622,6 +627,10 @@ class BarrierPHSPINNActor(nn.Module):
         else:
             action = dist.rsample()  # Reparameterization trick
         
+        # === Safety Layer: Correct action based on barrier gradient ===
+        if self.use_safety_layer:
+            action = self._apply_safety_correction(action, obs, H_barrier, grad_H_total)
+        
         # Compute log probability
         action_log_probs = dist.log_prob(action)  # Per-dimension, no sum (like MAPPO)
         
@@ -712,3 +721,77 @@ class BarrierPHSPINNActor(nn.Module):
             'state': state.detach(),
             'min_dist': min_dist.detach()
         }
+
+    def _apply_safety_correction(self, action, obs, H_barrier, grad_H_barrier):
+        """
+        Apply safety correction to action based on barrier potential gradient.
+        
+        This implements a Control Barrier Function (CBF)-inspired safety layer:
+        When H_barrier is high (near obstacles), correct the action to avoid
+        moving toward obstacles.
+        
+        Args:
+            action: [batch, act_dim] raw action from policy
+            obs: [batch, obs_dim] observation
+            H_barrier: [batch, 1] barrier potential
+            grad_H_barrier: [batch, 2] barrier gradient
+            
+        Returns:
+            corrected_action: [batch, act_dim] safety-corrected action
+        """
+        # Extract current velocity
+        vel = obs[:, self.vel_indices]  # [batch, 2]
+        vel_norm = torch.norm(vel, dim=-1, keepdim=True) + 1e-6
+        vel_dir = vel / vel_norm
+        
+        # Extract lidar info for danger detection
+        lidar_obs, min_dist = self._extract_lidar_info(obs)
+        max_lidar = lidar_obs.max(dim=-1, keepdim=True)[0]
+        
+        # Danger level: 0 when safe, 1 when very close to obstacle
+        danger_level = torch.clamp((max_lidar - 0.5) / 0.5, min=0.0, max=1.0)
+        
+        # Normalize barrier gradient
+        grad_norm = torch.norm(grad_H_barrier, dim=-1, keepdim=True) + 1e-6
+        grad_dir = grad_H_barrier / grad_norm  # Direction away from obstacles
+        
+        # Compute action direction (for Point/Car, action[0] is forward, action[1] is turn)
+        # action[0]: forward force (positive = forward)
+        # action[1]: turning (positive = left)
+        
+        # Project action onto gradient direction
+        # If action would move toward obstacle (opposite to gradient), correct it
+        
+        # For Point/Car agent:
+        # Forward action should be reduced if moving toward obstacle
+        # Turn action should be modified to turn away from obstacle
+        
+        # Compute correction factor based on danger level and barrier potential
+        correction_strength = danger_level * self.safety_gamma * (1.0 + H_barrier / 10.0)
+        correction_strength = torch.clamp(correction_strength, max=0.5)  # Max 50% correction
+        
+        # Compute dot product between velocity direction and gradient
+        # If negative, we're moving toward obstacle
+        vel_grad_dot = (vel_dir * grad_dir).sum(dim=-1, keepdim=True)
+        moving_toward_danger = (vel_grad_dot < 0).float()
+        
+        # Correct forward action: reduce forward force if moving toward obstacle
+        action_corrected = action.clone()
+        
+        # Only correct when in danger and moving toward obstacle
+        correction_mask = danger_level * moving_toward_danger
+        
+        # Reduce forward velocity when dangerous
+        action_corrected[:, 0:1] = action[:, 0:1] * (1.0 - correction_strength * correction_mask)
+        
+        # Add turning component to avoid obstacle
+        # Use cross product to determine which way to turn
+        cross = vel_dir[:, 0:1] * grad_dir[:, 1:2] - vel_dir[:, 1:2] * grad_dir[:, 0:1]
+        turn_correction = correction_strength * correction_mask * torch.sign(cross) * 0.5
+        action_corrected[:, 1:2] = action[:, 1:2] + turn_correction
+        
+        # Clip corrected action to valid range
+        action_corrected = torch.clamp(action_corrected, -1.0 + self.action_clip_margin, 
+                                        1.0 - self.action_clip_margin)
+        
+        return action_corrected

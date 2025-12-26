@@ -222,9 +222,26 @@ class MAPPOSafePINNTrainer():
 
         self.value_normalizer = PopArt(1, device=self.config["device"])
         
-        # Auxiliary loss weights for physics-informed training
-        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.01)
-        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.01)
+        # Auxiliary loss weights for physics-informed training (v3.0 增强安全学习)
+        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.05)
+        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.1)
+        self.aux_safety_weight = config.get("aux_safety_weight", 0.2)
+        
+        # === Lagrangian Constraint for Cost (NEW) ===
+        self.use_lagrangian = config.get("use_lagrangian", True)
+        self.cost_limit = config.get("cost_limit", 25.0)  # Target cost limit
+        self.lagrangian_multiplier = nn.Parameter(
+            torch.tensor(config.get("lagrangian_init", 0.001), 
+                        dtype=torch.float32, device=config["device"]),
+            requires_grad=True
+        )
+        self.lagrangian_lr = config.get("lagrangian_lr", 0.035)
+        self.lagrangian_max = config.get("lagrangian_max", 10.0)
+        self.lagrangian_optimizer = torch.optim.Adam([self.lagrangian_multiplier], lr=self.lagrangian_lr)
+        
+        # Cost buffer for Lagrangian update
+        self.recent_costs = []
+        self.cost_window = 10  # Average over last N episodes
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.config["clip_param"],
@@ -243,11 +260,10 @@ class MAPPOSafePINNTrainer():
         """
         Compute auxiliary losses to help train H_task and barrier_k networks.
         
-        Key insight: Without direct supervision, these networks learn very slowly
-        through the policy gradient. We add auxiliary losses:
-        
+        Enhanced with stronger safety guidance:
         1. Task potential should be lower near goals (based on goal lidar readings)
         2. Barrier potential should be higher near obstacles (based on hazard lidar)
+        3. Safety loss: penalize being close to hazards to reduce cost
         
         Args:
             obs_batch: [batch, obs_dim] observation tensor
@@ -281,30 +297,49 @@ class MAPPOSafePINNTrainer():
         
         # === Auxiliary Loss 1: Task Potential ===
         # H_task should be LOWER when close to goal (goal_proximity high)
-        # Loss: encourage H_task to be negatively correlated with goal proximity
-        # Target: H_task ≈ 1 - goal_proximity (normalized)
+        # Enhanced: use negative exponential for stronger gradient near goal
         target_H_task = 1.0 - goal_proximity.clamp(0, 1)
         task_potential_loss = F.mse_loss(torch.sigmoid(H_task), target_H_task)
         
         # === Auxiliary Loss 2: Barrier Awareness ===
         # barrier_k should be HIGHER when close to hazards
-        # This encourages the network to learn hazard-aware stiffness
         k = actor.barrier_k_net(obs_batch)  # [batch, 1]
-        # Target: k should increase with hazard proximity
-        target_k_scale = 0.5 + hazard_proximity.clamp(0, 1) * 2.0  # Range [0.5, 2.5]
+        # Enhanced: stronger response to hazards
+        target_k_scale = 0.3 + hazard_proximity.clamp(0, 1) * 3.0  # Range [0.3, 3.3]
         barrier_k_loss = F.mse_loss(k, target_k_scale)
         
-        # Combined auxiliary loss
+        # === Auxiliary Loss 3: Safety Loss (NEW) ===
+        # Penalize being in dangerous positions (high hazard proximity)
+        # This encourages the network to learn safer policies
+        # Key insight: H_barrier should be responsive to hazard proximity
+        danger_mask = (hazard_proximity > 0.5).float()  # In danger zone
+        safety_loss = (danger_mask * (1.0 - H_barrier / (H_barrier.detach().max() + 1e-6))).mean()
+        
+        # === Auxiliary Loss 4: Gradient Alignment ===
+        # Encourage barrier gradient to point away from obstacles
+        # This helps the policy learn correct avoidance behavior
+        _, grad_H_barrier = actor._compute_barrier_potential(obs_batch)
+        grad_magnitude = torch.norm(grad_H_barrier, dim=-1, keepdim=True)
+        # Barrier gradient should be large when near hazards
+        target_grad_mag = hazard_proximity * 5.0
+        grad_alignment_loss = F.mse_loss(grad_magnitude.clamp(max=5.0), target_grad_mag.clamp(max=5.0))
+        
+        # Combined auxiliary loss with enhanced safety
         aux_loss = (self.aux_task_potential_weight * task_potential_loss + 
-                    self.aux_barrier_potential_weight * barrier_k_loss)
+                    self.aux_barrier_potential_weight * (barrier_k_loss + grad_alignment_loss) +
+                    self.aux_safety_weight * safety_loss)
         
         aux_info = {
             'aux_task_loss': task_potential_loss.item(),
             'aux_barrier_k_loss': barrier_k_loss.item(),
+            'aux_safety_loss': safety_loss.item(),
+            'aux_grad_align_loss': grad_alignment_loss.item(),
             'H_task_mean': H_task.mean().item(),
             'H_task_std': H_task.std().item(),
+            'H_barrier_mean': H_barrier.mean().item(),
             'k_mean': k.mean().item(),
             'k_std': k.std().item(),
+            'hazard_proximity_mean': hazard_proximity.mean().item(),
         }
         
         return aux_loss, aux_info
@@ -344,8 +379,22 @@ class MAPPOSafePINNTrainer():
         # Compute auxiliary physics loss for H_task and barrier_k networks
         aux_loss, aux_info = self.compute_auxiliary_physics_loss(check(obs_batch).to(**self.tpdv))
         
-        # Total actor loss = policy loss + auxiliary physics loss
-        total_actor_loss = policy_loss - dist_entropy * self.config["entropy_coef"] + aux_loss
+        # === Lagrangian Penalty for Cost Constraint (NEW) ===
+        lagrangian_penalty = torch.tensor(0.0, device=self.config["device"])
+        if self.use_lagrangian and len(self.recent_costs) > 0:
+            # Use recent average cost to compute penalty
+            avg_cost = sum(self.recent_costs) / len(self.recent_costs)
+            cost_violation = max(0, avg_cost - self.cost_limit)
+            
+            # Lagrangian penalty: λ * (cost - limit)
+            # This adds cost awareness to the policy loss
+            lagrangian_penalty = self.lagrangian_multiplier.clamp(min=0.0) * cost_violation
+            aux_info['lagrangian_multiplier'] = self.lagrangian_multiplier.item()
+            aux_info['cost_violation'] = cost_violation
+            aux_info['lagrangian_penalty'] = lagrangian_penalty.item()
+        
+        # Total actor loss = policy loss + auxiliary physics loss + lagrangian penalty
+        total_actor_loss = policy_loss - dist_entropy * self.config["entropy_coef"] + aux_loss + lagrangian_penalty
 
         self.policy.actor_optimizer.zero_grad()
         total_actor_loss.backward()
@@ -361,6 +410,35 @@ class MAPPOSafePINNTrainer():
 
         return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info
 
+    def update_lagrangian(self, episode_cost):
+        """
+        Update Lagrangian multiplier based on episode cost.
+        
+        Uses dual gradient ascent:
+        λ = λ + lr * (cost - cost_limit)
+        
+        Args:
+            episode_cost: Average cost of the episode
+        """
+        if not self.use_lagrangian:
+            return
+        
+        # Add to recent costs buffer
+        self.recent_costs.append(episode_cost)
+        if len(self.recent_costs) > self.cost_window:
+            self.recent_costs.pop(0)
+        
+        # Compute cost violation
+        avg_cost = sum(self.recent_costs) / len(self.recent_costs)
+        cost_violation = avg_cost - self.cost_limit
+        
+        # Update Lagrangian multiplier using gradient ascent
+        # λ += lr * (cost - limit)
+        with torch.no_grad():
+            self.lagrangian_multiplier.add_(self.lagrangian_lr * cost_violation)
+            # Clamp to [0, max]
+            self.lagrangian_multiplier.clamp_(min=0.0, max=self.lagrangian_max)
+
     def train(self, buffer, logger):
         advantages = buffer.returns[:-1] - self.value_normalizer.denormalize(buffer.value_preds[:-1])
         advantages_copy = advantages.clone()
@@ -374,21 +452,33 @@ class MAPPOSafePINNTrainer():
             for sample in data_generator:
                 value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info \
                     = self.ppo_update(sample)
-            logger.store(
-                **{
-                    "Loss/Loss_reward_critic": value_loss.item(),
-                    "Loss/Loss_actor": policy_loss.item(),
-                    "Loss/Aux_task_potential": aux_info['aux_task_loss'],
-                    "Loss/Aux_barrier_k": aux_info['aux_barrier_k_loss'],
-                    "Safe/H_task_mean": aux_info['H_task_mean'],
-                    "Safe/H_task_std": aux_info['H_task_std'],
-                    "Safe/k_mean": aux_info['k_mean'],
-                    "Safe/k_std": aux_info['k_std'],
-                    "Misc/Reward_critic_norm": critic_grad_norm.item(),
-                    "Misc/Entropy": dist_entropy.item(),
-                    "Misc/Ratio": imp_weights.detach().mean().item(),
-                }
-            )
+        
+        # Add Lagrangian info to logger
+        lagrangian_info = {
+            "Loss/Loss_reward_critic": value_loss.item(),
+            "Loss/Loss_actor": policy_loss.item(),
+            "Loss/Aux_task_potential": aux_info['aux_task_loss'],
+            "Loss/Aux_barrier_k": aux_info['aux_barrier_k_loss'],
+            "Loss/Aux_safety": aux_info['aux_safety_loss'],
+            "Loss/Aux_grad_align": aux_info['aux_grad_align_loss'],
+            "Safe/H_task_mean": aux_info['H_task_mean'],
+            "Safe/H_task_std": aux_info['H_task_std'],
+            "Safe/H_barrier_mean": aux_info['H_barrier_mean'],
+            "Safe/k_mean": aux_info['k_mean'],
+            "Safe/k_std": aux_info['k_std'],
+            "Safe/hazard_proximity": aux_info['hazard_proximity_mean'],
+            "Misc/Reward_critic_norm": critic_grad_norm.item(),
+            "Misc/Entropy": dist_entropy.item(),
+            "Misc/Ratio": imp_weights.detach().mean().item(),
+        }
+        
+        # Add Lagrangian metrics if available
+        if 'lagrangian_multiplier' in aux_info:
+            lagrangian_info["Safe/lagrangian_multiplier"] = aux_info['lagrangian_multiplier']
+            lagrangian_info["Safe/cost_violation"] = aux_info['cost_violation']
+            lagrangian_info["Loss/lagrangian_penalty"] = aux_info['lagrangian_penalty']
+        
+        logger.store(**lagrangian_info)
 
     def prep_training(self):
         self.policy.actor.train()
@@ -550,6 +640,10 @@ class Runner:
                 aver_episode_costs = torch.stack(done_episodes_costs).mean()
                 self.return_aver_cost(aver_episode_costs)
                 
+                # === Update Lagrangian multiplier based on episode cost ===
+                for agent_id in range(self.num_agents):
+                    self.trainer[agent_id].update_lagrangian(aver_episode_costs.item())
+                
                 # Collect barrier physics information for Safe module
                 barrier_info = self.collect_barrier_physics_info(obs)
                 
@@ -559,6 +653,14 @@ class Runner:
                     "Eval/EpRet": eval_rewards,
                     "Eval/EpCost": eval_costs,
                 }
+                
+                # Add Lagrangian info to log
+                if self.trainer[0].use_lagrangian:
+                    log_dict["Safe/lagrangian_multiplier"] = self.trainer[0].lagrangian_multiplier.item()
+                    if len(self.trainer[0].recent_costs) > 0:
+                        avg_cost = sum(self.trainer[0].recent_costs) / len(self.trainer[0].recent_costs)
+                        log_dict["Safe/avg_recent_cost"] = avg_cost
+                        log_dict["Safe/cost_limit"] = self.trainer[0].cost_limit
                 
                 # Add barrier physics to log dict
                 log_dict.update(barrier_info)
@@ -577,13 +679,23 @@ class Runner:
                 self.logger.log_tabular("Misc/Entropy")
                 self.logger.log_tabular("Misc/Ratio")
                 
-                # Log auxiliary physics losses
+                # Log auxiliary physics losses (enhanced safety learning)
                 self.logger.log_tabular("Loss/Aux_task_potential")
                 self.logger.log_tabular("Loss/Aux_barrier_k")
+                self.logger.log_tabular("Loss/Aux_safety")
+                self.logger.log_tabular("Loss/Aux_grad_align")
                 self.logger.log_tabular("Safe/H_task_mean")
                 self.logger.log_tabular("Safe/H_task_std")
+                self.logger.log_tabular("Safe/H_barrier_mean")
                 self.logger.log_tabular("Safe/k_mean")
                 self.logger.log_tabular("Safe/k_std")
+                self.logger.log_tabular("Safe/hazard_proximity")
+                
+                # Log Lagrangian constraint info
+                if self.trainer[0].use_lagrangian:
+                    self.logger.log_tabular("Safe/lagrangian_multiplier")
+                    self.logger.log_tabular("Safe/avg_recent_cost")
+                    self.logger.log_tabular("Safe/cost_limit")
                 
                 # Log barrier physics parameters (Safe module)
                 for physics_key in barrier_info.keys():
@@ -972,22 +1084,27 @@ class Runner:
                                     obstacle_positions, goal_positions, _ = self._extract_env_obstacles()
                                     agent_positions = self._extract_agent_positions()
                                     
-                                    # Use fast analytical computation for real-time visualization
-                                    potential_field = potential_visualizer.compute_barrier_potential_field_fast(
-                                        obstacle_positions=np.array(obstacle_positions),
-                                        agent_positions=np.array(agent_positions) if agent_positions else None,
-                                    )
-                                    
-                                    # Render combined frame
-                                    combined_frame = potential_visualizer.render_combined_frame(
+                                    # Use new all-potentials visualization (barrier, task, total)
+                                    combined_frame, barrier_img, task_img, total_img = potential_visualizer.render_all_potentials_frame(
                                         env_frame=frame.copy(),
-                                        potential_field=potential_field,
-                                        agent_positions=np.array(agent_positions) if agent_positions else None,
                                         obstacle_positions=np.array(obstacle_positions),
                                         goal_positions=np.array(goal_positions),
+                                        agent_positions=np.array(agent_positions) if agent_positions else None,
                                         step=step_count,
+                                        task_potential_scale=2.0,
                                     )
                                     potential_field_frames.append(combined_frame)
+                                    
+                                    # Store latest individual potential images for wandb logging
+                                    if step_count == 0:  # Initialize storage
+                                        self._latest_barrier_img = barrier_img
+                                        self._latest_task_img = task_img
+                                        self._latest_total_img = total_img
+                                    else:  # Update with latest
+                                        self._latest_barrier_img = barrier_img
+                                        self._latest_task_img = task_img
+                                        self._latest_total_img = total_img
+                                        
                                 except Exception as e:
                                     # Fallback: just use the original frame
                                     pass
@@ -1044,7 +1161,7 @@ class Runner:
                 #             key="eval/video"
                 #         )
                 
-                # Upload potential field video for MultiGoal tasks to Viz module
+                # Upload potential field video and images for MultiGoal tasks to Viz module
                 if len(potential_field_frames) > 0 and should_record_video and is_multi_goal_task:
                     try:
                         # Create visualization directory
@@ -1066,14 +1183,34 @@ class Runner:
                                 video_array = np.stack(potential_field_frames, axis=0)  # (T, H, W, C)
                                 video_array = np.transpose(video_array, (0, 3, 1, 2))   # (T, C, H, W)
                                 
-                                caption = f"Barrier Potential Field - Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
+                                caption = f"All Potentials - Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
                                 video_obj = wandb.Video(video_array, fps=30, format="mp4", caption=caption)
+                                
+                                # Create wandb log dict with video and images (use dict for mixed types)
+                                viz_log: dict = {"Viz/all_potentials_video": video_obj}
+                                
+                                # Add individual potential field images
+                                if hasattr(self, '_latest_barrier_img') and self._latest_barrier_img is not None:
+                                    viz_log["Viz/barrier_potential"] = wandb.Image(
+                                        self._latest_barrier_img, 
+                                        caption=f"Barrier Potential - Eval #{self.eval_count}"
+                                    )
+                                if hasattr(self, '_latest_task_img') and self._latest_task_img is not None:
+                                    viz_log["Viz/task_potential"] = wandb.Image(
+                                        self._latest_task_img,
+                                        caption=f"Task Potential - Eval #{self.eval_count}"
+                                    )
+                                if hasattr(self, '_latest_total_img') and self._latest_total_img is not None:
+                                    viz_log["Viz/total_potential"] = wandb.Image(
+                                        self._latest_total_img,
+                                        caption=f"Total Potential - Eval #{self.eval_count}"
+                                    )
                                 
                                 # Upload to wandb Viz module (separate from Eval module)
                                 if hasattr(self.logger, 'wandb_run') and self.logger.wandb_run is not None:
-                                    self.logger.wandb_run.log({"Viz/potential_field_video": video_obj}, step=total_steps)
+                                    self.logger.wandb_run.log(viz_log, step=total_steps)
                                 elif wandb.run is not None:
-                                    wandb.log({"Viz/potential_field_video": video_obj}, step=total_steps)
+                                    wandb.log(viz_log, step=total_steps)
                                     
                             except Exception as e:
                                 # Silently ignore wandb upload errors

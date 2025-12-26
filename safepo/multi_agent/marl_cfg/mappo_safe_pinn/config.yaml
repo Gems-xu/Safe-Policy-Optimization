@@ -81,29 +81,48 @@ physics_hidden: 128         # Hidden size for physics networks (H_task, H_barrie
 pinn_state_dim: 4           # Physics state dimension: (vx, vy, ax, ay)
 
 # ==================================================
-# Barrier Potential Parameters (Enhanced Safety)
+# Barrier Potential Parameters (v3.0 精准化)
 # ==================================================
 
-# Core barrier parameters
-barrier_r_safe: 0.5         # Safe distance threshold - increased for earlier avoidance
-barrier_epsilon: 0.005      # Numerical stability - reduced for steeper barrier
-barrier_clip_max: 100.0     # Maximum barrier potential (increased for stronger safety)
+# Core barrier parameters (精准化 - 极小化障碍势能边界)
+barrier_r_safe: 0.08        # Safe distance threshold - 进一步减小到0.08
+barrier_epsilon: 0.1        # Numerical stability - 增大到0.1使势能更平滑
+barrier_clip_max: 20.0      # Maximum barrier potential - 减小到20
 
-# Enhanced barrier strength parameters
-barrier_k_scale: 2.0        # Multiplier for barrier stiffness (>1 = stronger barrier)
-barrier_gradient_scale: 1.5 # Multiplier for barrier gradient influence
-barrier_decay_rate: 2.0     # Power for distance decay (higher = sharper barrier near r_safe)
-min_barrier_k: 0.5          # Minimum barrier stiffness to ensure base safety
+# Enhanced barrier strength parameters (精准化 - 极快衰减)
+barrier_k_scale: 0.3        # Multiplier for barrier stiffness - 减小到0.3
+barrier_gradient_scale: 0.3 # Multiplier for barrier gradient influence
+barrier_decay_rate: 5.0     # Power for distance decay - 增大到5.0（距离^5极快衰减）
+min_barrier_k: 0.05         # Minimum barrier stiffness - 减小到0.05
 
-# Cost-aware safety parameters
-cost_aware_weight: 0.3      # Weight for cost-aware policy shaping in danger zones
-danger_zone_threshold: 0.8  # Lidar reading threshold for danger zone detection (0-1)
+# Cost-aware safety parameters (精准化)
+cost_aware_weight: 0.02     # Weight for cost-aware policy shaping
+danger_zone_threshold: 0.98 # Lidar reading threshold - 只有极近时才触发
 
 # Lidar configuration (for obstacle detection)
 num_lidar_bins: 16          # Number of lidar bins per obstacle type
 
-# Physics regularization (optional)
+# ==================================================
+# Lagrangian Constraint Parameters (NEW - 约束cost)
+# ==================================================
+use_lagrangian: True        # Enable Lagrangian constraint for cost
+cost_limit: 25.0            # Target cost limit per episode
+lagrangian_init: 0.001      # Initial Lagrangian multiplier
+lagrangian_lr: 0.035        # Learning rate for Lagrangian multiplier
+lagrangian_max: 10.0        # Maximum Lagrangian multiplier
+
+# ==================================================
+# Safety Action Constraint (NEW - 动作层安全约束)
+# ==================================================
+use_safety_layer: True      # Enable safety layer for action correction
+safety_gamma: 0.1           # Safety layer correction strength
+action_clip_margin: 0.1     # Margin for safe action clipping
+
+# Physics regularization and auxiliary loss weights (增强安全学习)
 physics_loss_weight: 0.0    # Weight for physics regularization (0 = pure RL)
+aux_task_potential_weight: 0.05     # Task potential auxiliary loss weight (增大)
+aux_barrier_potential_weight: 0.1   # Barrier potential auxiliary loss weight (增大)
+aux_safety_weight: 0.2              # Safety auxiliary loss weight (增大)
 
 # Video recording (Fixed-interval rendering)
 record_video: True          # Enable video recording
