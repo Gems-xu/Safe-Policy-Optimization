@@ -222,12 +222,20 @@ class MAPPOSafePINNTrainer():
 
         self.value_normalizer = PopArt(1, device=self.config["device"])
         
-        # Auxiliary loss weights for physics-informed training (v3.0 增强安全学习)
-        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.05)
-        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.1)
-        self.aux_safety_weight = config.get("aux_safety_weight", 0.2)
+        # v7.0: Minimal auxiliary loss - let PPO do the main learning
+        # Physics features are provided to the network, but we don't force behavior
+        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.01)
+        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.02)
+        self.aux_safety_weight = config.get("aux_safety_weight", 0.01)
         
-        # === Lagrangian Constraint for Cost (NEW) ===
+        # v7.0: DISABLE reward shaping - it was causing train/eval mismatch
+        # The huge gap (380 vs 8) was because shaping dominated training rewards
+        self.use_reward_shaping = config.get("use_reward_shaping", False)  # DISABLED!
+        self.reward_shaping_weight = config.get("reward_shaping_weight", 0.0)
+        self.barrier_reward_weight = config.get("barrier_reward_weight", 0.0)
+        self.task_reward_weight = config.get("task_reward_weight", 0.0)
+        
+        # === Lagrangian Constraint for Cost ===
         self.use_lagrangian = config.get("use_lagrangian", True)
         self.cost_limit = config.get("cost_limit", 25.0)  # Target cost limit
         self.lagrangian_multiplier = nn.Parameter(
@@ -282,18 +290,14 @@ class MAPPOSafePINNTrainer():
         H_task, _ = actor._compute_task_potential(obs_batch)
         H_barrier, _ = actor._compute_barrier_potential(obs_batch)
         
-        # Extract goal and hazard lidar readings
-        # Goal lidar: obs[12:28] (goal_red) - higher means closer to goal
-        goal_lidar = obs_batch[:, 12:28]
-        goal_proximity = goal_lidar.max(dim=-1, keepdim=True)[0]  # [batch, 1]
+        # Extract lidar readings using actor's methods for consistency
+        # Goal lidar: obs[12:44] - higher means closer to goal
+        goal_lidar, goal_proximity = actor._extract_goal_lidar_info(obs_batch)
         
-        # Hazard lidar: obs[44:60] - higher means closer to hazard
-        hazard_lidar_end = min(60, obs_batch.shape[-1])
-        if hazard_lidar_end > 44:
-            hazard_lidar = obs_batch[:, 44:hazard_lidar_end]
-            hazard_proximity = hazard_lidar.max(dim=-1, keepdim=True)[0]  # [batch, 1]
-        else:
-            hazard_proximity = torch.zeros(batch_size, 1, device=device)
+        # Hazard + Agent lidar: obs[44:60] + obs[76:92] (combined in _extract_lidar_info)
+        # Higher means closer to hazard/other agent
+        # v4.0: Returns proximity ∈ [0, 1], not approx_dist
+        hazard_lidar, hazard_proximity = actor._extract_lidar_info(obs_batch)
         
         # === Auxiliary Loss 1: Task Potential ===
         # H_task should be LOWER when close to goal (goal_proximity high)
@@ -324,7 +328,8 @@ class MAPPOSafePINNTrainer():
         target_grad_mag = hazard_proximity * 5.0
         grad_alignment_loss = F.mse_loss(grad_magnitude.clamp(max=5.0), target_grad_mag.clamp(max=5.0))
         
-        # Combined auxiliary loss with enhanced safety
+        # v6.0: Simplified auxiliary loss - focus on potential learning, not action penalization
+        # The action danger penalty is removed; reward shaping handles safety guidance
         aux_loss = (self.aux_task_potential_weight * task_potential_loss + 
                     self.aux_barrier_potential_weight * (barrier_k_loss + grad_alignment_loss) +
                     self.aux_safety_weight * safety_loss)
@@ -343,6 +348,67 @@ class MAPPOSafePINNTrainer():
         }
         
         return aux_loss, aux_info
+
+    def compute_potential_reward_shaping(self, obs_batch, next_obs_batch):
+        """
+        Compute potential-based reward shaping for guiding safe policy learning.
+        
+        v6.0: This is the key mechanism for learning safety through rewards.
+        
+        Using potential-based reward shaping (PBRS) which preserves optimal policy:
+        F(s, s') = γ * Φ(s') - Φ(s)
+        
+        Where Φ is the potential function based on H_task and H_barrier.
+        
+        The reward shaping encourages:
+        1. Moving toward goal (decreasing H_task)
+        2. Staying away from obstacles (decreasing H_barrier or maintaining low H_barrier)
+        
+        Args:
+            obs_batch: [batch, obs_dim] current observations
+            next_obs_batch: [batch, obs_dim] next observations
+            
+        Returns:
+            shaping_reward: [batch, 1] additional reward for safe behavior
+        """
+        actor = self.policy.actor
+        gamma = self.config.get("gamma", 0.99)
+        
+        with torch.no_grad():
+            # Compute potentials at current and next states
+            H_task_curr, _ = actor._compute_task_potential(obs_batch)
+            H_task_next, _ = actor._compute_task_potential(next_obs_batch)
+            
+            H_barrier_curr, _ = actor._compute_barrier_potential(obs_batch)
+            H_barrier_next, _ = actor._compute_barrier_potential(next_obs_batch)
+            
+            # Task potential shaping: reward for decreasing H_task (moving toward goal)
+            # Φ_task = -H_task (so decreasing H_task increases potential)
+            task_shaping = gamma * (-H_task_next) - (-H_task_curr)  # = H_task_curr - γ * H_task_next
+            
+            # Barrier potential shaping: reward for staying safe (low H_barrier)
+            # Φ_barrier = -H_barrier (so low H_barrier is good)
+            # We want to encourage staying in low H_barrier regions
+            barrier_shaping = gamma * (-H_barrier_next) - (-H_barrier_curr)  # = H_barrier_curr - γ * H_barrier_next
+            
+            # Additional: penalize entering danger zone
+            _, proximity_curr = actor._extract_lidar_info(obs_batch)
+            _, proximity_next = actor._extract_lidar_info(next_obs_batch)
+            
+            # Penalty for getting closer to obstacles
+            proximity_penalty = torch.clamp(proximity_next - proximity_curr, min=0.0) * 2.0
+            
+            # Combine shaping rewards
+            shaping_reward = (
+                self.task_reward_weight * task_shaping +
+                self.barrier_reward_weight * barrier_shaping -
+                self.reward_shaping_weight * proximity_penalty
+            )
+            
+            # Clip to prevent too large shaping rewards
+            shaping_reward = torch.clamp(shaping_reward, min=-1.0, max=1.0)
+        
+        return shaping_reward
 
     def ppo_update(self, sample):
         share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
@@ -477,7 +543,12 @@ class MAPPOSafePINNTrainer():
             lagrangian_info["Safe/lagrangian_multiplier"] = aux_info['lagrangian_multiplier']
             lagrangian_info["Safe/cost_violation"] = aux_info['cost_violation']
             lagrangian_info["Loss/lagrangian_penalty"] = aux_info['lagrangian_penalty']
-        
+        else:
+            # Ensure these keys always exist to prevent logging errors
+            if self.use_lagrangian:
+                lagrangian_info["Safe/lagrangian_multiplier"] = 0.0  # Default value
+                lagrangian_info["Safe/cost_violation"] = 0.0        # Default value
+                lagrangian_info["Loss/lagrangian_penalty"] = 0.0    # Default value
         logger.store(**lagrangian_info)
 
     def prep_training(self):
@@ -591,6 +662,11 @@ class Runner:
         train_episode_costs = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
         eval_rewards=0.0
         eval_costs=0.0
+        
+        # v7.0: Reward shaping is DISABLED by default
+        # It caused train/eval mismatch (380 vs 8 reward gap)
+        use_reward_shaping = self.config.get("use_reward_shaping", False)
+        
         pbar = tqdm(range(episodes), desc="Safe-pH-MARL Training", ncols=100)
         for episode in pbar:
 
@@ -598,9 +674,12 @@ class Runner:
             done_episodes_costs = []
 
             for step in range(self.config["episode_length"]):
-                # Sample actions
+                # Sample actions (no need to save prev_obs if shaping disabled)
                 values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
                 obs, share_obs, rewards, costs, dones, infos, _ = self.envs.step(actions)
+
+                # v7.0: Reward shaping disabled - use original rewards only
+                # This ensures train and eval rewards are comparable
 
                 dones_env = torch.all(dones, dim=1)
 
@@ -696,6 +775,8 @@ class Runner:
                     self.logger.log_tabular("Safe/lagrangian_multiplier")
                     self.logger.log_tabular("Safe/avg_recent_cost")
                     self.logger.log_tabular("Safe/cost_limit")
+                    self.logger.log_tabular("Loss/lagrangian_penalty")
+                    self.logger.log_tabular("Safe/cost_violation")
                 
                 # Log barrier physics parameters (Safe module)
                 for physics_key in barrier_info.keys():

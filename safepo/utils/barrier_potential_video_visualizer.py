@@ -197,17 +197,22 @@ class BarrierPotentialVideoVisualizer:
         """
         potential_field = np.zeros((self.grid_resolution, self.grid_resolution))
         
-        # Get barrier parameters from actor if available (v3.0 精准化)
+        # Get barrier parameters from actor if available (v4.0 - proximity-based)
         if self.actor is not None:
-            r_safe = getattr(self.actor, 'r_safe', 0.08)
-            barrier_epsilon = getattr(self.actor, 'barrier_epsilon', 0.1)
-            barrier_k = getattr(self.actor, 'barrier_k_scale', 0.3)
-            barrier_decay_rate = getattr(self.actor, 'barrier_decay_rate', 5.0)
+            r_safe = getattr(self.actor, 'r_safe', 0.3)
+            barrier_epsilon = getattr(self.actor, 'barrier_epsilon', 0.01)
+            barrier_k = getattr(self.actor, 'barrier_k_scale', 2.0)
+            barrier_decay_rate = getattr(self.actor, 'barrier_decay_rate', 2.0)
+            barrier_clip_max = getattr(self.actor, 'barrier_clip_max', 10.0)
         else:
-            r_safe = 0.08
-            barrier_epsilon = 0.1
-            barrier_k = 0.3
-            barrier_decay_rate = 5.0
+            r_safe = 0.3
+            barrier_epsilon = 0.01
+            barrier_k = 2.0
+            barrier_decay_rate = 2.0
+            barrier_clip_max = 10.0
+        
+        # Define lidar range (matches safety_gymnasium pseudo lidar)
+        max_lidar_dist = 3.0  # Maximum lidar detection distance
         
         # Combine obstacles and agents as repellers
         all_repellers = []
@@ -226,16 +231,25 @@ class BarrierPotentialVideoVisualizer:
             for j in range(self.grid_resolution):
                 pos = np.array([self.X[i, j], self.Y[i, j]])
                 
-                # Distance to all repellers
-                dists = np.linalg.norm(all_repellers - pos, axis=1)
+                # Distance to all repellers (minus hazard radius)
+                dists = np.linalg.norm(all_repellers - pos, axis=1) - self.hazard_radius
+                min_dist = np.min(np.maximum(dists, 0.01))
                 
-                # Barrier potential: k / ((d - r_safe - hazard_radius)^decay_rate + ε)
-                # Use decay_rate for faster falloff
-                margin = np.maximum(dists - self.hazard_radius - r_safe, 0.01)
-                H_barrier = barrier_k / (np.power(margin, barrier_decay_rate) + barrier_epsilon)
+                # v4.0: Convert distance to proximity (like lidar)
+                # proximity = 1 - (dist / max_range), clamped to [0, 1]
+                # Higher proximity = closer = more dangerous
+                proximity = np.clip(1.0 - min_dist / max_lidar_dist, 0.0, 1.0)
                 
-                # Sum over all repellers
-                potential_field[i, j] = np.sum(H_barrier)
+                # v4.0: Proximity-based barrier formula (matches actor)
+                # H_barrier = k * proximity^decay_rate / (safety_margin + ε)
+                safety_margin = np.maximum(1.0 - proximity, 0.01)
+                numerator = np.power(proximity + 0.01, barrier_decay_rate)
+                H_barrier = barrier_k * numerator / (safety_margin + barrier_epsilon)
+                
+                # Clip like actor does
+                H_barrier = np.minimum(H_barrier, barrier_clip_max)
+                
+                potential_field[i, j] = H_barrier
         
         return potential_field
     
@@ -775,7 +789,8 @@ class BarrierPotentialVideoVisualizer:
             
             # Write video with proper error handling
             try:
-                writer = imageio.get_writer(output_path, fps=fps, codec='libx264')
+                # Use macro_block_size=1 to avoid resizing warnings
+                writer = imageio.get_writer(output_path, fps=fps, codec='libx264', macro_block_size=1)
                 for frame in frames:
                     writer.append_data(frame)
                 writer.close()
