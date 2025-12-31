@@ -160,8 +160,11 @@ class MAPPOSafePINNPolicy:
         # Use Barrier Port-Hamiltonian PINN Actor
         self.actor = BarrierPHSPINNActor(config, self.obs_space, self.act_space, self.config["device"])
         
-        # Use standard Critic (like MAPPO)
+        # Use standard Critic for reward (like MAPPO)
         self.critic = Critic(config, self.share_obs_space, self.config["device"])
+        
+        # v8.0: Add Cost Critic for safety constraint (like MAPPO-Lagrangian)
+        self.cost_critic = Critic(config, self.share_obs_space, self.config["device"])
 
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), 
@@ -175,9 +178,15 @@ class MAPPOSafePINNPolicy:
             eps=self.config["opti_eps"], 
             weight_decay=self.config["weight_decay"]
         )
+        self.cost_optimizer = torch.optim.Adam(
+            self.cost_critic.parameters(), 
+            lr=self.config["critic_lr"], 
+            eps=self.config["opti_eps"], 
+            weight_decay=self.config["weight_decay"]
+        )
 
     def get_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, masks, available_actions=None,
-                    deterministic=False):
+                    deterministic=False, rnn_states_cost=None):
         actions, action_log_probs, rnn_states_actor = self.actor(obs,
                                                                  rnn_states_actor,
                                                                  masks,
@@ -185,14 +194,23 @@ class MAPPOSafePINNPolicy:
                                                                  deterministic)
 
         values, rnn_states_critic = self.critic(cent_obs, rnn_states_critic, masks)
-        return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic
+        
+        if rnn_states_cost is None:
+            return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic
+        else:
+            cost_preds, rnn_states_cost = self.cost_critic(cent_obs, rnn_states_cost, masks)
+            return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic, cost_preds, rnn_states_cost
 
     def get_values(self, cent_obs, rnn_states_critic, masks):
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         return values
+    
+    def get_cost_values(self, cent_obs, rnn_states_cost, masks):
+        cost_preds, _ = self.cost_critic(cent_obs, rnn_states_cost, masks)
+        return cost_preds
 
     def evaluate_actions(self, cent_obs, obs, rnn_states_actor, rnn_states_critic, action, masks,
-                         available_actions=None, active_masks=None):
+                         available_actions=None, active_masks=None, rnn_states_cost=None):
         action_log_probs, dist_entropy = self.actor.evaluate_actions(obs,
                                                                      rnn_states_actor,
                                                                      action,
@@ -201,7 +219,12 @@ class MAPPOSafePINNPolicy:
                                                                      active_masks)
 
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
-        return values, action_log_probs, dist_entropy
+        
+        if rnn_states_cost is None:
+            return values, action_log_probs, dist_entropy
+        else:
+            cost_values, _ = self.cost_critic(cent_obs, rnn_states_cost, masks)
+            return values, action_log_probs, dist_entropy, cost_values
 
     def act(self, obs, rnn_states_actor, masks, available_actions=None, deterministic=False):
         actions, _, rnn_states_actor = self.actor(obs, rnn_states_actor, masks, available_actions, deterministic)
@@ -209,7 +232,7 @@ class MAPPOSafePINNPolicy:
 
 
 # =============================================================================
-# MAPPO-Safe-PINN Trainer (same as MAPPO, but with physics logging)
+# MAPPO-Safe-PINN Trainer (v8.0: with Cost Critic like MAPPO-Lagrangian)
 # =============================================================================
 
 class MAPPOSafePINNTrainer():
@@ -221,35 +244,17 @@ class MAPPOSafePINNTrainer():
         self.policy = policy
 
         self.value_normalizer = PopArt(1, device=self.config["device"])
+        # v8.0: Cost value normalizer (like MAPPO-Lagrangian)
+        self.cost_value_normalizer = PopArt(1, device=self.config["device"])
         
-        # v7.0: Minimal auxiliary loss - let PPO do the main learning
-        # Physics features are provided to the network, but we don't force behavior
+        # v8.0: Minimal auxiliary loss - physics features guide the network
         self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.01)
         self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.02)
         self.aux_safety_weight = config.get("aux_safety_weight", 0.01)
         
-        # v7.0: DISABLE reward shaping - it was causing train/eval mismatch
-        # The huge gap (380 vs 8) was because shaping dominated training rewards
-        self.use_reward_shaping = config.get("use_reward_shaping", False)  # DISABLED!
-        self.reward_shaping_weight = config.get("reward_shaping_weight", 0.0)
-        self.barrier_reward_weight = config.get("barrier_reward_weight", 0.0)
-        self.task_reward_weight = config.get("task_reward_weight", 0.0)
-        
-        # === Lagrangian Constraint for Cost ===
-        self.use_lagrangian = config.get("use_lagrangian", True)
-        self.cost_limit = config.get("cost_limit", 25.0)  # Target cost limit
-        self.lagrangian_multiplier = nn.Parameter(
-            torch.tensor(config.get("lagrangian_init", 0.001), 
-                        dtype=torch.float32, device=config["device"]),
-            requires_grad=True
-        )
-        self.lagrangian_lr = config.get("lagrangian_lr", 0.035)
-        self.lagrangian_max = config.get("lagrangian_max", 10.0)
-        self.lagrangian_optimizer = torch.optim.Adam([self.lagrangian_multiplier], lr=self.lagrangian_lr)
-        
-        # Cost buffer for Lagrangian update
-        self.recent_costs = []
-        self.cost_window = 10  # Average over last N episodes
+        # v8.0: Use MAPPO-Lagrangian style constraint
+        # lamda_lagr: Lagrangian multiplier for cost constraint
+        self.lamda_lagr = config.get("lamda_lagr", 0.5)  # Initial Lagrangian multiplier
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.config["clip_param"],
@@ -349,171 +354,118 @@ class MAPPOSafePINNTrainer():
         
         return aux_loss, aux_info
 
-    def compute_potential_reward_shaping(self, obs_batch, next_obs_batch):
-        """
-        Compute potential-based reward shaping for guiding safe policy learning.
-        
-        v6.0: This is the key mechanism for learning safety through rewards.
-        
-        Using potential-based reward shaping (PBRS) which preserves optimal policy:
-        F(s, s') = γ * Φ(s') - Φ(s)
-        
-        Where Φ is the potential function based on H_task and H_barrier.
-        
-        The reward shaping encourages:
-        1. Moving toward goal (decreasing H_task)
-        2. Staying away from obstacles (decreasing H_barrier or maintaining low H_barrier)
-        
-        Args:
-            obs_batch: [batch, obs_dim] current observations
-            next_obs_batch: [batch, obs_dim] next observations
-            
-        Returns:
-            shaping_reward: [batch, 1] additional reward for safe behavior
-        """
-        actor = self.policy.actor
-        gamma = self.config.get("gamma", 0.99)
-        
-        with torch.no_grad():
-            # Compute potentials at current and next states
-            H_task_curr, _ = actor._compute_task_potential(obs_batch)
-            H_task_next, _ = actor._compute_task_potential(next_obs_batch)
-            
-            H_barrier_curr, _ = actor._compute_barrier_potential(obs_batch)
-            H_barrier_next, _ = actor._compute_barrier_potential(next_obs_batch)
-            
-            # Task potential shaping: reward for decreasing H_task (moving toward goal)
-            # Φ_task = -H_task (so decreasing H_task increases potential)
-            task_shaping = gamma * (-H_task_next) - (-H_task_curr)  # = H_task_curr - γ * H_task_next
-            
-            # Barrier potential shaping: reward for staying safe (low H_barrier)
-            # Φ_barrier = -H_barrier (so low H_barrier is good)
-            # We want to encourage staying in low H_barrier regions
-            barrier_shaping = gamma * (-H_barrier_next) - (-H_barrier_curr)  # = H_barrier_curr - γ * H_barrier_next
-            
-            # Additional: penalize entering danger zone
-            _, proximity_curr = actor._extract_lidar_info(obs_batch)
-            _, proximity_next = actor._extract_lidar_info(next_obs_batch)
-            
-            # Penalty for getting closer to obstacles
-            proximity_penalty = torch.clamp(proximity_next - proximity_curr, min=0.0) * 2.0
-            
-            # Combine shaping rewards
-            shaping_reward = (
-                self.task_reward_weight * task_shaping +
-                self.barrier_reward_weight * barrier_shaping -
-                self.reward_shaping_weight * proximity_penalty
-            )
-            
-            # Clip to prevent too large shaping rewards
-            shaping_reward = torch.clamp(shaping_reward, min=-1.0, max=1.0)
-        
-        return shaping_reward
-
     def ppo_update(self, sample):
+        """
+        v8.0: PPO update with Cost Critic (like MAPPO-Lagrangian).
+        
+        Key difference from v7.0:
+        - Uses cost advantage to compute hybrid advantage: adv_hybrid = adv - λ * cost_adv
+        - Updates Lagrangian multiplier based on cost violation
+        - Trains cost critic alongside reward critic
+        """
         share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
         value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, \
-        adv_targ, available_actions_batch, _ = sample
-        old_action_log_probs_batch, adv_targ, value_preds_batch, return_batch, active_masks_batch = [
+        adv_targ, available_actions_batch, factor_batch, cost_preds_batch, cost_returns_batch, \
+        rnn_states_cost_batch, cost_adv_targ, aver_episode_costs = sample
+
+        old_action_log_probs_batch, adv_targ, value_preds_batch, return_batch, active_masks_batch, \
+        factor_batch, cost_returns_batch, cost_preds_batch, cost_adv_targ = [
             check(x).to(**self.tpdv) for x in [
-                old_action_log_probs_batch, adv_targ, value_preds_batch, return_batch, active_masks_batch
+                old_action_log_probs_batch, adv_targ, value_preds_batch, return_batch, active_masks_batch,
+                factor_batch, cost_returns_batch, cost_preds_batch, cost_adv_targ
             ]
         ]
 
-        values, action_log_probs, dist_entropy = self.policy.evaluate_actions(share_obs_batch,
-                                                                              obs_batch,
-                                                                              rnn_states_batch,
-                                                                              rnn_states_critic_batch,
-                                                                              actions_batch,
-                                                                              masks_batch,
-                                                                              available_actions_batch,
-                                                                              active_masks_batch)
-        imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
+        # Evaluate actions with cost values
+        values, action_log_probs, dist_entropy, cost_values = self.policy.evaluate_actions(
+            share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch,
+            actions_batch, masks_batch, available_actions_batch, active_masks_batch,
+            rnn_states_cost_batch
+        )
+        
+        # === v8.0: Hybrid advantage = reward_adv - λ * cost_adv ===
+        # This is the key to MAPPO-Lagrangian's success
+        adv_targ_hybrid = adv_targ - self.lamda_lagr * cost_adv_targ
 
-        surr1 = imp_weights * adv_targ
-        surr2 = torch.clamp(imp_weights, 1.0 - self.config["clip_param"], 1.0 + self.config["clip_param"]) * adv_targ
+        imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
+        imp_weights = torch.prod(imp_weights, dim=-1, keepdim=True)
+
+        surr1 = imp_weights * adv_targ_hybrid
+        surr2 = torch.clamp(imp_weights, 1.0 - self.config["clip_param"], 1.0 + self.config["clip_param"]) * adv_targ_hybrid
 
         if self.config["use_policy_active_masks"]:
-            policy_action_loss = (-torch.sum(torch.min(surr1, surr2),
+            policy_action_loss = (-torch.sum(factor_batch * torch.min(surr1, surr2),
                                              dim=-1,
                                              keepdim=True) * active_masks_batch).sum() / active_masks_batch.sum()
         else:
-            policy_action_loss = -torch.sum(torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
+            policy_action_loss = -torch.sum(factor_batch * torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
 
         policy_loss = policy_action_loss
         
-        # Compute auxiliary physics loss for H_task and barrier_k networks
+        # Compute auxiliary physics loss
         aux_loss, aux_info = self.compute_auxiliary_physics_loss(check(obs_batch).to(**self.tpdv))
-        
-        # === Lagrangian Penalty for Cost Constraint (NEW) ===
-        lagrangian_penalty = torch.tensor(0.0, device=self.config["device"])
-        if self.use_lagrangian and len(self.recent_costs) > 0:
-            # Use recent average cost to compute penalty
-            avg_cost = sum(self.recent_costs) / len(self.recent_costs)
-            cost_violation = max(0, avg_cost - self.cost_limit)
-            
-            # Lagrangian penalty: λ * (cost - limit)
-            # This adds cost awareness to the policy loss
-            lagrangian_penalty = self.lagrangian_multiplier.clamp(min=0.0) * cost_violation
-            aux_info['lagrangian_multiplier'] = self.lagrangian_multiplier.item()
-            aux_info['cost_violation'] = cost_violation
-            aux_info['lagrangian_penalty'] = lagrangian_penalty.item()
-        
-        # Total actor loss = policy loss + auxiliary physics loss + lagrangian penalty
-        total_actor_loss = policy_loss - dist_entropy * self.config["entropy_coef"] + aux_loss + lagrangian_penalty
 
+        # Actor update
         self.policy.actor_optimizer.zero_grad()
-        total_actor_loss.backward()
+        (policy_loss - dist_entropy * self.config["entropy_coef"] + aux_loss).backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.config["max_grad_norm"])
         self.policy.actor_optimizer.step()
 
+        # === Update Lagrangian multiplier (like MAPPO-Lagrangian) ===
+        delta_lamda_lagr = -((aver_episode_costs.mean() - self.config["cost_limit"]) * (1 - self.config["gamma"]) + 
+                             (imp_weights * cost_adv_targ)).mean().detach()
+        R_Relu = torch.nn.ReLU()
+        new_lamda_lagr = R_Relu(self.lamda_lagr - (delta_lamda_lagr * self.config.get("lagrangian_coef_rate", 0.05)))
+        self.lamda_lagr = new_lamda_lagr.item() if isinstance(new_lamda_lagr, torch.Tensor) else new_lamda_lagr
+        
+        aux_info['lamda_lagr'] = self.lamda_lagr
+
+        # Reward critic update
         value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
         self.policy.critic_optimizer.zero_grad()
         (value_loss * self.config["value_loss_coef"]).backward()
         critic_grad_norm = nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.config["max_grad_norm"])
-
         self.policy.critic_optimizer.step()
+
+        # Cost critic update
+        cost_loss = self.cal_value_loss(cost_values, cost_preds_batch, cost_returns_batch, active_masks_batch)
+        self.policy.cost_optimizer.zero_grad()
+        (cost_loss * self.config["value_loss_coef"]).backward()
+        cost_grad_norm = nn.utils.clip_grad_norm_(self.policy.cost_critic.parameters(), self.config["max_grad_norm"])
+        self.policy.cost_optimizer.step()
+        
+        aux_info['cost_loss'] = cost_loss.item()
 
         return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info
 
-    def update_lagrangian(self, episode_cost):
-        """
-        Update Lagrangian multiplier based on episode cost.
-        
-        Uses dual gradient ascent:
-        λ = λ + lr * (cost - cost_limit)
-        
-        Args:
-            episode_cost: Average cost of the episode
-        """
-        if not self.use_lagrangian:
-            return
-        
-        # Add to recent costs buffer
-        self.recent_costs.append(episode_cost)
-        if len(self.recent_costs) > self.cost_window:
-            self.recent_costs.pop(0)
-        
-        # Compute cost violation
-        avg_cost = sum(self.recent_costs) / len(self.recent_costs)
-        cost_violation = avg_cost - self.cost_limit
-        
-        # Update Lagrangian multiplier using gradient ascent
-        # λ += lr * (cost - limit)
-        with torch.no_grad():
-            self.lagrangian_multiplier.add_(self.lagrangian_lr * cost_violation)
-            # Clamp to [0, max]
-            self.lagrangian_multiplier.clamp_(min=0.0, max=self.lagrangian_max)
-
     def train(self, buffer, logger):
+        """
+        v8.0: Train with cost advantage like MAPPO-Lagrangian.
+        
+        Key changes:
+        - Compute cost advantage from cost returns and cost predictions
+        - Pass cost_adv to feed_forward_generator
+        - Use cost advantage in ppo_update for hybrid advantage
+        """
+        # Compute reward advantages
         advantages = buffer.returns[:-1] - self.value_normalizer.denormalize(buffer.value_preds[:-1])
         advantages_copy = advantages.clone()
-        mean_advantages = torch.mean(advantages_copy)
-        std_advantages = torch.std(advantages_copy)
-        advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
+        advantages_copy[buffer.active_masks[:-1] == 0.0] = float('nan')
+        mean_advantages = torch.nanmean(advantages_copy)
+        std_advantages = torch.std(advantages_copy[~torch.isnan(advantages_copy)])
+        advantages = (advantages - mean_advantages) / (std_advantages + 1e-8)
+
+        # === v8.0: Compute cost advantages (like MAPPO-Lagrangian) ===
+        cost_adv = buffer.cost_returns[:-1] - self.cost_value_normalizer.denormalize(buffer.cost_preds[:-1])
+        cost_adv_copy = cost_adv.clone()
+        cost_adv_copy[buffer.active_masks[:-1] == 0.0] = float('nan')
+        mean_cost_adv = torch.nanmean(cost_adv_copy)
+        std_cost_adv = torch.std(cost_adv_copy[~torch.isnan(cost_adv_copy)])
+        cost_adv = (cost_adv - mean_cost_adv) / (std_cost_adv + 1e-8)
 
         for _ in range(self.config["learning_iters"]):
-            data_generator = buffer.feed_forward_generator(advantages, self.config["num_mini_batch"])
+            # Pass cost_adv to generator (requires buffer.algo == "mappolag" format)
+            data_generator = buffer.feed_forward_generator(advantages, self.config["num_mini_batch"], cost_adv=cost_adv)
 
             for sample in data_generator:
                 value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info \
@@ -523,6 +475,7 @@ class MAPPOSafePINNTrainer():
         lagrangian_info = {
             "Loss/Loss_reward_critic": value_loss.item(),
             "Loss/Loss_actor": policy_loss.item(),
+            "Loss/Loss_cost_critic": aux_info.get('cost_loss', 0.0),
             "Loss/Aux_task_potential": aux_info['aux_task_loss'],
             "Loss/Aux_barrier_k": aux_info['aux_barrier_k_loss'],
             "Loss/Aux_safety": aux_info['aux_safety_loss'],
@@ -533,31 +486,23 @@ class MAPPOSafePINNTrainer():
             "Safe/k_mean": aux_info['k_mean'],
             "Safe/k_std": aux_info['k_std'],
             "Safe/hazard_proximity": aux_info['hazard_proximity_mean'],
+            "Safe/lamda_lagr": aux_info.get('lamda_lagr', 0.0),
             "Misc/Reward_critic_norm": critic_grad_norm.item(),
             "Misc/Entropy": dist_entropy.item(),
             "Misc/Ratio": imp_weights.detach().mean().item(),
         }
         
-        # Add Lagrangian metrics if available
-        if 'lagrangian_multiplier' in aux_info:
-            lagrangian_info["Safe/lagrangian_multiplier"] = aux_info['lagrangian_multiplier']
-            lagrangian_info["Safe/cost_violation"] = aux_info['cost_violation']
-            lagrangian_info["Loss/lagrangian_penalty"] = aux_info['lagrangian_penalty']
-        else:
-            # Ensure these keys always exist to prevent logging errors
-            if self.use_lagrangian:
-                lagrangian_info["Safe/lagrangian_multiplier"] = 0.0  # Default value
-                lagrangian_info["Safe/cost_violation"] = 0.0        # Default value
-                lagrangian_info["Loss/lagrangian_penalty"] = 0.0    # Default value
         logger.store(**lagrangian_info)
 
     def prep_training(self):
         self.policy.actor.train()
         self.policy.critic.train()
+        self.policy.cost_critic.train()
 
     def prep_rollout(self):
         self.policy.actor.eval()
         self.policy.critic.eval()
+        self.policy.cost_critic.eval()
 
 
 # =============================================================================
@@ -667,6 +612,9 @@ class Runner:
         # It caused train/eval mismatch (380 vs 8 reward gap)
         use_reward_shaping = self.config.get("use_reward_shaping", False)
         
+        # v8.0: Track done_episodes_costs_aver for Lagrangian update
+        done_episodes_costs_aver = 0.0
+        
         pbar = tqdm(range(episodes), desc="Safe-pH-MARL Training", ncols=100)
         for episode in pbar:
 
@@ -674,8 +622,8 @@ class Runner:
             done_episodes_costs = []
 
             for step in range(self.config["episode_length"]):
-                # Sample actions (no need to save prev_obs if shaping disabled)
-                values, actions, action_log_probs, rnn_states, rnn_states_critic = self.collect(step)
+                # v8.0: Collect includes cost_preds and rnn_states_cost
+                values, actions, action_log_probs, rnn_states, rnn_states_critic, cost_preds, rnn_states_cost = self.collect(step)
                 obs, share_obs, rewards, costs, dones, infos, _ = self.envs.step(actions)
 
                 # v7.0: Reward shaping disabled - use original rewards only
@@ -696,9 +644,10 @@ class Runner:
                         done_episodes_costs.append(train_episode_costs[:, t].clone())
                         train_episode_costs[:, t] = 0
 
-                data = obs, share_obs, rewards, dones, infos, \
+                # v8.0: Include costs, cost_preds, and rnn_states_cost in data
+                data = obs, share_obs, rewards, costs, dones, infos, \
                        values, actions, action_log_probs, \
-                       rnn_states, rnn_states_critic
+                       rnn_states, rnn_states_critic, cost_preds, rnn_states_cost
 
                 self.insert(data)
             self.compute()
@@ -719,9 +668,7 @@ class Runner:
                 aver_episode_costs = torch.stack(done_episodes_costs).mean()
                 self.return_aver_cost(aver_episode_costs)
                 
-                # === Update Lagrangian multiplier based on episode cost ===
-                for agent_id in range(self.num_agents):
-                    self.trainer[agent_id].update_lagrangian(aver_episode_costs.item())
+                # v8.0: No longer need update_lagrangian - done in ppo_update via cost advantage
                 
                 # Collect barrier physics information for Safe module
                 barrier_info = self.collect_barrier_physics_info(obs)
@@ -733,13 +680,8 @@ class Runner:
                     "Eval/EpCost": eval_costs,
                 }
                 
-                # Add Lagrangian info to log
-                if self.trainer[0].use_lagrangian:
-                    log_dict["Safe/lagrangian_multiplier"] = self.trainer[0].lagrangian_multiplier.item()
-                    if len(self.trainer[0].recent_costs) > 0:
-                        avg_cost = sum(self.trainer[0].recent_costs) / len(self.trainer[0].recent_costs)
-                        log_dict["Safe/avg_recent_cost"] = avg_cost
-                        log_dict["Safe/cost_limit"] = self.trainer[0].cost_limit
+                # v8.0: Log lamda_lagr from trainer
+                log_dict["Safe/lamda_lagr"] = self.trainer[0].lamda_lagr
                 
                 # Add barrier physics to log dict
                 log_dict.update(barrier_info)
@@ -753,6 +695,7 @@ class Runner:
                 self.logger.log_tabular("Train/Epoch", episode)
                 self.logger.log_tabular("Train/TotalSteps", total_num_steps)
                 self.logger.log_tabular("Loss/Loss_reward_critic")
+                self.logger.log_tabular("Loss/Loss_cost_critic")
                 self.logger.log_tabular("Loss/Loss_actor")
                 self.logger.log_tabular("Misc/Reward_critic_norm")
                 self.logger.log_tabular("Misc/Entropy")
@@ -769,14 +712,7 @@ class Runner:
                 self.logger.log_tabular("Safe/k_mean")
                 self.logger.log_tabular("Safe/k_std")
                 self.logger.log_tabular("Safe/hazard_proximity")
-                
-                # Log Lagrangian constraint info
-                if self.trainer[0].use_lagrangian:
-                    self.logger.log_tabular("Safe/lagrangian_multiplier")
-                    self.logger.log_tabular("Safe/avg_recent_cost")
-                    self.logger.log_tabular("Safe/cost_limit")
-                    self.logger.log_tabular("Loss/lagrangian_penalty")
-                    self.logger.log_tabular("Safe/cost_violation")
+                self.logger.log_tabular("Safe/lamda_lagr")
                 
                 # Log barrier physics parameters (Safe module)
                 for physics_key in barrier_info.keys():
@@ -810,33 +746,49 @@ class Runner:
 
     @torch.no_grad()
     def collect(self, step):
+        """
+        v8.0: Collect actions and values, including cost predictions.
+        
+        Like MAPPO-Lagrangian, also collect cost_preds and rnn_states_cost
+        for cost critic training.
+        """
         value_collector = []
         action_collector = []
         action_log_prob_collector = []
         rnn_state_collector = []
         rnn_state_critic_collector = []
+        cost_preds_collector = []
+        rnn_states_cost_collector = []
+        
         for agent_id in range(self.num_agents):
             self.trainer[agent_id].prep_rollout()
-            value, action, action_log_prob, rnn_state, rnn_state_critic \
-                = self.trainer[agent_id].policy.get_actions(self.buffer[agent_id].share_obs[step],
-                                                            self.buffer[agent_id].obs[step],
-                                                            self.buffer[agent_id].rnn_states[step],
-                                                            self.buffer[agent_id].rnn_states_critic[step],
-                                                            self.buffer[agent_id].masks[step])
+            value, action, action_log_prob, rnn_state, rnn_state_critic, cost_pred, rnn_state_cost \
+                = self.trainer[agent_id].policy.get_actions(
+                    self.buffer[agent_id].share_obs[step],
+                    self.buffer[agent_id].obs[step],
+                    self.buffer[agent_id].rnn_states[step],
+                    self.buffer[agent_id].rnn_states_critic[step],
+                    self.buffer[agent_id].masks[step],
+                    rnn_states_cost=self.buffer[agent_id].rnn_states_cost[step]
+                )
             value_collector.append(value.detach())
             action_collector.append(action.detach())
-
             action_log_prob_collector.append(action_log_prob.detach())
             rnn_state_collector.append(rnn_state.detach())
             rnn_state_critic_collector.append(rnn_state_critic.detach())
+            cost_preds_collector.append(cost_pred.detach())
+            rnn_states_cost_collector.append(rnn_state_cost.detach())
+            
         if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
             zeros = torch.zeros(action_collector[-1].shape[0], 1)
             action_collector[-1]=torch.cat((action_collector[-1], zeros), dim=1)
         values = torch.transpose(torch.stack(value_collector), 1, 0)
         rnn_states = torch.transpose(torch.stack(rnn_state_collector), 1, 0)
         rnn_states_critic = torch.transpose(torch.stack(rnn_state_critic_collector), 1, 0)
+        cost_preds = torch.transpose(torch.stack(cost_preds_collector), 1, 0)
+        rnn_states_cost = torch.transpose(torch.stack(rnn_states_cost_collector), 1, 0)
 
-        return values, action_collector, action_log_prob_collector, rnn_states, rnn_states_critic
+        return values, action_collector, action_log_prob_collector, rnn_states, rnn_states_critic, cost_preds, rnn_states_cost
 
     @torch.no_grad()
     def collect_barrier_physics_info(self, obs):
@@ -997,9 +949,14 @@ class Runner:
         
         return obstacle_positions, goal_positions, hazard_radius
 
-    def insert(self, data):
-        obs, share_obs, rewards, dones, infos, \
-        values, actions, action_log_probs, rnn_states, rnn_states_critic = data
+    def insert(self, data, aver_episode_costs=0):
+        """
+        v8.0: Insert data including costs and cost predictions.
+        
+        Like MAPPO-Lagrangian, also store costs and cost_preds in buffer.
+        """
+        obs, share_obs, rewards, costs, dones, infos, \
+        values, actions, action_log_probs, rnn_states, rnn_states_critic, cost_preds, rnn_states_cost = data
 
         dones_env = torch.all(dones, axis=1)
 
@@ -1007,6 +964,8 @@ class Runner:
             (dones_env == True).sum(), self.num_agents, self.config["recurrent_N"], self.config["hidden_size"], device=self.config["device"])
         rnn_states_critic[dones_env == True] = torch.zeros(
             (dones_env == True).sum(), self.num_agents, *self.buffer[0].rnn_states_critic.shape[2:], device=self.config["device"])
+        rnn_states_cost[dones_env == True] = torch.zeros(
+            (dones_env == True).sum(), self.num_agents, *self.buffer[0].rnn_states_cost.shape[2:], device=self.config["device"])
 
         masks = torch.ones(self.config["n_rollout_threads"], self.num_agents, 1, device=self.config["device"])
         masks[dones_env == True] = torch.zeros((dones_env == True).sum(), self.num_agents, 1, device=self.config["device"])
@@ -1022,11 +981,16 @@ class Runner:
                 obs_to_insert = obs[agent_id]
             else:
                 obs_to_insert = obs[:, agent_id]
-            self.buffer[agent_id].insert(share_obs[:, agent_id], obs_to_insert, rnn_states[:, agent_id],
-                                         rnn_states_critic[:, agent_id], actions[agent_id],
-                                         action_log_probs[agent_id],
-                                         values[:, agent_id], rewards[:, agent_id].unsqueeze(-1), masks[:, agent_id], None,
-                                         active_masks[:, agent_id], None)
+            self.buffer[agent_id].insert(
+                share_obs[:, agent_id], obs_to_insert, rnn_states[:, agent_id],
+                rnn_states_critic[:, agent_id], actions[agent_id],
+                action_log_probs[agent_id],
+                values[:, agent_id], rewards[:, agent_id].unsqueeze(-1), masks[:, agent_id], None,
+                active_masks[:, agent_id], None,
+                costs=costs[:, agent_id].unsqueeze(-1),
+                cost_preds=cost_preds[:, agent_id],
+                rnn_states_cost=rnn_states_cost[:, agent_id]
+            )
 
     def train(self):
         action_dim = 1
@@ -1325,13 +1289,32 @@ class Runner:
 
     @torch.no_grad()
     def compute(self):
+        """
+        v8.0: Compute returns for both reward and cost critics.
+        
+        Key change: Also compute cost_returns for cost critic training,
+        just like MAPPO-Lagrangian.
+        """
         for agent_id in range(self.num_agents):
             self.trainer[agent_id].prep_rollout()
-            next_value = self.trainer[agent_id].policy.get_values(self.buffer[agent_id].share_obs[-1],
-                                                                self.buffer[agent_id].rnn_states_critic[-1],
-                                                                self.buffer[agent_id].masks[-1])
+            
+            # Compute reward returns
+            next_value = self.trainer[agent_id].policy.get_values(
+                self.buffer[agent_id].share_obs[-1],
+                self.buffer[agent_id].rnn_states_critic[-1],
+                self.buffer[agent_id].masks[-1]
+            )
             next_value = next_value.detach()
             self.buffer[agent_id].compute_returns(next_value, self.trainer[agent_id].value_normalizer)
+            
+            # v8.0: Compute cost returns (like MAPPO-Lagrangian)
+            next_costs = self.trainer[agent_id].policy.get_cost_values(
+                self.buffer[agent_id].share_obs[-1],
+                self.buffer[agent_id].rnn_states_cost[-1],
+                self.buffer[agent_id].masks[-1]
+            )
+            next_costs = next_costs.detach()
+            self.buffer[agent_id].compute_cost_returns(next_costs, self.trainer[agent_id].cost_value_normalizer)
 
 
 def train(args, cfg_train):
