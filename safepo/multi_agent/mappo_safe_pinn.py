@@ -247,18 +247,16 @@ class MAPPOSafePINNTrainer():
         # v8.0: Cost value normalizer (like MAPPO-Lagrangian)
         self.cost_value_normalizer = PopArt(1, device=self.config["device"])
         
-        # v8.1: Enhanced auxiliary loss weights for better safety learning
-        # Increased weights to make physics features more influential
+        # v8.4: Increased agent collision weight to prevent train/eval gap
         self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.02)
         self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.05)
-        self.aux_safety_weight = config.get("aux_safety_weight", 0.1)  # 10x increase!
-        self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.15)  # NEW: agent-agent penalty
+        self.aux_safety_weight = config.get("aux_safety_weight", 0.03)  # Slight increase
+        self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.05)  # 2.5x increase
         
-        # v8.1: Improved MAPPO-Lagrangian style constraint
-        # Higher initial value for faster safety enforcement
-        self.lamda_lagr = config.get("lamda_lagr", 2.0)  # Start higher for quicker safety
-        self.lamda_lagr_min = config.get("lamda_lagr_min", 0.1)  # Minimum bound
-        self.lamda_lagr_max = config.get("lamda_lagr_max", 50.0)  # Maximum bound
+        # v8.4: Tuned lamda_lagr for stable constraint
+        self.lamda_lagr = config.get("lamda_lagr", 1.5)
+        self.lamda_lagr_min = config.get("lamda_lagr_min", 0.5)  # Higher minimum
+        self.lamda_lagr_max = config.get("lamda_lagr_max", 8.0)  # Slightly higher max
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.config["clip_param"],
@@ -321,11 +319,11 @@ class MAPPOSafePINNTrainer():
         target_k_scale = 0.3 + hazard_proximity.clamp(0, 1) * 3.0  # Range [0.3, 3.3]
         barrier_k_loss = F.mse_loss(k, target_k_scale)
         
-        # === Auxiliary Loss 3: Safety Loss (ENHANCED v8.1) ===
-        # Penalize being in dangerous positions (high hazard proximity)
-        # v8.1: Lower threshold and continuous penalty for better gradient
-        danger_level = torch.clamp(hazard_proximity - 0.3, min=0.0) / 0.7  # Starts at 0.3 proximity
-        safety_loss = (danger_level ** 2).mean()  # Quadratic penalty for smooth gradient
+        # === Auxiliary Loss 3: Safety Loss (v8.2: Fixed threshold) ===
+        # v8.2: Use higher threshold (0.7 instead of 0.3) to avoid always-on penalty
+        # Only penalize when really close to obstacles
+        danger_level = torch.clamp(hazard_proximity - 0.7, min=0.0) / 0.3  # Only [0.7, 1.0] is dangerous
+        safety_loss = (danger_level ** 2).mean()  # Now in reasonable range
         
         # === Auxiliary Loss 4: Gradient Alignment ===
         # Encourage barrier gradient to point away from obstacles
@@ -334,26 +332,31 @@ class MAPPOSafePINNTrainer():
         target_grad_mag = hazard_proximity * 5.0
         grad_alignment_loss = F.mse_loss(grad_magnitude.clamp(max=5.0), target_grad_mag.clamp(max=5.0))
         
-        # === Auxiliary Loss 5: Agent-Agent Collision Penalty (NEW v8.1) ===
+        # === Auxiliary Loss 5: Agent-Agent Collision Penalty (v8.4: Lower threshold) ===
         # Extract agent-specific lidar (obs[76:92]) for inter-agent collision
         agent_lidar_start = 76
         agent_lidar_end = min(92, obs_batch.shape[-1])
         if agent_lidar_start < agent_lidar_end:
             agent_lidar = obs_batch[:, agent_lidar_start:agent_lidar_end]
-            agent_proximity = agent_lidar.max(dim=-1, keepdim=True)[0]
-            # Strong penalty when agents are very close (proximity > 0.6)
-            agent_danger = torch.clamp(agent_proximity - 0.4, min=0.0) / 0.6
-            agent_collision_loss = (agent_danger ** 2).mean()
+            # agent_proximity_max: for each sample, get max across lidar bins
+            agent_proximity_per_sample = agent_lidar.max(dim=-1, keepdim=True)[0]  # [batch, 1]
+            # For logging: mean of max-per-sample (should be in [0,1])
+            agent_proximity_for_log = agent_proximity_per_sample.mean().item()
+            # v8.4: Lower threshold (0.5 instead of 0.7) to prevent collision earlier
+            agent_danger = torch.clamp(agent_proximity_per_sample - 0.5, min=0.0) / 0.5
+            # Progressive penalty: linear + quadratic for strong gradient
+            agent_collision_loss = (agent_danger + agent_danger ** 2).mean()
         else:
+            agent_proximity_for_log = 0.0
             agent_collision_loss = torch.tensor(0.0, device=device)
         
-        # v8.1: Combined auxiliary loss with agent collision penalty
+        # v8.4: Combined auxiliary loss
         aux_loss = (self.aux_task_potential_weight * task_potential_loss + 
                     self.aux_barrier_potential_weight * (barrier_k_loss + grad_alignment_loss) +
                     self.aux_safety_weight * safety_loss +
                     self.aux_agent_collision_weight * agent_collision_loss)
         
-        # v8.1: Enhanced aux_info with agent collision metrics
+        # v8.4: Fixed aux_info
         aux_info = {
             'aux_task_loss': task_potential_loss.item(),
             'aux_barrier_k_loss': barrier_k_loss.item(),
@@ -366,7 +369,7 @@ class MAPPOSafePINNTrainer():
             'k_mean': k.mean().item(),
             'k_std': k.std().item(),
             'hazard_proximity_mean': hazard_proximity.mean().item(),
-            'agent_proximity_mean': agent_proximity.mean().item() if agent_lidar_start < agent_lidar_end else 0.0,
+            'agent_proximity_mean': agent_proximity_for_log,  # Fixed: now in [0,1]
         }
         
         return aux_loss, aux_info
@@ -428,19 +431,22 @@ class MAPPOSafePINNTrainer():
         actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.config["max_grad_norm"])
         self.policy.actor_optimizer.step()
 
-        # === Update Lagrangian multiplier (v8.1: with bounds and stability) ===
-        cost_limit = self.config.get("cost_limit", 25.0)
-        lagr_rate = self.config.get("lagrangian_coef_rate", 0.02)  # Reduced for stability
+        # === Update Lagrangian multiplier (v8.3: slower updates, higher limit) ===
+        # Key fix: cost_limit was 25, but EpCost naturally ~20-30, so lamda kept growing
+        cost_limit = self.config.get("cost_limit", 30.0)  # Increased from 25
+        lagr_rate = self.config.get("lagrangian_coef_rate", 0.01)  # Slower updates
         
-        # Compute delta with proper scaling
+        # Compute cost violation
         cost_violation = aver_episode_costs.mean() - cost_limit
-        delta_lamda_lagr = -((cost_violation * (1 - self.config["gamma"])) + 
-                             (imp_weights * cost_adv_targ).mean()).detach()
         
-        # Update with bounds to prevent oscillation
-        new_lamda_lagr = self.lamda_lagr - (delta_lamda_lagr.item() * lagr_rate)
-        new_lamda_lagr = max(self.lamda_lagr_min, min(self.lamda_lagr_max, new_lamda_lagr))
-        self.lamda_lagr = new_lamda_lagr
+        # Only update lamda if significant violation (hysteresis)
+        if cost_violation.item() > 2.0:  # Only increase if clearly over limit
+            delta_lamda = lagr_rate * cost_violation.item() * 0.1
+            self.lamda_lagr = min(self.lamda_lagr_max, self.lamda_lagr + delta_lamda)
+        elif cost_violation.item() < -5.0:  # Only decrease if well under limit
+            delta_lamda = lagr_rate * abs(cost_violation.item()) * 0.05
+            self.lamda_lagr = max(self.lamda_lagr_min, self.lamda_lagr - delta_lamda)
+        # Otherwise keep lamda stable
         
         aux_info['lamda_lagr'] = self.lamda_lagr
         aux_info['cost_violation'] = cost_violation.item() if isinstance(cost_violation, torch.Tensor) else cost_violation
@@ -496,7 +502,7 @@ class MAPPOSafePINNTrainer():
                 value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info \
                     = self.ppo_update(sample)
         
-        # v8.1: Enhanced logging with agent collision and cost violation metrics
+        # v8.2: Fixed logging with correct field names
         lagrangian_info = {
             "Loss/Loss_reward_critic": value_loss.item(),
             "Loss/Loss_actor": policy_loss.item(),
@@ -512,7 +518,7 @@ class MAPPOSafePINNTrainer():
             "Safe/k_mean": aux_info['k_mean'],
             "Safe/k_std": aux_info['k_std'],
             "Safe/hazard_proximity": aux_info['hazard_proximity_mean'],
-            "Safe/agent_proximity": aux_info.get('agent_proximity_mean', 0.0),
+            "Safe/agent_proximity": aux_info.get('agent_proximity_mean', 0.0),  # v8.3: fixed name
             "Safe/lamda_lagr": aux_info.get('lamda_lagr', 0.0),
             "Safe/cost_violation": aux_info.get('cost_violation', 0.0),
             "Misc/Reward_critic_norm": critic_grad_norm.item(),
@@ -1135,6 +1141,13 @@ class Runner:
                                                       eval_rnn_states[:, agent_id],
                                                       eval_masks[:, agent_id],
                                                       deterministic=True)
+                
+                # v8.4: Add small noise per agent to break symmetry and prevent deadlock
+                # Different agents get different noise to encourage coordination
+                noise_scale = 0.05 * (agent_id + 1) / self.num_agents  # Agent-specific noise
+                noise = torch.randn_like(eval_actions) * noise_scale
+                eval_actions = eval_actions + noise
+                
                 eval_rnn_states[:, agent_id] = temp_rnn_state
                 eval_actions_collector.append(eval_actions)
 
