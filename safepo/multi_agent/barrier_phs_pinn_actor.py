@@ -670,16 +670,29 @@ class BarrierPHSPINNActor(nn.Module):
         action_std = torch.sigmoid(self.log_std / self.std_x_coef) * self.std_y_coef
         action_std = action_std.expand_as(action_mean)
         
-        # === v6.0: NO forced action correction ===
-        # The policy network learns from physics features (H_task, H_barrier, gradients, dynamics)
-        # The network can learn to use these features to produce safe actions
-        # Reward shaping in the trainer will guide the learning process
+        # === v8.6: Safety Action Correction when in danger ===
+        # Key insight: When H_barrier is high, EXPLICITLY reduce forward velocity
+        # This is a hard safety constraint, not just a learned feature
+        # Get hazard proximity for each sample
+        _, hazard_proximity = self._extract_lidar_info(obs)  # [batch, 1]
+        _, agent_proximity = self._extract_agent_lidar_info(obs)  # [batch, 1]
         
-        # Create distribution with learned action mean (no correction)
-        dist = torch.distributions.Normal(action_mean, action_std)
+        # Combined danger: max of hazard and agent proximity
+        combined_proximity = torch.maximum(hazard_proximity, agent_proximity)
+        
+        # Safety correction factor: reduces action when in danger
+        # When proximity > 0.6, start reducing; at proximity = 1.0, reduce by 80%
+        danger_factor = torch.clamp((combined_proximity - 0.6) / 0.4, min=0.0, max=1.0)
+        safety_scale = 1.0 - 0.8 * danger_factor  # [1.0 -> 0.2]
+        
+        # Apply safety scaling to action mean (reduce velocity commands when near obstacles)
+        action_mean_safe = action_mean * safety_scale
+        
+        # Create distribution with safety-corrected action mean
+        dist = torch.distributions.Normal(action_mean_safe, action_std)
         
         if deterministic:
-            action = action_mean
+            action = action_mean_safe
         else:
             action = dist.rsample()  # Reparameterization trick
         
@@ -691,6 +704,20 @@ class BarrierPHSPINNActor(nn.Module):
             rnn_states = torch.zeros(obs.shape[0], 1, 1, device=self.device)
         
         return action, action_log_probs, rnn_states
+    
+    def _extract_agent_lidar_info(self, obs):
+        """Extract agent lidar info for inter-agent collision detection."""
+        batch_size = obs.shape[0]
+        obs_dim = obs.shape[-1]
+        
+        agent_end = min(self.agent_lidar_end_idx, obs_dim)
+        if self.agent_lidar_start_idx < agent_end:
+            agent_lidar = obs[:, self.agent_lidar_start_idx:agent_end]
+            agent_proximity = agent_lidar.max(dim=-1, keepdim=True)[0]
+        else:
+            agent_proximity = torch.zeros(batch_size, 1, device=self.device)
+        
+        return None, agent_proximity
     
     def evaluate_actions(self, obs, rnn_states, action, masks, available_actions=None, active_masks=None):
         """
@@ -735,9 +762,15 @@ class BarrierPHSPINNActor(nn.Module):
         action_std = torch.sigmoid(self.log_std / self.std_x_coef) * self.std_y_coef
         action_std = action_std.expand_as(action_mean)
         
-        # === v6.0: No action correction - matches forward() ===
-        # Distribution uses learned action mean directly
-        dist = torch.distributions.Normal(action_mean, action_std)
+        # === v8.6: Safety Action Correction - MUST match forward()! ===
+        _, hazard_proximity = self._extract_lidar_info(obs)
+        _, agent_proximity = self._extract_agent_lidar_info(obs)
+        combined_proximity = torch.maximum(hazard_proximity, agent_proximity)
+        danger_factor = torch.clamp((combined_proximity - 0.6) / 0.4, min=0.0, max=1.0)
+        safety_scale = 1.0 - 0.8 * danger_factor
+        action_mean_safe = action_mean * safety_scale
+        
+        dist = torch.distributions.Normal(action_mean_safe, action_std)
         
         # Compute log prob of given action
         action_log_probs = dist.log_prob(action)  # Per-dimension (like MAPPO)

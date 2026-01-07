@@ -247,16 +247,21 @@ class MAPPOSafePINNTrainer():
         # v8.0: Cost value normalizer (like MAPPO-Lagrangian)
         self.cost_value_normalizer = PopArt(1, device=self.config["device"])
         
-        # v8.4: Increased agent collision weight to prevent train/eval gap
-        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.02)
-        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.05)
-        self.aux_safety_weight = config.get("aux_safety_weight", 0.03)  # Slight increase
-        self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.05)  # 2.5x increase
+        # v8.6: Focus on making H_barrier actually prevent collisions
+        # Key insight: H_barrier is only a feature, not a controller!
+        # We need: 1) Soft cost to train Cost Critic early, 2) Action correction when in danger
+        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.03)
+        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.05)  # Increase barrier awareness
+        self.aux_safety_weight = config.get("aux_safety_weight", 0.02)  # Use H_barrier directly
+        self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.03)
         
-        # v8.4: Tuned lamda_lagr for stable constraint
-        self.lamda_lagr = config.get("lamda_lagr", 1.5)
-        self.lamda_lagr_min = config.get("lamda_lagr_min", 0.5)  # Higher minimum
-        self.lamda_lagr_max = config.get("lamda_lagr_max", 8.0)  # Slightly higher max
+        # v8.6: Moderate Lagrangian bounds
+        self.lamda_lagr = config.get("lamda_lagr", 1.0)
+        self.lamda_lagr_min = config.get("lamda_lagr_min", 0.2)
+        self.lamda_lagr_max = config.get("lamda_lagr_max", 6.0)
+        
+        # v8.6: Soft cost weight - blend environment cost with H_barrier predicted danger
+        self.soft_cost_weight = config.get("soft_cost_weight", 0.3)  # 30% soft cost from H_barrier
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.config["clip_param"],
@@ -319,11 +324,17 @@ class MAPPOSafePINNTrainer():
         target_k_scale = 0.3 + hazard_proximity.clamp(0, 1) * 3.0  # Range [0.3, 3.3]
         barrier_k_loss = F.mse_loss(k, target_k_scale)
         
-        # === Auxiliary Loss 3: Safety Loss (v8.2: Fixed threshold) ===
-        # v8.2: Use higher threshold (0.7 instead of 0.3) to avoid always-on penalty
-        # Only penalize when really close to obstacles
-        danger_level = torch.clamp(hazard_proximity - 0.7, min=0.0) / 0.3  # Only [0.7, 1.0] is dangerous
-        safety_loss = (danger_level ** 2).mean()  # Now in reasonable range
+        # === Auxiliary Loss 3: Safety Loss (v8.6: Use H_barrier directly!) ===
+        # v8.6 Key insight: H_barrier should predict cost, not just proximity!
+        # Train H_barrier to be high when we expect collision (cost > 0)
+        # This makes H_barrier a leading indicator of collision, not just proximity
+        # Safety loss: Minimize H_barrier² weighted by inverse of safety margin
+        # When hazard_proximity > 0.5, H_barrier should be HIGH (warning)
+        # This encourages the policy to avoid states where H_barrier would be high
+        H_barrier_normalized = torch.sigmoid(H_barrier / 5.0)  # Normalize to [0, 1]
+        danger_level = torch.clamp(hazard_proximity - 0.5, min=0.0) / 0.5  # [0.5, 1.0] -> [0, 1]
+        # Loss: H_barrier should match danger_level (predictive of collision)
+        safety_loss = F.mse_loss(H_barrier_normalized, danger_level)
         
         # === Auxiliary Loss 4: Gradient Alignment ===
         # Encourage barrier gradient to point away from obstacles
@@ -332,31 +343,29 @@ class MAPPOSafePINNTrainer():
         target_grad_mag = hazard_proximity * 5.0
         grad_alignment_loss = F.mse_loss(grad_magnitude.clamp(max=5.0), target_grad_mag.clamp(max=5.0))
         
-        # === Auxiliary Loss 5: Agent-Agent Collision Penalty (v8.4: Lower threshold) ===
+        # === Auxiliary Loss 5: Agent-Agent Collision Penalty (v8.6: Stronger) ===
         # Extract agent-specific lidar (obs[76:92]) for inter-agent collision
         agent_lidar_start = 76
         agent_lidar_end = min(92, obs_batch.shape[-1])
         if agent_lidar_start < agent_lidar_end:
             agent_lidar = obs_batch[:, agent_lidar_start:agent_lidar_end]
-            # agent_proximity_max: for each sample, get max across lidar bins
             agent_proximity_per_sample = agent_lidar.max(dim=-1, keepdim=True)[0]  # [batch, 1]
-            # For logging: mean of max-per-sample (should be in [0,1])
             agent_proximity_for_log = agent_proximity_per_sample.mean().item()
-            # v8.4: Lower threshold (0.5 instead of 0.7) to prevent collision earlier
-            agent_danger = torch.clamp(agent_proximity_per_sample - 0.5, min=0.0) / 0.5
-            # Progressive penalty: linear + quadratic for strong gradient
-            agent_collision_loss = (agent_danger + agent_danger ** 2).mean()
+            # v8.6: Lower threshold (0.4) for earlier warning, steeper penalty
+            agent_danger = torch.clamp(agent_proximity_per_sample - 0.4, min=0.0) / 0.6
+            # Cubic penalty for stronger gradient at high danger
+            agent_collision_loss = (agent_danger ** 3).mean()
         else:
             agent_proximity_for_log = 0.0
             agent_collision_loss = torch.tensor(0.0, device=device)
         
-        # v8.4: Combined auxiliary loss
+        # v8.5: Balanced auxiliary loss - prioritize task over safety
         aux_loss = (self.aux_task_potential_weight * task_potential_loss + 
                     self.aux_barrier_potential_weight * (barrier_k_loss + grad_alignment_loss) +
                     self.aux_safety_weight * safety_loss +
                     self.aux_agent_collision_weight * agent_collision_loss)
         
-        # v8.4: Fixed aux_info
+        # v8.5: aux_info
         aux_info = {
             'aux_task_loss': task_potential_loss.item(),
             'aux_barrier_k_loss': barrier_k_loss.item(),
@@ -991,9 +1000,14 @@ class Runner:
 
     def insert(self, data, aver_episode_costs=0):
         """
-        v8.0: Insert data including costs and cost predictions.
+        v8.6: Insert data with SOFT COST mechanism.
         
-        Like MAPPO-Lagrangian, also store costs and cost_preds in buffer.
+        Key insight: Environment cost is SPARSE (only 1 when collision happens).
+        This gives Cost Critic no early warning signal to learn from.
+        
+        Solution: Add "soft cost" from H_barrier to provide gradient BEFORE collision:
+        - augmented_cost = env_cost + soft_cost_weight * H_barrier_based_danger
+        - This lets Cost Critic learn to predict danger BEFORE it happens
         """
         obs, share_obs, rewards, costs, dones, infos, \
         values, actions, action_log_probs, rnn_states, rnn_states_critic, cost_preds, rnn_states_cost = data
@@ -1016,18 +1030,39 @@ class Runner:
 
         if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
             actions[1]=actions[1][:, :8]
+        
+        # v8.6: Compute soft cost from H_barrier for each agent
+        soft_cost_weight = self.trainer[0].soft_cost_weight
+        
         for agent_id in range(self.num_agents):
             if 'Frank'in self.config['env_name']:
                 obs_to_insert = obs[agent_id]
             else:
                 obs_to_insert = obs[:, agent_id]
+            
+            # v8.6: Augment costs with soft cost from H_barrier
+            agent_env_cost = costs[:, agent_id].unsqueeze(-1)  # [batch, 1]
+            
+            if soft_cost_weight > 0:
+                with torch.no_grad():
+                    obs_tensor = obs_to_insert.to(self.config["device"])
+                    actor = self.policy[agent_id].actor
+                    H_barrier, _ = actor._compute_barrier_potential(obs_tensor)
+                    # Soft cost: sigmoid of H_barrier scaled to [0, 1]
+                    # When H_barrier > 5, soft_cost approaches 1 (high danger)
+                    soft_cost = torch.sigmoid((H_barrier - 3.0) / 2.0)  # Center at H_barrier=3
+                    # Augmented cost = env_cost + weighted soft_cost
+                    augmented_cost = agent_env_cost + soft_cost_weight * soft_cost
+            else:
+                augmented_cost = agent_env_cost
+            
             self.buffer[agent_id].insert(
                 share_obs[:, agent_id], obs_to_insert, rnn_states[:, agent_id],
                 rnn_states_critic[:, agent_id], actions[agent_id],
                 action_log_probs[agent_id],
                 values[:, agent_id], rewards[:, agent_id].unsqueeze(-1), masks[:, agent_id], None,
                 active_masks[:, agent_id], None,
-                costs=costs[:, agent_id].unsqueeze(-1),
+                costs=augmented_cost,  # v8.6: Use augmented cost!
                 cost_preds=cost_preds[:, agent_id],
                 rnn_states_cost=rnn_states_cost[:, agent_id]
             )
@@ -1142,11 +1177,12 @@ class Runner:
                                                       eval_masks[:, agent_id],
                                                       deterministic=True)
                 
-                # v8.4: Add small noise per agent to break symmetry and prevent deadlock
-                # Different agents get different noise to encourage coordination
-                noise_scale = 0.05 * (agent_id + 1) / self.num_agents  # Agent-specific noise
-                noise = torch.randn_like(eval_actions) * noise_scale
-                eval_actions = eval_actions + noise
+                # v8.5: Minimal noise only on rotation (action[1]), not forward motion
+                # This preserves forward momentum while breaking symmetry
+                if eval_actions.shape[-1] >= 2:
+                    rotation_noise = torch.randn(eval_actions.shape[0], 1, device=eval_actions.device) * 0.03 * (agent_id + 1)
+                    eval_actions = eval_actions.clone()
+                    eval_actions[:, 1:2] = eval_actions[:, 1:2] + rotation_noise
                 
                 eval_rnn_states[:, agent_id] = temp_rnn_state
                 eval_actions_collector.append(eval_actions)
