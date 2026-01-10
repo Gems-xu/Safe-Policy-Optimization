@@ -247,21 +247,24 @@ class MAPPOSafePINNTrainer():
         # v8.0: Cost value normalizer (like MAPPO-Lagrangian)
         self.cost_value_normalizer = PopArt(1, device=self.config["device"])
         
-        # v8.6: Focus on making H_barrier actually prevent collisions
-        # Key insight: H_barrier is only a feature, not a controller!
-        # We need: 1) Soft cost to train Cost Critic early, 2) Action correction when in danger
-        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.03)
-        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.05)  # Increase barrier awareness
-        self.aux_safety_weight = config.get("aux_safety_weight", 0.02)  # Use H_barrier directly
-        self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.03)
+        # v9.0: SIMPLE approach - no aggressive penalties!
+        # Key lesson: Over-penalizing kills exploration and learning.
+        # Let the Lagrangian method handle safety naturally.
+        self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.02)
+        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.02)
+        self.aux_safety_weight = config.get("aux_safety_weight", 0.01)
+        self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.01)
         
-        # v8.6: Moderate Lagrangian bounds
-        self.lamda_lagr = config.get("lamda_lagr", 1.0)
-        self.lamda_lagr_min = config.get("lamda_lagr_min", 0.2)
-        self.lamda_lagr_max = config.get("lamda_lagr_max", 6.0)
+        # v9.0: Moderate Lagrangian - not too high to kill learning
+        self.lamda_lagr = config.get("lamda_lagr", 0.5)  # Start low
+        self.lamda_lagr_min = config.get("lamda_lagr_min", 0.1)
+        self.lamda_lagr_max = config.get("lamda_lagr_max", 5.0)
         
-        # v8.6: Soft cost weight - blend environment cost with H_barrier predicted danger
-        self.soft_cost_weight = config.get("soft_cost_weight", 0.3)  # 30% soft cost from H_barrier
+        # v9.0: NO proximity penalty on reward! Use only soft cost.
+        self.proximity_penalty_weight = config.get("proximity_penalty_weight", 0.0)  # DISABLED
+        
+        # v9.0: Light soft cost - just help Cost Critic learn
+        self.soft_cost_weight = config.get("soft_cost_weight", 0.1)
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.config["clip_param"],
@@ -1000,14 +1003,10 @@ class Runner:
 
     def insert(self, data, aver_episode_costs=0):
         """
-        v8.6: Insert data with SOFT COST mechanism.
+        v9.0: SIMPLE insert - use original rewards, only light soft cost.
         
-        Key insight: Environment cost is SPARSE (only 1 when collision happens).
-        This gives Cost Critic no early warning signal to learn from.
-        
-        Solution: Add "soft cost" from H_barrier to provide gradient BEFORE collision:
-        - augmented_cost = env_cost + soft_cost_weight * H_barrier_based_danger
-        - This lets Cost Critic learn to predict danger BEFORE it happens
+        Key lesson from v8.8: Modifying rewards too aggressively kills learning.
+        Let the Lagrangian method handle cost constraints naturally.
         """
         obs, share_obs, rewards, costs, dones, infos, \
         values, actions, action_log_probs, rnn_states, rnn_states_critic, cost_preds, rnn_states_cost = data
@@ -1031,7 +1030,6 @@ class Runner:
         if self.config["env_name"] == "Safety9|8HumanoidVelocity-v0":
             actions[1]=actions[1][:, :8]
         
-        # v8.6: Compute soft cost from H_barrier for each agent
         soft_cost_weight = self.trainer[0].soft_cost_weight
         
         for agent_id in range(self.num_agents):
@@ -1040,18 +1038,16 @@ class Runner:
             else:
                 obs_to_insert = obs[:, agent_id]
             
-            # v8.6: Augment costs with soft cost from H_barrier
             agent_env_cost = costs[:, agent_id].unsqueeze(-1)  # [batch, 1]
+            agent_reward = rewards[:, agent_id].unsqueeze(-1)  # [batch, 1]
             
+            # v9.0: Only compute soft cost, don't modify reward
             if soft_cost_weight > 0:
                 with torch.no_grad():
                     obs_tensor = obs_to_insert.to(self.config["device"])
                     actor = self.policy[agent_id].actor
                     H_barrier, _ = actor._compute_barrier_potential(obs_tensor)
-                    # Soft cost: sigmoid of H_barrier scaled to [0, 1]
-                    # When H_barrier > 5, soft_cost approaches 1 (high danger)
-                    soft_cost = torch.sigmoid((H_barrier - 3.0) / 2.0)  # Center at H_barrier=3
-                    # Augmented cost = env_cost + weighted soft_cost
+                    soft_cost = torch.sigmoid((H_barrier - 3.0) / 2.0)
                     augmented_cost = agent_env_cost + soft_cost_weight * soft_cost
             else:
                 augmented_cost = agent_env_cost
@@ -1060,9 +1056,9 @@ class Runner:
                 share_obs[:, agent_id], obs_to_insert, rnn_states[:, agent_id],
                 rnn_states_critic[:, agent_id], actions[agent_id],
                 action_log_probs[agent_id],
-                values[:, agent_id], rewards[:, agent_id].unsqueeze(-1), masks[:, agent_id], None,
+                values[:, agent_id], agent_reward, masks[:, agent_id], None,  # v9.0: original reward!
                 active_masks[:, agent_id], None,
-                costs=augmented_cost,  # v8.6: Use augmented cost!
+                costs=augmented_cost,
                 cost_preds=cost_preds[:, agent_id],
                 rnn_states_cost=rnn_states_cost[:, agent_id]
             )

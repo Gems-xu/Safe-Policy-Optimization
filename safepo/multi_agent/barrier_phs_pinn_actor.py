@@ -670,29 +670,13 @@ class BarrierPHSPINNActor(nn.Module):
         action_std = torch.sigmoid(self.log_std / self.std_x_coef) * self.std_y_coef
         action_std = action_std.expand_as(action_mean)
         
-        # === v8.6: Safety Action Correction when in danger ===
-        # Key insight: When H_barrier is high, EXPLICITLY reduce forward velocity
-        # This is a hard safety constraint, not just a learned feature
-        # Get hazard proximity for each sample
-        _, hazard_proximity = self._extract_lidar_info(obs)  # [batch, 1]
-        _, agent_proximity = self._extract_agent_lidar_info(obs)  # [batch, 1]
-        
-        # Combined danger: max of hazard and agent proximity
-        combined_proximity = torch.maximum(hazard_proximity, agent_proximity)
-        
-        # Safety correction factor: reduces action when in danger
-        # When proximity > 0.6, start reducing; at proximity = 1.0, reduce by 80%
-        danger_factor = torch.clamp((combined_proximity - 0.6) / 0.4, min=0.0, max=1.0)
-        safety_scale = 1.0 - 0.8 * danger_factor  # [1.0 -> 0.2]
-        
-        # Apply safety scaling to action mean (reduce velocity commands when near obstacles)
-        action_mean_safe = action_mean * safety_scale
-        
-        # Create distribution with safety-corrected action mean
-        dist = torch.distributions.Normal(action_mean_safe, action_std)
+        # v8.8: NO safety action correction! Let policy learn from reward shaping.
+        # Previous versions broke PPO consistency by modifying action_mean.
+        # Now we use dense reward shaping in the trainer instead.
+        dist = torch.distributions.Normal(action_mean, action_std)
         
         if deterministic:
-            action = action_mean_safe
+            action = action_mean
         else:
             action = dist.rsample()  # Reparameterization trick
         
@@ -762,15 +746,8 @@ class BarrierPHSPINNActor(nn.Module):
         action_std = torch.sigmoid(self.log_std / self.std_x_coef) * self.std_y_coef
         action_std = action_std.expand_as(action_mean)
         
-        # === v8.6: Safety Action Correction - MUST match forward()! ===
-        _, hazard_proximity = self._extract_lidar_info(obs)
-        _, agent_proximity = self._extract_agent_lidar_info(obs)
-        combined_proximity = torch.maximum(hazard_proximity, agent_proximity)
-        danger_factor = torch.clamp((combined_proximity - 0.6) / 0.4, min=0.0, max=1.0)
-        safety_scale = 1.0 - 0.8 * danger_factor
-        action_mean_safe = action_mean * safety_scale
-        
-        dist = torch.distributions.Normal(action_mean_safe, action_std)
+        # v8.8: NO safety action correction - matches forward()
+        dist = torch.distributions.Normal(action_mean, action_std)
         
         # Compute log prob of given action
         action_log_probs = dist.log_prob(action)  # Per-dimension (like MAPPO)
