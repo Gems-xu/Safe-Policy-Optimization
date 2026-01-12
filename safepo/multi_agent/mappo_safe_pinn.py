@@ -247,24 +247,23 @@ class MAPPOSafePINNTrainer():
         # v8.0: Cost value normalizer (like MAPPO-Lagrangian)
         self.cost_value_normalizer = PopArt(1, device=self.config["device"])
         
-        # v9.0: SIMPLE approach - no aggressive penalties!
-        # Key lesson: Over-penalizing kills exploration and learning.
-        # Let the Lagrangian method handle safety naturally.
+        # v9.1: Slightly increased barrier awareness for better obstacle avoidance
+        # Balance: enough to learn avoidance, not so high to kill task performance
         self.aux_task_potential_weight = config.get("aux_task_potential_weight", 0.02)
-        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.02)
+        self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.03)  # Slightly higher
         self.aux_safety_weight = config.get("aux_safety_weight", 0.01)
-        self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.01)
+        self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.02)  # Slightly higher
         
-        # v9.0: Moderate Lagrangian - not too high to kill learning
-        self.lamda_lagr = config.get("lamda_lagr", 0.5)  # Start low
-        self.lamda_lagr_min = config.get("lamda_lagr_min", 0.1)
+        # v9.1: Slightly higher Lagrangian for stronger safety bias
+        self.lamda_lagr = config.get("lamda_lagr", 0.8)  # Slightly higher start
+        self.lamda_lagr_min = config.get("lamda_lagr_min", 0.2)
         self.lamda_lagr_max = config.get("lamda_lagr_max", 5.0)
         
         # v9.0: NO proximity penalty on reward! Use only soft cost.
         self.proximity_penalty_weight = config.get("proximity_penalty_weight", 0.0)  # DISABLED
         
-        # v9.0: Light soft cost - just help Cost Critic learn
-        self.soft_cost_weight = config.get("soft_cost_weight", 0.1)
+        # v9.1: Slightly higher soft cost for better Cost Critic training
+        self.soft_cost_weight = config.get("soft_cost_weight", 0.15)
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(-self.config["clip_param"],

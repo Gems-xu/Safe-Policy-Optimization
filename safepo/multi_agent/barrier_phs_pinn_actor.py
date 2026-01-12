@@ -362,12 +362,15 @@ class BarrierPHSPINNActor(nn.Module):
         """
         Compute Barrier Lyapunov Function (BLF) based potential.
         
-        v7.0: Simplified and smoother formula that doesn't saturate quickly.
-        H_barrier = k * proximity^2 / (1 - proximity^2 + ε)
+        v9.2: EXPONENTIAL barrier growth from boundary to center + anti-deadlock.
         
-        This provides a smoother gradient and doesn't explode to clip_max immediately.
+        Key Design Principles:
+        1. EXPONENTIAL growth: H = k * exp(alpha * proximity) - creates rapid increase near center
+        2. Smooth at boundary (proximity~0), explosive at center (proximity~1)
+        3. Anti-deadlock: perpendicular escape when surrounded, enables passing between obstacles
         
-        Where proximity ∈ [0, 1]: 0 = safe (far), 1 = danger (collision)
+        Proximity ∈ [0, 1]: 0 = far/safe, 1 = collision/center
+        H_barrier grows exponentially: exp(0)=1 → exp(5)≈150 at center
         
         Args:
             obs: [batch, obs_dim] observation tensor
@@ -376,53 +379,80 @@ class BarrierPHSPINNActor(nn.Module):
             H_barrier: [batch, 1] barrier potential
             grad_H_barrier: [batch, 2] gradient w.r.t. velocity (approximation)
         """
-        # Get adaptive stiffness from network and scale it
+        # Get adaptive stiffness from network
         k_base = self.barrier_k_net(obs)  # [batch, 1], positive due to Softplus
         k = torch.clamp(k_base * self.barrier_k_scale + self.min_barrier_k, min=self.min_barrier_k)
         
         # Extract lidar info and proximity
         lidar_obs, proximity = self._extract_lidar_info(obs)  # proximity ∈ [0, 1]
         
-        # v7.0: Simplified barrier formula with smoother behavior
-        # Use squared proximity for smoother gradient near safety boundary
-        proximity_sq = proximity ** 2
-        safety_margin = torch.clamp(1.0 - proximity_sq, min=0.05)  # Larger min to prevent saturation
+        # === v9.2: EXPONENTIAL barrier potential ===
+        # H_barrier = k * (exp(alpha * proximity) - 1)
+        # alpha controls growth rate: higher = steeper near center
+        # Subtract 1 so H_barrier=0 when proximity=0 (far from obstacles)
+        alpha = 5.0  # Growth rate: exp(5) ≈ 148 at proximity=1
+        H_barrier = k * (torch.exp(alpha * proximity) - 1.0)
         
-        # H_barrier = k * proximity^2 / safety_margin
-        # This gives smoother gradient and doesn't explode as quickly
-        H_barrier = k * proximity_sq / (safety_margin + self.barrier_epsilon)
+        # Clip to prevent numerical issues, but allow high values
+        H_barrier = torch.clamp(H_barrier, max=self.barrier_clip_max * 2.0)
         
-        # Reduced clip for more gradual behavior
-        H_barrier = torch.clamp(H_barrier, max=self.barrier_clip_max)
-        
-        # Compute gradient approximation
-        vel = obs[:, self.vel_indices]  # [batch, 2]
-        vel_norm = torch.norm(vel, dim=-1, keepdim=True) + 1e-6
-        
-        # v7.0: Smoother gradient magnitude
-        # dH/d(proximity) ≈ 2k * proximity / safety_margin
-        grad_magnitude = 2.0 * k * proximity / (safety_margin + self.barrier_epsilon)
+        # === Gradient: d/dp[k*(exp(alpha*p)-1)] = k * alpha * exp(alpha*p) ===
+        grad_magnitude = k * alpha * torch.exp(alpha * proximity)
         grad_magnitude = grad_magnitude * self.barrier_gradient_scale
-        grad_magnitude = torch.clamp(grad_magnitude, max=10.0)  # Lower clip
+        grad_magnitude = torch.clamp(grad_magnitude, max=20.0)  # Allow strong but bounded gradient
         
-        # Use lidar-weighted direction for obstacle avoidance
+        # === Compute obstacle direction from lidar ===
         num_bins = lidar_obs.shape[-1]
         angles = torch.linspace(0, 2 * np.pi, num_bins + 1, device=self.device)[:-1]
         angles = angles.unsqueeze(0).expand(obs.shape[0], -1)
         
-        # Weighted sum of directions based on lidar readings
-        weights = lidar_obs ** 2
+        # Use exponential weights: closer obstacles have MUCH stronger influence
+        weights = torch.exp(3.0 * lidar_obs) - 1.0  # exp(3)-1 ≈ 19 at max
         weights_sum = weights.sum(dim=-1, keepdim=True) + 1e-6
         
         obstacle_dir_x = (weights * torch.cos(angles)).sum(dim=-1, keepdim=True) / weights_sum
         obstacle_dir_y = (weights * torch.sin(angles)).sum(dim=-1, keepdim=True) / weights_sum
         
-        # Gradient points away from obstacles (repulsive)
-        grad_H_barrier_x = -grad_magnitude * obstacle_dir_x
-        grad_H_barrier_y = -grad_magnitude * obstacle_dir_y
-        grad_H_barrier = torch.cat([grad_H_barrier_x, grad_H_barrier_y], dim=-1)
+        # === v9.2: Enhanced Anti-Deadlock Mechanism ===
+        # Problem: When obstacles block multiple directions, agent may stop
+        # Solution: Add PERPENDICULAR escape direction to navigate around/between obstacles
         
-        return H_barrier, grad_H_barrier
+        # Detect "surrounded" state: many directions have high readings
+        high_threshold = 0.4  # Lower threshold to detect obstacles earlier
+        high_readings = (lidar_obs > high_threshold).float().sum(dim=-1, keepdim=True)
+        
+        # Also detect "corridor" state: obstacles on sides but path ahead/behind
+        # Check if front (bins 0,15) and back (bins 7,8) are clearer than sides
+        front_clear = (lidar_obs[:, 0:2].max(dim=-1, keepdim=True)[0] < 0.5).float()
+        back_clear = (lidar_obs[:, 7:9].max(dim=-1, keepdim=True)[0] < 0.5).float()
+        in_corridor = front_clear * back_clear * (high_readings > 2).float()
+        
+        # Surrounded: many obstacles, not a corridor
+        is_surrounded = ((high_readings > 5) * (1 - in_corridor)).float()
+        
+        # Perpendicular escape: rotate obstacle direction by 90 degrees
+        escape_x = -obstacle_dir_y
+        escape_y = obstacle_dir_x
+        
+        # Escape blend: 40% when surrounded (strong enough to break deadlock)
+        escape_blend = 0.4 * is_surrounded
+        
+        # When in corridor, reduce escape to allow passing through
+        escape_blend = escape_blend * (1 - 0.5 * in_corridor)
+        
+        # Final direction: blend avoidance with escape
+        final_dir_x = obstacle_dir_x * (1 - escape_blend) + escape_x * escape_blend
+        final_dir_y = obstacle_dir_y * (1 - escape_blend) + escape_y * escape_blend
+        
+        # Normalize direction
+        dir_norm = torch.sqrt(final_dir_x**2 + final_dir_y**2) + 1e-6
+        final_dir_x = final_dir_x / dir_norm
+        final_dir_y = final_dir_y / dir_norm
+        
+        # Gradient points AWAY from obstacles (repulsive force)
+        grad_H_barrier_x = -grad_magnitude * final_dir_x
+        grad_H_barrier_y = -grad_magnitude * final_dir_y
+        grad_H_barrier = torch.cat([grad_H_barrier_x, grad_H_barrier_y], dim=-1)
         
         return H_barrier, grad_H_barrier
     
