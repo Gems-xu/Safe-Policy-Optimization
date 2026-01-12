@@ -1312,22 +1312,22 @@ class Runner:
                                 # Create wandb log dict with video and images (use dict for mixed types)
                                 viz_log: dict = {"Viz/all_potentials_video": video_obj}
                                 
-                                # Add individual potential field images
-                                if hasattr(self, '_latest_barrier_img') and self._latest_barrier_img is not None:
-                                    viz_log["Viz/barrier_potential"] = wandb.Image(
-                                        self._latest_barrier_img, 
-                                        caption=f"Barrier Potential - Eval #{self.eval_count}"
-                                    )
-                                if hasattr(self, '_latest_task_img') and self._latest_task_img is not None:
-                                    viz_log["Viz/task_potential"] = wandb.Image(
-                                        self._latest_task_img,
-                                        caption=f"Task Potential - Eval #{self.eval_count}"
-                                    )
-                                if hasattr(self, '_latest_total_img') and self._latest_total_img is not None:
-                                    viz_log["Viz/total_potential"] = wandb.Image(
-                                        self._latest_total_img,
-                                        caption=f"Total Potential - Eval #{self.eval_count}"
-                                    )
+                                # # Add individual potential field images
+                                # if hasattr(self, '_latest_barrier_img') and self._latest_barrier_img is not None:
+                                #     viz_log["Viz/barrier_potential"] = wandb.Image(
+                                #         self._latest_barrier_img, 
+                                #         caption=f"Barrier Potential - Eval #{self.eval_count}"
+                                #     )
+                                # if hasattr(self, '_latest_task_img') and self._latest_task_img is not None:
+                                #     viz_log["Viz/task_potential"] = wandb.Image(
+                                #         self._latest_task_img,
+                                #         caption=f"Task Potential - Eval #{self.eval_count}"
+                                #     )
+                                # if hasattr(self, '_latest_total_img') and self._latest_total_img is not None:
+                                #     viz_log["Viz/total_potential"] = wandb.Image(
+                                #         self._latest_total_img,
+                                #         caption=f"Total Potential - Eval #{self.eval_count}"
+                                #     )
                                 
                                 # Upload to wandb Viz module (separate from Eval module)
                                 if hasattr(self.logger, 'wandb_run') and self.logger.wandb_run is not None:
