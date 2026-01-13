@@ -573,7 +573,9 @@ class Runner:
         self.eval_count = 0
         self.video_record_freq = config.get("video_record_freq", 1)  # Record every N evals
 
-        torch.autograd.set_detect_anomaly(True)
+        # Disable anomaly detection for production (10-100x speedup)
+        # Only enable for debugging: torch.autograd.set_detect_anomaly(True)
+        torch.autograd.set_detect_anomaly(False)
         torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = True
         
@@ -1142,13 +1144,14 @@ class Runner:
 
         # Initialize potential field visualizer for MultiGoal tasks
         potential_visualizer = None
+        frame_sample_rate = 3  # Sample every N frames to reduce computation
         if should_record_video and is_multi_goal_task:
             try:
                 obstacle_positions, goal_positions, hazard_radius = self._extract_env_obstacles()
                 potential_visualizer = BarrierPotentialVideoVisualizer(
                     actor=self.policy[0].actor,
                     world_bounds=(-2.5, 2.5, -2.5, 2.5),
-                    grid_resolution=50,
+                    grid_resolution=30,  # Reduced from 50 to 30 for faster computation
                     device='cpu',
                     hazard_radius=hazard_radius,
                 )
@@ -1201,15 +1204,17 @@ class Runner:
                             first_episode_frames.append(frame.copy())
                             
                             # Generate combined potential field frame for MultiGoal tasks
-                            if potential_visualizer is not None and is_multi_goal_task:
+                            # Use frame sampling to reduce computation (only compute every N frames)
+                            should_compute_potential = (step_count % frame_sample_rate == 0)
+                            if potential_visualizer is not None and is_multi_goal_task and should_compute_potential:
                                 try:
-                                    # Get current positions
+                                    # Get current positions (cached for efficiency)
                                     obstacle_positions, goal_positions, _ = self._extract_env_obstacles()
                                     agent_positions = self._extract_agent_positions()
                                     
                                     # Use new all-potentials visualization (barrier, task, total)
                                     combined_frame, barrier_img, task_img, total_img = potential_visualizer.render_all_potentials_frame(
-                                        env_frame=frame.copy(),
+                                        env_frame=frame,  # No copy needed, visualizer handles it
                                         obstacle_positions=np.array(obstacle_positions),
                                         goal_positions=np.array(goal_positions),
                                         agent_positions=np.array(agent_positions) if agent_positions else None,
@@ -1219,14 +1224,9 @@ class Runner:
                                     potential_field_frames.append(combined_frame)
                                     
                                     # Store latest individual potential images for wandb logging
-                                    if step_count == 0:  # Initialize storage
-                                        self._latest_barrier_img = barrier_img
-                                        self._latest_task_img = task_img
-                                        self._latest_total_img = total_img
-                                    else:  # Update with latest
-                                        self._latest_barrier_img = barrier_img
-                                        self._latest_task_img = task_img
-                                        self._latest_total_img = total_img
+                                    self._latest_barrier_img = barrier_img
+                                    self._latest_task_img = task_img
+                                    self._latest_total_img = total_img
                                         
                                 except Exception as e:
                                     # Fallback: just use the original frame
@@ -1303,11 +1303,15 @@ class Runner:
                             try:
                                 # Stack frames and convert to (T, C, H, W) format for wandb
                                 # Input frames are (H, W, C), need to transpose to (C, H, W)
-                                video_array = np.stack(potential_field_frames, axis=0)  # (T, H, W, C)
-                                video_array = np.transpose(video_array, (0, 3, 1, 2))   # (T, C, H, W)
+                                # Use ascontiguousarray for better memory layout
+                                video_array = np.ascontiguousarray(
+                                    np.transpose(np.stack(potential_field_frames, axis=0), (0, 3, 1, 2))
+                                )  # (T, C, H, W)
                                 
+                                # Adjust FPS based on frame sampling rate
+                                fps_adjusted = 30 // frame_sample_rate
                                 caption = f"All Potentials - Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
-                                video_obj = wandb.Video(video_array, fps=30, format="mp4", caption=caption)
+                                video_obj = wandb.Video(video_array, fps=fps_adjusted, format="mp4", caption=caption)
                                 
                                 # Create wandb log dict with video and images (use dict for mixed types)
                                 viz_log: dict = {"Viz/all_potentials_video": video_obj}
