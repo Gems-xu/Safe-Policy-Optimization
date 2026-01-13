@@ -904,6 +904,70 @@ class Runner:
                 policy_cost_critic_state_dict = torch.load(cost_critic_path)
                 self.policy[agent_id].cost_critic.load_state_dict(policy_cost_critic_state_dict)
 
+    def _extract_agent_positions(self):
+        """Extract current agent positions from environment."""
+        agent_positions = []
+        
+        if not hasattr(self.eval_envs, 'envs') or len(self.eval_envs.envs) == 0:
+            return agent_positions
+        
+        env = self.eval_envs.envs[0]
+        task = getattr(getattr(env, 'env', env), 'task', None)
+        
+        if task and hasattr(task, 'agent'):
+            agent = task.agent
+            if hasattr(agent, 'pos_0'):
+                agent_positions.append((float(agent.pos_0[0]), float(agent.pos_0[1])))
+            if hasattr(agent, 'pos_1'):
+                agent_positions.append((float(agent.pos_1[0]), float(agent.pos_1[1])))
+        
+        return agent_positions
+    
+    def _extract_env_obstacles(self):
+        """Extract obstacle and goal positions from environment."""
+        obstacle_positions = []
+        goal_positions = []
+        hazard_radius = 0.25
+        
+        if not hasattr(self.eval_envs, 'envs') or len(self.eval_envs.envs) == 0:
+            return obstacle_positions, goal_positions, hazard_radius
+        
+        env = self.eval_envs.envs[0]
+        task = getattr(getattr(env, 'env', env), 'task', None)
+        
+        if task:
+            # Get hazards from task.hazards.pos (real-time positions)
+            if hasattr(task, 'hazards') and hasattr(task.hazards, 'pos'):
+                hazards_pos = task.hazards.pos
+                if hazards_pos is not None:
+                    for pos in hazards_pos:
+                        obstacle_positions.append((float(pos[0]), float(pos[1])))
+                if hasattr(task.hazards, 'size'):
+                    hazard_radius = float(task.hazards.size)
+            
+            # Get goals from task.goal_red/blue.pos
+            if hasattr(task, 'goal_red') and hasattr(task.goal_red, 'pos'):
+                goal_red_pos = task.goal_red.pos
+                if goal_red_pos is not None:
+                    goal_positions.append((float(goal_red_pos[0]), float(goal_red_pos[1])))
+            
+            if hasattr(task, 'goal_blue') and hasattr(task.goal_blue, 'pos'):
+                goal_blue_pos = task.goal_blue.pos
+                if goal_blue_pos is not None:
+                    goal_positions.append((float(goal_blue_pos[0]), float(goal_blue_pos[1])))
+        
+        # Fallback to defaults if extraction failed
+        if len(obstacle_positions) == 0:
+            obstacle_positions = [
+                (0.8, 0.0), (-0.8, 0.0), (0.0, 0.8), (0.0, -0.8),
+                (0.6, 0.6), (-0.6, 0.6), (0.6, -0.6), (-0.6, -0.6)
+            ]
+        
+        if len(goal_positions) == 0:
+            goal_positions = [(1.2, 1.2), (-1.2, -1.2)]
+        
+        return obstacle_positions, goal_positions, hazard_radius
+
     @torch.no_grad()
     def eval(self, eval_episodes=1, total_steps=0):
         """Evaluate policy performance."""
@@ -931,17 +995,16 @@ class Runner:
         frame_sample_rate = 3
 
         potential_visualizer = None
+        
         if should_record_video and is_multi_goal_task:
-            try:
-                potential_visualizer = BarrierPotentialVideoVisualizer(
-                    actor=self.policy[0].actor,
-                    world_bounds=(-2.5, 2.5, -2.5, 2.5),
-                    grid_resolution=30,
-                    device='cpu',
-                    hazard_radius=0.25,
-                )
-            except Exception as e:
-                potential_visualizer = None
+            _, _, hazard_radius = self._extract_env_obstacles()
+            potential_visualizer = BarrierPotentialVideoVisualizer(
+                actor=self.policy[0].actor,
+                world_bounds=(-2.5, 2.5, -2.5, 2.5),
+                grid_resolution=30,
+                device='cpu',
+                hazard_radius=hazard_radius,
+            )
 
         eval_obs, _, _ = self.eval_envs.reset()
 
@@ -980,28 +1043,26 @@ class Runner:
 
             # Capture frame
             if recording_first_episode and hasattr(self.eval_envs, 'render'):
-                try:
-                    frame = self.eval_envs.render()
-                    if frame is not None and isinstance(frame, np.ndarray) and len(frame.shape) == 3:
-                        first_episode_frames.append(frame.copy())
+                frame = self.eval_envs.render()
+                if frame is not None and isinstance(frame, np.ndarray) and len(frame.shape) == 3:
+                    first_episode_frames.append(frame.copy())
+                    
+                    if potential_visualizer is not None and step_count % frame_sample_rate == 0:
+                        # Extract current positions
+                        obstacle_positions, goal_positions, _ = self._extract_env_obstacles()
+                        agent_positions = self._extract_agent_positions()
                         
-                        if potential_visualizer is not None and step_count % frame_sample_rate == 0:
-                            try:
-                                combined_frame, _, _, _ = potential_visualizer.render_all_potentials_frame(
-                                    env_frame=frame,
-                                    obstacle_positions=np.array([]),
-                                    goal_positions=np.array([]),
-                                    agent_positions=None,
-                                    step=step_count,
-                                    task_potential_scale=2.0,
-                                )
-                                potential_field_frames.append(combined_frame)
-                            except Exception:
-                                pass
-                        
-                        step_count += 1
-                except Exception:
-                    pass
+                        combined_frame, _, _, _ = potential_visualizer.render_all_potentials_frame(
+                            env_frame=frame,
+                            obstacle_positions=np.array(obstacle_positions),
+                            goal_positions=np.array(goal_positions),
+                            agent_positions=np.array(agent_positions) if agent_positions else None,
+                            step=step_count,
+                            task_potential_scale=2.0,
+                        )
+                        potential_field_frames.append(combined_frame)
+                    
+                    step_count += 1
 
             eval_obs, _, eval_rewards, eval_costs, eval_dones, _, _ = self.eval_envs.step(
                 eval_actions_collector
@@ -1047,44 +1108,32 @@ class Runner:
                     one_episode_costs[:, eval_i] = 0
 
             if eval_episode >= eval_episodes:
-                # Upload potential field video
+                # Save potential field video
                 if len(potential_field_frames) > 0 and should_record_video and is_multi_goal_task:
-                    try:
-                        viz_dir = os.path.join(os.path.dirname(self.save_dir), "vizs")
-                        os.makedirs(viz_dir, exist_ok=True)
+                    viz_dir = os.path.join(os.path.dirname(self.save_dir), "vizs")
+                    os.makedirs(viz_dir, exist_ok=True)
+                    
+                    video_path = os.path.join(viz_dir, f"potential_field_step{total_steps}.mp4")
+                    if potential_visualizer is not None:
+                        potential_visualizer.save_video(potential_field_frames, video_path, fps=30)
+                    
+                    if self.logger.use_wandb:
+                        import wandb
+                        video_array = np.ascontiguousarray(
+                            np.transpose(np.stack(potential_field_frames, axis=0), (0, 3, 1, 2))
+                        )
+                        fps_adjusted = 30 // frame_sample_rate
+                        caption = f"PHS-MAPPO v2 - Eval #{self.eval_count} - R:{first_episode_reward:.1f} C:{first_episode_cost:.1f}"
+                        video_obj = wandb.Video(video_array, fps=fps_adjusted, format="mp4", caption=caption)
                         
-                        video_path = os.path.join(viz_dir, f"potential_field_step{total_steps}.mp4")
-                        if potential_visualizer is not None:
-                            potential_visualizer.save_video(potential_field_frames, video_path, fps=30)
-                        
-                        if self.logger.use_wandb:
-                            import wandb
-                            try:
-                                video_array = np.ascontiguousarray(
-                                    np.transpose(np.stack(potential_field_frames, axis=0), (0, 3, 1, 2))
-                                )
-                                fps_adjusted = 30 // frame_sample_rate
-                                caption = f"PHS-MAPPO v2 - Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
-                                video_obj = wandb.Video(video_array, fps=fps_adjusted, format="mp4", caption=caption)
-                                
-                                viz_log = {"Viz/all_potentials_video": video_obj}
-                                
-                                if hasattr(self.logger, 'wandb_run') and self.logger.wandb_run is not None:
-                                    self.logger.wandb_run.log(viz_log, step=total_steps)
-                                elif wandb.run is not None:
-                                    wandb.log(viz_log, step=total_steps)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
+                        if hasattr(self.logger, 'wandb_run') and self.logger.wandb_run is not None:
+                            self.logger.wandb_run.log({"Viz/all_potentials_video": video_obj}, step=total_steps)
+                        elif wandb.run is not None:
+                            wandb.log({"Viz/all_potentials_video": video_obj}, step=total_steps)
                 
                 # Cleanup
-                try:
-                    import matplotlib.pyplot as plt
-                    plt.close('all')
-                except:
-                    pass
-                
+                import matplotlib.pyplot as plt
+                plt.close('all')
                 import gc
                 gc.collect()
                 
