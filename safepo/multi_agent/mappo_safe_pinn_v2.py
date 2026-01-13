@@ -33,7 +33,9 @@ Key Innovations from v2:
        - SoftBarrierHead learns pairwise stiffness k_ij
        
     4. Combined Potentials:
-       - H_task: Learned task potential (includes goal attraction)
+       - H_goal: Quadratic goal attraction (from goal lidar)
+       - H_task_learned: Learned task potential (neural network)
+       - H_task = H_goal + H_task_learned (explicit + learned)
        - H_barrier: Log barrier for collision avoidance
        - H_kin: Kinetic energy penalty
        
@@ -670,8 +672,8 @@ class Runner:
                 pbar.set_postfix({
                     'EpRet': f"{aver_episode_rewards.item():.2f}",
                     'EpCost': f"{aver_episode_costs.item():.2f}",
-                    'λ': f"{self.trainer[0].lamda_lagr:.2f}",
-                    'bw': f"{self.trainer[0].policy.actor._get_current_barrier_weight():.3f}",
+                    # 'λ': f"{self.trainer[0].lamda_lagr:.2f}",
+                    # 'bw': f"{self.trainer[0].policy.actor._get_current_barrier_weight():.3f}",
                 })
         pbar.close()
 

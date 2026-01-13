@@ -27,7 +27,7 @@ Core Innovation:
     - J: Learned skew-symmetric interconnection matrix (energy-conserving)
     - R: Learned positive semi-definite dissipation matrix (damping)
     - H_total = H_task + H_barrier + H_kin (combined potentials)
-    - H_task: Learned task potential (includes goal attraction)
+    - H_task = H_goal + H_task_learned (explicit goal attraction + learned component)
 
 Key Differences from v2:
     1. Action is COMPUTED from physics, not just informed by physics features
@@ -222,7 +222,9 @@ class PHSMAPPOActor(nn.Module):
     
     Key Architecture:
         1. Potential Functions:
-           - H_task: Learned task potential (includes goal attraction via goal lidar)
+           - H_goal: Explicit quadratic goal attraction (from goal lidar)
+           - H_task_learned: Learned task-specific potential (neural network)
+           - H_task = H_goal + H_task_learned (combined task potential)
            - H_barrier: Log barrier for collision avoidance
            - H_kin: Kinetic energy penalty
            
@@ -466,16 +468,41 @@ class PHSMAPPOActor(nn.Module):
         
         return adjacency
     
-    def _compute_task_potential_from_obs(self, obs, state_features):
+    def _compute_goal_potential(self, obs):
         """
-        Compute learned task potential H_task.
+        Compute explicit goal attraction potential H_goal from goal lidar.
         
-        Uses neural network to learn task-specific potential field.
-        Goal lidar features are included in obs, so the network learns
-        goal attraction implicitly along with other task objectives.
+        Uses goal lidar to estimate goal direction and distance.
+        H_goal = 0.5 * k * distance_to_goal^2 (quadratic spring)
+        
+        This provides explicit guidance toward the goal.
         """
-        H_task = self.H_task_net(state_features)
-        return H_task
+        # Extract goal lidar
+        goal_end = min(self.goal_lidar_end, obs.shape[-1])
+        goal_lidar = obs[..., self.goal_lidar_start:goal_end]  # [batch, ..., 32]
+        
+        # Max goal proximity (higher = closer to goal)
+        goal_proximity = goal_lidar.max(dim=-1, keepdim=True)[0]  # [batch, ..., 1]
+        
+        # Convert proximity to effective distance (inverse relationship)
+        # When proximity=1, distance≈0; when proximity=0, distance≈1
+        goal_distance = 1.0 - goal_proximity
+        
+        # Quadratic potential: lower when close to goal
+        k_goal = 10.0
+        H_goal = 0.5 * k_goal * goal_distance.pow(2)
+        
+        return H_goal
+    
+    def _compute_task_potential_learned(self, state_features):
+        """
+        Compute learned task potential H_task_learned.
+        
+        Uses neural network to learn task-specific potential field
+        beyond the explicit goal attraction.
+        """
+        H_task_learned = self.H_task_net(state_features)
+        return H_task_learned
     
     def _compute_obstacle_barrier(self, obs):
         """
@@ -606,7 +633,9 @@ class PHSMAPPOActor(nn.Module):
             
             # Compute all potential components
             H_kin = self._compute_kinetic_energy(obs_var)
-            H_task = self.H_task_net(state_features_var)  # Use state_features computed from obs_var
+            H_goal = self._compute_goal_potential(obs_var)  # Explicit goal attraction
+            H_task_learned = self._compute_task_potential_learned(state_features_var)  # Learned task component
+            H_task = H_goal + H_task_learned  # Combined task potential
             
             # Barrier potentials
             H_barrier_obs = self._compute_obstacle_barrier(obs_var)
@@ -627,7 +656,7 @@ class PHSMAPPOActor(nn.Module):
             barrier_weight_tensor = torch.tensor(current_barrier_weight, device=obs_var.device, dtype=obs_var.dtype)
             obstacle_weight_tensor = torch.tensor(self.obstacle_barrier_weight, device=obs_var.device, dtype=obs_var.dtype)
             
-            # Total Hamiltonian (H_task now includes goal attraction)
+            # Total Hamiltonian (H_task = H_goal + H_task_learned)
             H_total = (
                 task_weight_tensor * (H_task + H_kin) +
                 barrier_weight_tensor * H_barrier_agent +
@@ -646,6 +675,8 @@ class PHSMAPPOActor(nn.Module):
         grad_H_vel = grad_H[..., self.vel_indices]  # [batch, ..., 2]
         
         return H_total.detach(), grad_H_vel.detach(), {
+            'H_goal': H_goal.detach(),
+            'H_task_learned': H_task_learned.detach(),
             'H_task': H_task.detach(),
             'H_kin': H_kin.detach(),
             'H_barrier_obs': H_barrier_obs.detach(),
@@ -883,6 +914,8 @@ class PHSMAPPOActor(nn.Module):
         
         return {
             'H_total': H_total.detach(),
+            'H_goal': H_info['H_goal'],
+            'H_task_learned': H_info['H_task_learned'],
             'H_task': H_info['H_task'],
             'H_barrier_obs': H_info['H_barrier_obs'],
             'H_barrier_agent': H_info['H_barrier_agent'],
@@ -897,9 +930,11 @@ class PHSMAPPOActor(nn.Module):
     
     def _compute_task_potential(self, obs):
         """Wrapper for compatibility with trainer's auxiliary loss."""
+        H_goal = self._compute_goal_potential(obs)
         obs_norm = self.feature_norm(obs)
         state_features = self.state_encoder(obs_norm)
-        return self._compute_task_potential_from_obs(obs, state_features), None
+        H_task_learned = self._compute_task_potential_learned(state_features)
+        return H_goal + H_task_learned, None
     
     def _compute_barrier_potential(self, obs):
         """Wrapper for compatibility with trainer's auxiliary loss."""
