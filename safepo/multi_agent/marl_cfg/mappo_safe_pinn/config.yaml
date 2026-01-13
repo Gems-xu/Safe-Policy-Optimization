@@ -81,19 +81,21 @@ physics_hidden: 128         # Hidden size for physics networks (H_task, H_barrie
 pinn_state_dim: 4           # Physics state dimension: (vx, vy, ax, ay)
 
 # ==================================================
-# Barrier Potential Parameters (v3.0 精准化)
+# Barrier Potential Parameters (v9.3 指数型强化 - 中心势能接近100)
 # ==================================================
 
-# Core barrier parameters (精准化 - 极小化障碍势能边界)
+# Core barrier parameters (指数型 - 极强梯度变化)
 barrier_r_safe: 0.08        # Safe distance threshold - 进一步减小到0.08
 barrier_epsilon: 0.1        # Numerical stability - 增大到0.1使势能更平滑
-barrier_clip_max: 20.0      # Maximum barrier potential - 减小到20
+barrier_clip_max: 100.0     # Maximum barrier potential - 100上限
 
-# Enhanced barrier strength parameters (精准化 - 极快衰减)
-barrier_k_scale: 0.3        # Multiplier for barrier stiffness - 减小到0.3
-barrier_gradient_scale: 0.3 # Multiplier for barrier gradient influence
-barrier_decay_rate: 5.0     # Power for distance decay - 增大到5.0（距离^5极快衰减）
-min_barrier_k: 0.05         # Minimum barrier stiffness - 减小到0.05
+# Enhanced barrier strength parameters (指数型 - 中心势能≈100)
+# 计算: k * (exp(5*proximity) - 1), proximity=1时 exp(5)-1≈147.4
+# 要达到H≈100: k ≈ 100/147.4 ≈ 0.68, 所以min_barrier_k设为0.68
+barrier_k_scale: 5.0        # Multiplier for barrier stiffness - 增加到5.0以增强网络学习能力
+barrier_gradient_scale: 2.0 # Multiplier for barrier gradient influence - 增加到2.0以增强梯度
+barrier_decay_rate: 5.0     # Power for distance decay - 保持5.0（指数alpha=5.0）
+min_barrier_k: 0.68         # Minimum barrier stiffness - 设为0.68以确保中心势能≈100
 
 # Cost-aware safety parameters (精准化)
 cost_aware_weight: 0.02     # Weight for cost-aware policy shaping
