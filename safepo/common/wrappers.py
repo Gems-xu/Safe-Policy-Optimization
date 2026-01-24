@@ -38,6 +38,7 @@ except RuntimeError:
     pass
 from gymnasium.vector.vector_env import VectorEnv
 from gymnasium.spaces import Box
+from gymnasium.spaces.utils import flatdim
 from gymnasium.wrappers.normalize import NormalizeObservation
 
 import safety_gymnasium
@@ -151,7 +152,6 @@ class MultiGoalEnv():
         self.observation_spaces = {}
         for agent in self.possible_agents:
             self.action_spaces[agent] = self.env.action_space(agent)
-            self.observation_spaces[agent] = self.env.observation_space(agent)
         
         # n_actions is the action dimension (e.g., 2 for Point robot)
         self.n_actions = self.action_spaces['agent_0'].shape[0]
@@ -162,13 +162,23 @@ class MultiGoalEnv():
         # For multi-agent, each agent gets its own observation
         # share_obs is the concatenation of all agents' observations for centralized critic
         sample_obs = obs_dict['agent_0']
-        self.obs_size = len(sample_obs)
+
+        # Build flat index mapping from obs_space_dict (OrderedDict)
+        self._obs_key_slices = {}
+        self._agent0_indices = None
+        self._agent1_indices = None
+        self._build_agent_obs_indices()
+
+        if self._agent0_indices is not None and self._agent1_indices is not None:
+            self.obs_size = len(self._agent0_indices)
+        else:
+            self.obs_size = len(sample_obs)
         
         # Share observation: concatenate all agent observations
         # This gives the centralized critic full observability
         self.share_obs_size = self.obs_size * self.num_agents
         
-        # Create share_observation_spaces (for centralized critic)
+        # Create observation_spaces (agent-specific) and share_observation_spaces (centralized critic)
         self.share_observation_spaces = {}
         for agent in self.possible_agents:
             self.share_observation_spaces[agent] = Box(
@@ -177,18 +187,97 @@ class MultiGoalEnv():
                 shape=(self.share_obs_size,),
                 dtype=np.float64
             )
+            self.observation_spaces[agent] = Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(self.obs_size,),
+                dtype=np.float64,
+            )
         
         # Store last observation for _get_obs methods
         self._last_obs_dict = obs_dict
+
+        # Keep raw observations to preserve magnetometer (cos/sin) and lidar scales
+        self._keep_raw_obs = True
+
+    def _build_agent_obs_indices(self):
+        """Build flattened index lists for agent-specific observations."""
+        obs_space_dict = None
+        task = None
+        candidates = [self.env]
+        for attr in ("unwrapped", "env", "_env"):
+            obj = getattr(self.env, attr, None)
+            if obj is not None:
+                candidates.append(obj)
+
+        for cand in candidates:
+            task = getattr(cand, "task", None)
+            if task is not None:
+                break
+
+        if task is not None:
+            obs_space_dict = getattr(getattr(task, "obs_info", None), "obs_space_dict", None)
+
+        if obs_space_dict is None:
+            return
+
+        if not hasattr(obs_space_dict, 'spaces'):
+            return
+
+        offset = 0
+        for name, space in obs_space_dict.spaces.items():
+            dim = flatdim(space)
+            self._obs_key_slices[name] = slice(offset, offset + dim)
+            offset += dim
+
+        def _keys_for_agent(agent_id: int):
+            suffix = '' if agent_id == 0 else '1'
+            keys = []
+
+            # Base sensors in fixed order
+            for base in ("accelerometer", "velocimeter", "gyro", "magnetometer"):
+                key = f"{base}{suffix}"
+                if key in self._obs_key_slices:
+                    keys.append(key)
+
+            # Car-only ball joint sensors (if present)
+            for base in ("ballangvel_rear", "ballquat_rear"):
+                key = f"{base}{suffix}"
+                if key in self._obs_key_slices:
+                    keys.append(key)
+
+            # Lidar blocks in fixed task order
+            for base in ("goal_red", "goal_blue", "hazards", "vases"):
+                lidar_key = f"{base}_lidar{suffix}"
+                if lidar_key in self._obs_key_slices:
+                    keys.append(lidar_key)
+
+            return keys
+
+        agent0_keys = _keys_for_agent(0)
+        agent1_keys = _keys_for_agent(1)
+
+        if len(agent0_keys) > 0 and len(agent1_keys) > 0:
+            self._agent0_indices = np.concatenate([
+                np.arange(self._obs_key_slices[k].start, self._obs_key_slices[k].stop)
+                for k in agent0_keys
+            ]).astype(np.int64)
+            self._agent1_indices = np.concatenate([
+                np.arange(self._obs_key_slices[k].start, self._obs_key_slices[k].stop)
+                for k in agent1_keys
+            ]).astype(np.int64)
 
     def _get_obs(self):
         """Get observations for all agents."""
         obs_n = []
         for agent in self.possible_agents:
             obs = self._last_obs_dict[agent]
-            # Normalize observation
-            obs_normed = (obs - np.mean(obs)) / (np.std(obs) + 1e-8)
-            obs_n.append(obs_normed.astype(np.float32))
+            if self._agent0_indices is not None and self._agent1_indices is not None:
+                if agent == 'agent_0':
+                    obs = obs[self._agent0_indices]
+                else:
+                    obs = obs[self._agent1_indices]
+            obs_n.append(obs.astype(np.float32))
         return obs_n
 
     def _get_share_obs(self):
@@ -197,17 +286,13 @@ class MultiGoalEnv():
         Concatenates all agents' observations.
         """
         # Concatenate all agent observations
-        all_obs = []
-        for agent in self.possible_agents:
-            all_obs.append(self._last_obs_dict[agent])
-        
-        concat_obs = np.concatenate(all_obs)
-        concat_obs_normed = (concat_obs - np.mean(concat_obs)) / (np.std(concat_obs) + 1e-8)
-        
+        all_obs = self._get_obs()
+        concat_obs = np.concatenate(all_obs).astype(np.float32)
+
         # Each agent gets the same shared observation
         share_obs = []
         for _ in range(self.num_agents):
-            share_obs.append(concat_obs_normed.astype(np.float32))
+            share_obs.append(concat_obs)
         return share_obs
 
     def _get_avail_actions(self):

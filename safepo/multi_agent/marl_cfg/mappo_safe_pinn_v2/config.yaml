@@ -1,19 +1,18 @@
-# Configuration for MAPPO-Safe-PINN v3 (True PHS-MAPPO)
+# Configuration for MAPPO-Safe-PINN v7 (True PHS-MAPPO)
 # Port-Hamiltonian System Embedded MAPPO Actor
 #
-# Key Innovation (v3):
-# - Actions computed directly from PHS dynamics: u = F⁻¹(dx - (J_sys - R_sys) ∇H_sys)
-# - Learned J (interconnection) and R (dissipation) matrices via attention
-# - Multi-agent coupling via Laplacian matrix
-# - SoftBarrierHead for pairwise stiffness k_ij
+# Key Innovation (v7):
+# - Actions computed from gradient descent on Hamiltonian: u = -K_goal*∇H_goal + K_barrier*∇H_barrier
+# - Learned gain matrices K_goal, K_barrier via neural network
+# - Small residual MLP for exploration
 # - Barrier warmup schedule for stable training
 
-env_name: mappo_safe_pinn_v3
-algorithm_name: mappo_safe_pinn_v3
-experiment_name: phs_mappo_v3
+env_name: mappo_safe_pinn_v7
+algorithm_name: mappo_safe_pinn_v7
+experiment_name: phs_mappo_v7
 seed: 0
 run_dir: ./runs
-num_env_steps: 10000000
+num_env_steps: 20000000
 episode_length: 1000
 n_rollout_threads: 20
 n_eval_rollout_threads: 1
@@ -28,14 +27,14 @@ eval_interval: 25
 log_interval: 25
 eval_episodes: 10
 
-gamma: 0.96
+gamma: 0.99
 gae_lambda: 0.95
 use_gae: True
 use_popart: True
 use_valuenorm: False
 use_proper_time_limits: False
 
-target_kl: 0.016
+target_kl: 0.02
 searching_steps: 10
 accept_ratio: 0.5
 clip_param: 0.2
@@ -43,7 +42,7 @@ learning_iters: 5
 num_mini_batch: 1
 data_chunk_length: 
 value_loss_coef: 1
-entropy_coef: 0.01
+entropy_coef: 0.05
 max_grad_norm: 10
 huber_delta: 10.0
 use_recurrent_policy: False
@@ -54,8 +53,8 @@ use_huber_loss: True
 use_value_active_masks: False
 use_policy_active_masks: False
 
-actor_lr: 9.e-5
-critic_lr: 5.e-3
+actor_lr: 2.e-4
+critic_lr: 2.e-3
 opti_eps: 1.e-5
 weight_decay: 0.0
 
@@ -83,19 +82,19 @@ physics_hidden: 128         # Hidden size for attention modules
 # ==================================================
 
 # Physical dynamics parameters
-phs_f_max: 0.8              # Maximum control force
-phs_drag: 0.25              # Base damping coefficient
+phs_f_max: 1.0              # Maximum control force
+phs_drag: 0.1               # Base damping coefficient
 phs_dt: 0.05                # Time step for dynamics
 
 # ==================================================
-# Potential Weight Parameters
+# Potential Weight Parameters (v7.0 - True PHS Gradient Control)
 # ==================================================
 
-# Hamiltonian weights (from PHS-MAPPO.md)
-task_weight: 1.3            # Weight for H_goal + H_task + H_kin
-barrier_weight: 0.12        # Final barrier weight (after warmup)
-barrier_weight_max: 0.20    # Maximum barrier weight during plateau
-obstacle_barrier_weight: 0.45  # Weight for obstacle barrier potential
+# These weights control the PHS control law: u = K_goal*∇H_goal + K_barrier*∇H_barrier
+task_weight: 1.0            # Weight for task potential (goal-seeking)
+barrier_weight: 0.2         # Barrier weight for collision avoidance (higher for safety)
+barrier_weight_max: 0.6     # Maximum barrier weight during plateau
+obstacle_barrier_weight: 0.2  # Weight for obstacle barrier potential
 
 # ==================================================
 # Barrier Potential Parameters
@@ -107,35 +106,39 @@ r_communication: 0.45       # Communication radius for Laplacian
 barrier_epsilon: 0.06       # Numerical stability for log barrier
 
 # ==================================================
-# Barrier Warmup Schedule (Key for stable training)
+# Barrier Warmup Schedule (v7.0 - Gradual increase, no decay)
 # ==================================================
 
-barrier_warmup_steps: 200   # Steps for warmup phase (0 → max)
-barrier_decay_start: 400    # When to start decay phase
-barrier_decay_rate: 0.50    # Final weight = barrier_weight * decay_rate
+barrier_warmup_steps: 2000  # Steps for warmup phase (0 → max)
+barrier_decay_start: 6000   # Later decay
+barrier_decay_rate: 0.80    # More decay to allow task learning
 
 # Multi-agent scaling
 auto_scale_by_agents: True  # Auto-scale barrier by number of agent pairs
 
 # ==================================================
-# MAPPO-Lagrangian Parameters
+# MAPPO-Lagrangian Parameters (v7.0)
 # ==================================================
 
-cost_limit: 25.0            # Target cost limit per episode
+cost_limit: 60.0            # Target cost limit per episode
 lagrangian_coef_rate: 0.01  # Learning rate for Lagrangian multiplier
-lamda_lagr: 0.5             # Initial Lagrangian multiplier
-lamda_lagr_min: 0.1         # Minimum Lagrangian multiplier
+lamda_lagr: 0.2             # Initial Lagrangian multiplier
+lamda_lagr_min: 0.05        # Minimum Lagrangian multiplier
 lamda_lagr_max: 5.0         # Maximum Lagrangian multiplier
 
 # ==================================================
-# Auxiliary Loss Parameters (lighter in v3)
+# Auxiliary Loss Parameters
 # ==================================================
 
-aux_task_potential_weight: 0.01     # Task potential auxiliary loss
-aux_barrier_potential_weight: 0.02  # Barrier potential auxiliary loss
-aux_safety_weight: 0.01             # Safety auxiliary loss
-aux_agent_collision_weight: 0.02    # Agent collision auxiliary loss
-soft_cost_weight: 0.1               # Soft cost for Cost Critic training
+aux_task_potential_weight: 0.005    # Task potential auxiliary loss
+aux_barrier_potential_weight: 0.005 # Barrier potential auxiliary loss
+aux_safety_weight: 0.002            # Safety auxiliary loss
+aux_agent_collision_weight: 0.005   # Agent collision auxiliary loss
+aux_loss_scale: 0.2                 # Global aux loss scale
+aux_warmup_steps: 4000              # Aux warmup steps
+soft_cost_weight: 0.0               # Soft cost for Cost Critic training
+soft_cost_warmup_steps: 4000        # Soft cost warmup steps
+soft_cost_start: 6000               # Soft cost start step
 
 # ==================================================
 # Video Recording

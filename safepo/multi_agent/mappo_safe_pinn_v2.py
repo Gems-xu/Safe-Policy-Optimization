@@ -112,12 +112,13 @@ class MAPPOSafePINNv2Policy:
     - Actions emerge from physical principles, not just physics-informed features
     """
 
-    def __init__(self, config, obs_space, cent_obs_space, act_space, n_agents=1):
+    def __init__(self, config, obs_space, cent_obs_space, act_space, n_agents=1, agent_id=0):
         self.config = config
         self.obs_space = obs_space
         self.act_space = act_space
         self.share_obs_space = cent_obs_space
         self.n_agents = n_agents
+        self.agent_id = agent_id
 
         # Use new PHS-MAPPO Actor with embedded physics
         self.actor = PHSMAPPOActor(
@@ -125,7 +126,8 @@ class MAPPOSafePINNv2Policy:
             self.obs_space, 
             self.act_space, 
             self.config["device"],
-            n_agents=n_agents
+            n_agents=n_agents,
+            agent_id=agent_id  # Pass agent_id so it knows which goal to focus on
         )
         
         # Standard Critic for reward
@@ -219,6 +221,8 @@ class MAPPOSafePINNv2Trainer:
         self.aux_barrier_potential_weight = config.get("aux_barrier_potential_weight", 0.02)
         self.aux_safety_weight = config.get("aux_safety_weight", 0.01)
         self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.02)
+        self.aux_loss_scale = config.get("aux_loss_scale", 0.5)
+        self.aux_warmup_steps = config.get("aux_warmup_steps", 2000)
         
         # Lagrangian parameters
         self.lamda_lagr = config.get("lamda_lagr", 0.5)
@@ -227,9 +231,34 @@ class MAPPOSafePINNv2Trainer:
         
         # Soft cost for Cost Critic training
         self.soft_cost_weight = config.get("soft_cost_weight", 0.1)
+        self.soft_cost_warmup_steps = config.get("soft_cost_warmup_steps", 2000)
+        self.soft_cost_start = config.get("soft_cost_start", 0)
         
         # Training step counter for barrier warmup
         self._training_step = 0
+
+    def _get_aux_loss_scale(self):
+        """Scale auxiliary losses to avoid over-regularization early in training."""
+        if self.aux_warmup_steps <= 0:
+            return self.aux_loss_scale
+
+        if self._training_step < self.aux_warmup_steps:
+            ratio = self._training_step / float(self.aux_warmup_steps)
+            return self.aux_loss_scale * ratio
+
+        return self.aux_loss_scale
+
+    def _get_soft_cost_weight(self):
+        """Gradually enable soft cost to avoid double-penalizing early."""
+        if self._training_step < self.soft_cost_start:
+            return 0.0
+
+        if self.soft_cost_warmup_steps <= 0:
+            return self.soft_cost_weight
+
+        warmup_progress = (self._training_step - self.soft_cost_start) / float(self.soft_cost_warmup_steps)
+        warmup_progress = max(0.0, min(1.0, warmup_progress))
+        return self.soft_cost_weight * warmup_progress
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(
@@ -296,6 +325,8 @@ class MAPPOSafePINNv2Trainer:
             self.aux_safety_weight * safety_loss +
             self.aux_agent_collision_weight * agent_collision_loss
         )
+
+        aux_loss = aux_loss * self._get_aux_loss_scale()
         
         aux_info = {
             'aux_task_loss': task_potential_loss.item(),
@@ -309,6 +340,7 @@ class MAPPOSafePINNv2Trainer:
             'k_std': k.std().item(),
             'hazard_proximity_mean': hazard_proximity.mean().item(),
             'agent_proximity_mean': agent_proximity.mean().item() if agent_lidar_start < agent_lidar_end else 0.0,
+            'aux_loss_scale': self._get_aux_loss_scale(),
         }
         
         return aux_loss, aux_info
@@ -466,6 +498,8 @@ class MAPPOSafePINNv2Trainer:
             "Safe/cost_violation": aux_info.get('cost_violation', 0.0),
             "Safe/barrier_weight": self.policy.actor._get_current_barrier_weight(),
             "Safe/training_step": self._training_step,
+            "Safe/aux_loss_scale": aux_info.get('aux_loss_scale', 0.0),
+            "Safe/soft_cost_weight": self._get_soft_cost_weight(),
             "Misc/Reward_critic_norm": critic_grad_norm.item(),
             "Misc/Entropy": dist_entropy.item(),
             "Misc/Ratio": imp_weights.detach().mean().item(),
@@ -537,7 +571,8 @@ class Runner:
                 self.envs.observation_space[agent_id],
                 share_observation_space,
                 self.envs.action_space[agent_id],
-                n_agents=self.num_agents
+                n_agents=self.num_agents,
+                agent_id=agent_id  # Each agent knows its own ID
             )
             self.policy.append(po)
 
@@ -791,7 +826,7 @@ class Runner:
             (dones_env == True).sum(), self.num_agents, 1, device=self.config["device"]
         )
 
-        soft_cost_weight = self.trainer[0].soft_cost_weight
+        soft_cost_weight = self.trainer[0]._get_soft_cost_weight()
         
         for agent_id in range(self.num_agents):
             if 'Frank' in self.config['env_name']:
@@ -1029,14 +1064,6 @@ class Runner:
                     eval_masks[:, agent_id],
                     deterministic=True
                 )
-                
-                # Small noise on rotation for symmetry breaking
-                if eval_actions.shape[-1] >= 2:
-                    rotation_noise = torch.randn(
-                        eval_actions.shape[0], 1, device=eval_actions.device
-                    ) * 0.03 * (agent_id + 1)
-                    eval_actions = eval_actions.clone()
-                    eval_actions[:, 1:2] = eval_actions[:, 1:2] + rotation_noise
                 
                 eval_rnn_states[:, agent_id] = temp_rnn_state
                 eval_actions_collector.append(eval_actions)

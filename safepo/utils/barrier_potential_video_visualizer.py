@@ -179,75 +179,100 @@ class BarrierPotentialVideoVisualizer:
         self,
         obstacle_positions: Optional[np.ndarray] = None,
         agent_positions: Optional[np.ndarray] = None,
+        current_agent_idx: Optional[int] = None,
     ) -> np.ndarray:
         """
-        Compute barrier potential field analytically (faster, uses distance-based formula).
+        Compute barrier potential field analytically (v5.0 - Highly Localized).
         
         This method directly computes the barrier potential from distances without
-        going through the neural network, providing a faster visualization.
+        going through the neural network, matching the actor's exponential formula.
         
-        H_barrier = k / ((d - r_safe)^2 + ε)
+        Key Features (v5.0):
+        - Far from obstacle (proximity < 0.75): H = 0 (white)
+        - Near obstacle edge (0.75 < proximity < 0.85): H = 0~3 (yellow)
+        - Close to obstacle (0.85 < proximity < 0.95): H = 3~6 (orange/red)  
+        - At obstacle center (proximity > 0.95): H = 6~10 (black)
+        - Other agents are treated as dynamic obstacles with smaller radius
         
         Args:
             obstacle_positions: Obstacle/hazard positions, shape (n_obstacles, 2)
-            agent_positions: Agent positions, shape (n_agents, 2)
+            agent_positions: Agent positions (treated as dynamic obstacles), shape (n_agents, 2)
+            current_agent_idx: Index of the agent for which we're computing potential
+                              (that agent is excluded from repellers). If None, all agents are repellers.
             
         Returns:
             potential_field: 2D numpy array of shape (grid_resolution, grid_resolution)
         """
         potential_field = np.zeros((self.grid_resolution, self.grid_resolution))
         
-        # Get barrier parameters from actor if available (v4.0 - proximity-based)
-        if self.actor is not None:
-            r_safe = getattr(self.actor, 'r_safe', 0.3)
-            barrier_epsilon = getattr(self.actor, 'barrier_epsilon', 0.01)
-            barrier_k = getattr(self.actor, 'barrier_k_scale', 2.0)
-            barrier_decay_rate = getattr(self.actor, 'barrier_decay_rate', 2.0)
-            barrier_clip_max = getattr(self.actor, 'barrier_clip_max', 10.0)
-        else:
-            r_safe = 0.3
-            barrier_epsilon = 0.01
-            barrier_k = 2.0
-            barrier_decay_rate = 2.0
-            barrier_clip_max = 10.0
+        # v5.0 parameters (must match phs_mappo_actor.py)
+        activation_threshold = 0.75  # Only activate when very close
+        alpha = 4.0  # Exponential growth rate (smoother)
+        scale = 10.0  # Maximum barrier value at center
         
         # Define lidar range (matches safety_gymnasium pseudo lidar)
         max_lidar_dist = 3.0  # Maximum lidar detection distance
         
-        # Combine obstacles and agents as repellers
-        all_repellers = []
-        if obstacle_positions is not None and len(obstacle_positions) > 0:
-            all_repellers.extend(obstacle_positions)
-        if agent_positions is not None and len(agent_positions) > 0:
-            all_repellers.extend(agent_positions)
+        # Agent collision radius (smaller than obstacle hazard radius)
+        agent_radius = 0.17  # r_collision from actor config
         
-        if len(all_repellers) == 0:
+        # Collect all repellers with their radii
+        repellers = []  # List of (position, radius)
+        
+        # Static obstacles (hazards)
+        if obstacle_positions is not None and len(obstacle_positions) > 0:
+            for pos in obstacle_positions:
+                repellers.append((np.array(pos), self.hazard_radius))
+        
+        # Other agents as dynamic obstacles
+        if agent_positions is not None and len(agent_positions) > 0:
+            for idx, pos in enumerate(agent_positions):
+                # Skip current agent (don't treat self as obstacle)
+                if current_agent_idx is not None and idx == current_agent_idx:
+                    continue
+                repellers.append((np.array(pos), agent_radius))
+        
+        if len(repellers) == 0:
             return potential_field
         
-        all_repellers = np.array(all_repellers)
+        # Precompute exp(alpha)
+        exp_alpha = np.exp(alpha)
+        
+        # Effective range after threshold
+        effective_range = 1.0 - activation_threshold  # 0.25
         
         # Vectorized computation over grid
         for i in range(self.grid_resolution):
             for j in range(self.grid_resolution):
                 pos = np.array([self.X[i, j], self.Y[i, j]])
                 
-                # Distance to all repellers (minus hazard radius)
-                dists = np.linalg.norm(all_repellers - pos, axis=1) - self.hazard_radius
-                min_dist = np.min(np.maximum(dists, 0.01))
+                # Find minimum distance considering each repeller's radius
+                min_dist = float('inf')
+                for rep_pos, rep_radius in repellers:
+                    dist = np.linalg.norm(rep_pos - pos) - rep_radius
+                    min_dist = min(min_dist, max(dist, 0.0))
                 
-                # v4.0: Convert distance to proximity (like lidar)
-                # proximity = 1 - (dist / max_range), clamped to [0, 1]
-                # Higher proximity = closer = more dangerous
+                # Convert distance to proximity (like lidar)
+                # proximity = 1 when at obstacle surface, 0 when far away
                 proximity = np.clip(1.0 - min_dist / max_lidar_dist, 0.0, 1.0)
                 
-                # v4.0: Proximity-based barrier formula (matches actor)
-                # H_barrier = k * proximity^decay_rate / (safety_margin + ε)
-                safety_margin = np.maximum(1.0 - proximity, 0.01)
-                numerator = np.power(proximity + 0.01, barrier_decay_rate)
-                H_barrier = barrier_k * numerator / (safety_margin + barrier_epsilon)
-                
-                # Clip like actor does
-                H_barrier = np.minimum(H_barrier, barrier_clip_max)
+                # v5.0: Highly localized exponential barrier (matches actor)
+                if proximity < activation_threshold:
+                    # Far from obstacle: zero potential (white in visualization)
+                    H_barrier = 0.0
+                else:
+                    # Shift and normalize proximity to [0, 1] range
+                    shifted_proximity = np.clip(
+                        (proximity - activation_threshold) / effective_range,
+                        0.0, 1.0
+                    )
+                    
+                    # Exponential barrier: H = scale * (exp(α * shifted) - 1) / (exp(α) - 1)
+                    exp_term = np.exp(np.minimum(alpha * shifted_proximity, 8.0))
+                    H_barrier = scale * (exp_term - 1.0) / (exp_alpha - 1.0)
+                    
+                    # Clamp to max scale
+                    H_barrier = np.minimum(H_barrier, scale)
                 
                 potential_field[i, j] = H_barrier
         
