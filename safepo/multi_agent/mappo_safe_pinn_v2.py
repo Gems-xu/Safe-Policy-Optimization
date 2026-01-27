@@ -223,11 +223,27 @@ class MAPPOSafePINNv2Trainer:
         self.aux_agent_collision_weight = config.get("aux_agent_collision_weight", 0.02)
         self.aux_loss_scale = config.get("aux_loss_scale", 0.5)
         self.aux_warmup_steps = config.get("aux_warmup_steps", 2000)
+        self.aux_cost_value_weight = config.get("aux_cost_value_weight", 0.05)
+        self.aux_cost_k_weight = config.get("aux_cost_k_weight", 0.02)
+        self.cost_value_scale = config.get("cost_value_scale", 10.0)
+
+        # Decouple Barrier PHS from Lagrange learning
+        self.decouple_barrier_lagrange = config.get("decouple_barrier_lagrange", True)
+        if self.decouple_barrier_lagrange:
+            self.aux_barrier_potential_weight = 0.0
+            self.aux_safety_weight = 0.0
+            self.aux_agent_collision_weight = 0.0
+            self.aux_cost_value_weight = 0.0
+            self.aux_cost_k_weight = 0.0
         
         # Lagrangian parameters
         self.lamda_lagr = config.get("lamda_lagr", 0.5)
         self.lamda_lagr_min = config.get("lamda_lagr_min", 0.1)
         self.lamda_lagr_max = config.get("lamda_lagr_max", 5.0)
+        self.lagrangian_update_interval = config.get("lagrangian_update_interval", 10)
+        self.lagrangian_ema_alpha = config.get("lagrangian_ema_alpha", 0.9)
+        self.lagrangian_slow_rate = config.get("lagrangian_slow_rate", 0.005)
+        self._ema_cost = None
         
         # Soft cost for Cost Critic training
         self.soft_cost_weight = config.get("soft_cost_weight", 0.1)
@@ -273,7 +289,7 @@ class MAPPOSafePINNv2Trainer:
         value_loss = torch.max(value_loss_original, value_loss_clipped)
         return value_loss.mean()
 
-    def compute_auxiliary_physics_loss(self, obs_batch):
+    def compute_auxiliary_physics_loss(self, obs_batch, cost_values=None):
         """
         Compute auxiliary losses for PHS potential networks.
         
@@ -318,12 +334,26 @@ class MAPPOSafePINNv2Trainer:
         else:
             agent_collision_loss = torch.tensor(0.0, device=device)
         
+        # Cost critic guidance (disabled when decoupled)
+        cost_guidance_loss = torch.tensor(0.0, device=device)
+        cost_k_loss = torch.tensor(0.0, device=device)
+        if (not self.decouple_barrier_lagrange) and cost_values is not None:
+            cost_target = torch.sigmoid(cost_values.detach() / self.cost_value_scale)
+            H_barrier_norm = torch.sigmoid(H_barrier / 5.0)
+            cost_guidance_loss = F.mse_loss(H_barrier_norm, cost_target)
+
+            # Encourage stiffness to rise where cost is predicted high
+            target_k_cost = 0.3 + cost_target * 2.0
+            cost_k_loss = F.mse_loss(k, target_k_cost)
+
         # Combined auxiliary loss
         aux_loss = (
             self.aux_task_potential_weight * task_potential_loss +
             self.aux_barrier_potential_weight * barrier_k_loss +
             self.aux_safety_weight * safety_loss +
-            self.aux_agent_collision_weight * agent_collision_loss
+            self.aux_agent_collision_weight * agent_collision_loss +
+            self.aux_cost_value_weight * cost_guidance_loss +
+            self.aux_cost_k_weight * cost_k_loss
         )
 
         aux_loss = aux_loss * self._get_aux_loss_scale()
@@ -333,6 +363,8 @@ class MAPPOSafePINNv2Trainer:
             'aux_barrier_k_loss': barrier_k_loss.item(),
             'aux_safety_loss': safety_loss.item(),
             'aux_agent_collision_loss': agent_collision_loss.item() if isinstance(agent_collision_loss, torch.Tensor) else 0.0,
+            'aux_cost_value_loss': cost_guidance_loss.item() if isinstance(cost_guidance_loss, torch.Tensor) else 0.0,
+            'aux_cost_k_loss': cost_k_loss.item() if isinstance(cost_k_loss, torch.Tensor) else 0.0,
             'H_task_mean': H_task.mean().item(),
             'H_task_std': H_task.std().item(),
             'H_barrier_mean': H_barrier.mean().item(),
@@ -397,7 +429,10 @@ class MAPPOSafePINNv2Trainer:
         policy_loss = policy_action_loss
         
         # Compute auxiliary physics loss
-        aux_loss, aux_info = self.compute_auxiliary_physics_loss(check(obs_batch).to(**self.tpdv))
+        aux_loss, aux_info = self.compute_auxiliary_physics_loss(
+            check(obs_batch).to(**self.tpdv),
+            cost_values=cost_values
+        )
 
         # Actor update
         self.policy.actor_optimizer.zero_grad()
@@ -408,20 +443,28 @@ class MAPPOSafePINNv2Trainer:
         )
         self.policy.actor_optimizer.step()
 
-        # Update Lagrangian multiplier
+        # Update Lagrangian multiplier (smoothed dual ascent)
         cost_limit = self.config.get("cost_limit", 25.0)
-        lagr_rate = self.config.get("lagrangian_coef_rate", 0.01)
-        cost_violation = aver_episode_costs.mean() - cost_limit
-        
-        if cost_violation.item() > 2.0:
-            delta_lamda = lagr_rate * cost_violation.item() * 0.1
-            self.lamda_lagr = min(self.lamda_lagr_max, self.lamda_lagr + delta_lamda)
-        elif cost_violation.item() < -5.0:
-            delta_lamda = lagr_rate * abs(cost_violation.item()) * 0.05
-            self.lamda_lagr = max(self.lamda_lagr_min, self.lamda_lagr - delta_lamda)
+        current_cost = aver_episode_costs.mean().item()
+        if self._ema_cost is None:
+            self._ema_cost = current_cost
+        else:
+            self._ema_cost = (
+                self.lagrangian_ema_alpha * self._ema_cost
+                + (1.0 - self.lagrangian_ema_alpha) * current_cost
+            )
+
+        cost_violation = self._ema_cost - cost_limit
+        if self._training_step % self.lagrangian_update_interval == 0:
+            delta_lamda = self.lagrangian_slow_rate * cost_violation
+            self.lamda_lagr = float(np.clip(
+                self.lamda_lagr + delta_lamda,
+                self.lamda_lagr_min,
+                self.lamda_lagr_max
+            ))
         
         aux_info['lamda_lagr'] = self.lamda_lagr
-        aux_info['cost_violation'] = cost_violation.item() if isinstance(cost_violation, torch.Tensor) else cost_violation
+        aux_info['cost_violation'] = cost_violation
 
         # Reward critic update
         value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
@@ -487,6 +530,8 @@ class MAPPOSafePINNv2Trainer:
             "Loss/Aux_barrier_k": aux_info['aux_barrier_k_loss'],
             "Loss/Aux_safety": aux_info['aux_safety_loss'],
             "Loss/Aux_agent_collision": aux_info.get('aux_agent_collision_loss', 0.0),
+            "Loss/Aux_cost_value": aux_info.get('aux_cost_value_loss', 0.0),
+            "Loss/Aux_cost_k": aux_info.get('aux_cost_k_loss', 0.0),
             "Safe/H_task_mean": aux_info['H_task_mean'],
             "Safe/H_task_std": aux_info['H_task_std'],
             "Safe/H_barrier_mean": aux_info['H_barrier_mean'],

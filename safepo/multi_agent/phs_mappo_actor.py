@@ -335,6 +335,10 @@ class PHSMAPPOActor(nn.Module):
         self.barrier_decay_start = config.get("barrier_decay_start", 5000)
         self.barrier_decay_rate = config.get("barrier_decay_rate", 0.95)
         self._training_step = 0
+
+        # Decouple Barrier PHS from Lagrange learning
+        self.decouple_barrier_lagrange = config.get("decouple_barrier_lagrange", True)
+        self.phs_prior_weight = config.get("phs_prior_weight", 0.3)
         
         # Multi-agent scaling
         self.auto_scale_by_agents = config.get("auto_scale_by_agents", True)
@@ -500,6 +504,12 @@ class PHSMAPPOActor(nn.Module):
         self._init_weights()
         
         self.to(device)
+
+        # Freeze barrier networks when decoupled
+        if self.decouple_barrier_lagrange:
+            for net in (self.obstacle_k_net, self.barrier_shape_net, self.H_barrier_head):
+                for param in net.parameters():
+                    param.requires_grad_(False)
         
     def _init_base_phs_matrices(self):
         """Initialize base PHS system matrices with standard Hamiltonian structure."""
@@ -1020,8 +1030,18 @@ class PHSMAPPOActor(nn.Module):
         residual = self.residual_mlp(state_features_flat)
         residual_w = torch.sigmoid(self.residual_weight) * 0.3  # Small exploration
         
-        # Final action in body frame [forward, turn] 
-        u_body = policy_output + residual_w * residual
+        # ========== 3. PHS Safety Prior (no gradient) ==========
+        phs_prior = torch.zeros_like(policy_output)
+        if self.phs_prior_weight > 0:
+            if is_multi_agent:
+                _, grad_H_vel, _ = self._compute_hamiltonian_gradient(obs, state_features, laplacian)
+                grad_H_vel = grad_H_vel.view(batch_size * n_agents, -1)
+            else:
+                _, grad_H_vel, _ = self._compute_hamiltonian_gradient(obs, state_features, laplacian)
+            phs_prior = -grad_H_vel.detach()
+
+        # Final action in body frame [forward, turn]
+        u_body = policy_output + residual_w * residual + self.phs_prior_weight * phs_prior
         
         # ========== 4. Convert to Agent-Specific Action Space ==========
         if self.agent_type == "car":
