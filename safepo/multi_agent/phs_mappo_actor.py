@@ -323,6 +323,12 @@ class PHSMAPPOActor(nn.Module):
         self.r_collision = config.get("r_collision", 0.17)  # Collision radius
         self.r_communication = config.get("r_communication", 0.45)  # Communication radius
         self.barrier_epsilon = config.get("barrier_epsilon", 0.06)  # Numerical stability
+        self.fixed_barrier_potential = config.get("fixed_barrier_potential", True)
+        self.obstacle_barrier_k = config.get("obstacle_barrier_k", 1.0)
+        self.obstacle_barrier_alpha = config.get("obstacle_barrier_alpha", 4.0)
+        self.obstacle_barrier_threshold = config.get("obstacle_barrier_threshold", 0.75)
+        self.obstacle_barrier_scale = config.get("obstacle_barrier_scale", 10.0)
+        self.agent_barrier_k = config.get("agent_barrier_k", 1.2)
         
         # Potential weights (v7.4 - Immediate barrier activation)
         self.task_weight = config.get("task_weight", 1.0)
@@ -338,7 +344,9 @@ class PHSMAPPOActor(nn.Module):
 
         # Decouple Barrier PHS from Lagrange learning
         self.decouple_barrier_lagrange = config.get("decouple_barrier_lagrange", True)
-        self.phs_prior_weight = config.get("phs_prior_weight", 0.3)
+        self.phs_prior_weight = config.get("phs_prior_weight", 0.0)
+        self.phs_goal_guidance_weight = config.get("phs_goal_guidance_weight", 0.35)
+        self.phs_barrier_guidance_weight = config.get("phs_barrier_guidance_weight", 0.15)
         
         # Multi-agent scaling
         self.auto_scale_by_agents = config.get("auto_scale_by_agents", True)
@@ -505,8 +513,8 @@ class PHSMAPPOActor(nn.Module):
         
         self.to(device)
 
-        # Freeze barrier networks when decoupled
-        if self.decouple_barrier_lagrange:
+        # Freeze barrier networks when decoupled or fixed barrier potential
+        if self.decouple_barrier_lagrange or self.fixed_barrier_potential:
             for net in (self.obstacle_k_net, self.barrier_shape_net, self.H_barrier_head):
                 for param in net.parameters():
                     param.requires_grad_(False)
@@ -689,20 +697,13 @@ class PHSMAPPOActor(nn.Module):
     
     def _compute_obstacle_barrier(self, obs):
         """
-        Compute obstacle barrier potential using learnable exponential barrier.
+        Compute obstacle barrier potential using fixed exponential barrier.
         
         H_barrier = k * (exp(α * proximity) - 1) only when proximity > threshold
         
-        Key Features (v5.1 - Learnable Structure):
-        - Base parameters: activation_threshold=0.75, alpha=4.0, scale=10.0
-        - k (stiffness): Learned from obstacle_k_net(obs)
-        - alpha (shape): Modulated by barrier_shape_net(obs) for adaptive steepness
-        - threshold: Slightly modulated for context-dependent activation
-        
-        This allows the barrier to adapt its shape based on the current observation,
-        not just its magnitude. The agent learns WHEN and HOW STRONGLY to avoid.
-        
-        Where proximity = max(hazard_lidar) (1 = contact, 0 = far away).
+        Fixed Structure (Barrier PHS Actor):
+        - k, alpha, threshold, scale are constants
+        - No learnable shape or stiffness
         """
         # Extract hazard lidar
         hazard_end = min(self.hazard_lidar_end, obs.shape[-1])
@@ -711,24 +712,19 @@ class PHSMAPPOActor(nn.Module):
         # Max proximity (higher = closer = more dangerous)
         max_proximity = hazard_lidar.max(dim=-1, keepdim=True)[0]
         
-        # Get adaptive stiffness k from network
-        k = self.obstacle_k_net(obs)  # [batch, ..., 1]
-        k_base = torch.clamp(k * 0.5 + 0.75, min=0.5, max=1.5)
-        
-        # Get learnable shape parameters (alpha_mod, threshold_mod) in [-1, 1]
-        shape_params = self.barrier_shape_net(obs)  # [batch, ..., 2]
-        alpha_mod = shape_params[..., 0:1]      # Modulates alpha (steepness)
-        threshold_mod = shape_params[..., 1:2]  # Modulates activation threshold
-        
-        # Base parameters
-        base_alpha = 4.0
-        base_threshold = 0.75
-        scale = 10.0
-        
-        # Modulated parameters (allow ±30% variation)
-        alpha = base_alpha * (1.0 + 0.3 * alpha_mod)  # [2.8, 5.2]
-        activation_threshold = base_threshold + 0.05 * threshold_mod  # [0.70, 0.80]
+        # Fixed parameters (no learning)
+        k_base = torch.tensor(self.obstacle_barrier_k, device=obs.device, dtype=obs.dtype)
+        k_base = k_base.view(*([1] * (max_proximity.dim() - 1)), 1)
+
+        alpha = torch.tensor(self.obstacle_barrier_alpha, device=obs.device, dtype=obs.dtype)
+        alpha = alpha.view(*([1] * (max_proximity.dim() - 1)), 1)
+
+        activation_threshold = torch.tensor(self.obstacle_barrier_threshold, device=obs.device, dtype=obs.dtype)
+        activation_threshold = activation_threshold.view(*([1] * (max_proximity.dim() - 1)), 1)
         activation_threshold = torch.clamp(activation_threshold, min=0.65, max=0.85)
+
+        scale = torch.tensor(self.obstacle_barrier_scale, device=obs.device, dtype=obs.dtype)
+        scale = scale.view(*([1] * (max_proximity.dim() - 1)), 1)
         
         # Normalized proximity range after threshold
         effective_range = 1.0 - activation_threshold  # ~0.20-0.35
@@ -742,14 +738,14 @@ class PHSMAPPOActor(nn.Module):
         # Exponential barrier: H = scale * (exp(α * shifted) - 1) / (exp(α) - 1)
         exp_term = torch.exp(torch.clamp(alpha * shifted_proximity, max=8.0))
         exp_alpha = torch.exp(torch.clamp(alpha, max=8.0))
-        
+
         H_barrier = k_base * scale * (exp_term - 1.0) / (exp_alpha - 1.0 + 1e-6)
         
         # Explicitly zero out where proximity is below activation threshold
         H_barrier = torch.where(max_proximity < activation_threshold, torch.zeros_like(H_barrier), H_barrier)
         
         # Clamp to reasonable range and check for NaN
-        H_barrier = torch.clamp(H_barrier, min=0.0, max=scale)
+        H_barrier = torch.clamp(H_barrier, min=0.0, max=float(self.obstacle_barrier_scale))
         H_barrier = torch.where(torch.isnan(H_barrier), torch.zeros_like(H_barrier), H_barrier)
         
         return H_barrier
@@ -770,8 +766,9 @@ class PHSMAPPOActor(nn.Module):
         
         n_agents = obs.shape[1]
         
-        # Get pairwise stiffness from SoftBarrierHead
-        k_ij = self.H_barrier_head(state_features, laplacian)  # [batch, n_agents, n_agents]
+        # Fixed pairwise stiffness (no learning)
+        k_val = torch.tensor(self.agent_barrier_k, device=obs.device, dtype=obs.dtype)
+        k_ij = k_val * laplacian
         
         # Extract agent lidar for distance estimation
         agent_lidar_end = min(self.agent_lidar_end, obs.shape[-1])
@@ -831,7 +828,7 @@ class PHSMAPPOActor(nn.Module):
         R = R + 0.01 * torch.eye(self.state_dim, device=self.device).unsqueeze(0)
         return R
     
-    def _compute_hamiltonian_gradient(self, obs, state_features, laplacian):
+    def _compute_hamiltonian_gradient(self, obs, state_features, laplacian, detach=True):
         """
         Compute total Hamiltonian and its gradient via automatic differentiation.
         
@@ -892,13 +889,32 @@ class PHSMAPPOActor(nn.Module):
         # Extract gradient w.r.t. velocity (indices 3,4) as 2D action gradient
         grad_H_vel = grad_H[..., self.vel_indices]  # [batch, ..., 2]
         
-        return H_total.detach(), grad_H_vel.detach(), {
-            'H_goal': H_goal.detach(),
-            'H_task_learned': H_task_learned.detach(),
-            'H_task': H_task.detach(),
-            'H_kin': H_kin.detach(),
-            'H_barrier_obs': H_barrier_obs.detach(),
-            'H_barrier_agent': H_barrier_agent.detach() if is_multi_agent else None,
+        if detach:
+            H_total_out = H_total.detach()
+            grad_H_vel_out = grad_H_vel.detach()
+            H_goal_out = H_goal.detach()
+            H_task_learned_out = H_task_learned.detach()
+            H_task_out = H_task.detach()
+            H_kin_out = H_kin.detach()
+            H_barrier_obs_out = H_barrier_obs.detach()
+            H_barrier_agent_out = H_barrier_agent.detach() if is_multi_agent else None
+        else:
+            H_total_out = H_total
+            grad_H_vel_out = grad_H_vel
+            H_goal_out = H_goal
+            H_task_learned_out = H_task_learned
+            H_task_out = H_task
+            H_kin_out = H_kin
+            H_barrier_obs_out = H_barrier_obs
+            H_barrier_agent_out = H_barrier_agent if is_multi_agent else None
+
+        return H_total_out, grad_H_vel_out, {
+            'H_goal': H_goal_out,
+            'H_task_learned': H_task_learned_out,
+            'H_task': H_task_out,
+            'H_kin': H_kin_out,
+            'H_barrier_obs': H_barrier_obs_out,
+            'H_barrier_agent': H_barrier_agent_out,
             'barrier_weight': current_barrier_weight
         }
     
@@ -993,18 +1009,14 @@ class PHSMAPPOActor(nn.Module):
     
     def _compute_phs_action(self, obs, state_features, laplacian):
         """
-        Compute action using v8.1 architecture: Pure Learnable Policy with PHS Features.
+        Compute action using Barrier PHS Actor (true port-Hamiltonian action mapping).
         
-        v8.1 Architecture Change:
-            - PHS gradients are used as INPUT FEATURES, not output bias
-            - policy_net is the SOLE action generator (full RL control)
-            - This matches standard RL while still using physics information
+        Action generation:
+            dx_target = π_θ([features]) + guidance
+            dx = (J - R) ∇H_total + F * a
+            a = F^+ (dx_target - (J - R) ∇H_total)
         
-        Formula:
-            features = [state_features, goal_grad, barrier_grad]
-            action = policy_net(features)  # Direct, no mixing
-        
-        This ensures clean gradient flow and standard RL optimization.
+        This injects Barrier PHS structure directly into action generation.
         """
         batch_size = obs.shape[0]
         is_multi_agent = obs.dim() == 3
@@ -1018,30 +1030,48 @@ class PHSMAPPOActor(nn.Module):
             state_features_flat = state_features
             n_agents = 1
         
-        # ========== 1. Compute PHS Directional Gradients (as features) ==========
+        # ========== 1. Compute Directional Gradients (as features + guidance) ==========
         goal_grad, barrier_grad, goal_prox, hazard_prox = self._compute_directional_gradient(obs_flat)
-        
-        # ========== 2. DIRECT POLICY OUTPUT (v8.1) ==========
-        # policy_net takes physics-informed features and directly outputs action
+
+        # ========== 2. Policy Output (desired state change) ==========
         policy_input = torch.cat([state_features_flat, goal_grad, barrier_grad], dim=-1)
         policy_output = self.policy_net(policy_input)  # [batch, act_dim]
-        
-        # ========== 3. Simple Exploration Residual ==========
-        residual = self.residual_mlp(state_features_flat)
-        residual_w = torch.sigmoid(self.residual_weight) * 0.3  # Small exploration
-        
-        # ========== 3. PHS Safety Prior (no gradient) ==========
-        phs_prior = torch.zeros_like(policy_output)
-        if self.phs_prior_weight > 0:
-            if is_multi_agent:
-                _, grad_H_vel, _ = self._compute_hamiltonian_gradient(obs, state_features, laplacian)
-                grad_H_vel = grad_H_vel.view(batch_size * n_agents, -1)
-            else:
-                _, grad_H_vel, _ = self._compute_hamiltonian_gradient(obs, state_features, laplacian)
-            phs_prior = -grad_H_vel.detach()
 
-        # Final action in body frame [forward, turn]
-        u_body = policy_output + residual_w * residual + self.phs_prior_weight * phs_prior
+        residual = self.residual_mlp(state_features_flat)
+        residual_w = torch.sigmoid(self.residual_weight) * 0.3
+
+        # Guidance encourages goal progress and basic avoidance
+        dx_guidance = (
+            self.phs_goal_guidance_weight * goal_grad +
+            self.phs_barrier_guidance_weight * barrier_grad
+        )
+
+        dx_target_body = policy_output + residual_w * residual + dx_guidance
+
+        # ========== 3. PHS Drift (Barrier + Task) ==========
+        if is_multi_agent:
+            H_total, grad_H_vel, H_info = self._compute_hamiltonian_gradient(
+                obs, state_features, laplacian, detach=False
+            )
+            grad_H_vel = grad_H_vel.view(batch_size * n_agents, -1)
+        else:
+            H_total, grad_H_vel, H_info = self._compute_hamiltonian_gradient(
+                obs, state_features, laplacian, detach=False
+            )
+
+        # Assemble gradient in state space (pos part = 0, vel part = grad_H_vel)
+        grad_H_state = torch.zeros(dx_target_body.shape[0], self.state_dim, device=obs.device, dtype=obs.dtype)
+        grad_H_state[:, -self.act_dim:] = grad_H_vel
+
+        J_R = self.J_sys - self.R_sys
+        phs_drift = torch.matmul(J_R, grad_H_state.unsqueeze(-1)).squeeze(-1)
+
+        # Desired state change in state space
+        dx_target_state = torch.zeros_like(grad_H_state)
+        dx_target_state[:, :self.act_dim] = dx_target_body
+
+        # Compute port action a via pseudo-inverse of F
+        u_body = torch.matmul(self.F_pinv, (dx_target_state - phs_drift).unsqueeze(-1)).squeeze(-1)
         
         # ========== 4. Convert to Agent-Specific Action Space ==========
         if self.agent_type == "car":
@@ -1067,14 +1097,8 @@ class PHSMAPPOActor(nn.Module):
         
         # ========== 6. Logging Info ==========
         barrier_weight = self._get_current_barrier_weight()
-        
-        H_info = {
-            'H_goal': self._compute_goal_potential(obs).detach(),
-            'H_task_learned': torch.zeros(batch_size, 1, device=obs.device),
-            'H_task': self._compute_goal_potential(obs).detach(),
-            'H_kin': self._compute_kinetic_energy(obs).detach(),
-            'H_barrier_obs': self._compute_obstacle_barrier(obs).detach(),
-            'H_barrier_agent': None,
+
+        H_info.update({
             'barrier_weight': barrier_weight,
             'goal_prox': goal_prox.mean().item(),
             'hazard_prox': hazard_prox.mean().item(),
@@ -1082,7 +1106,8 @@ class PHSMAPPOActor(nn.Module):
             'policy_output_mean': policy_output.mean().item(),
             'goal_grad_forward': goal_grad[:, 0].mean().item(),
             'goal_grad_turn': goal_grad[:, 1].mean().item(),
-        }
+            'dx_target_mean': dx_target_body.mean().item(),
+        })
         
         return u_mean, H_info, state_features
     
@@ -1295,7 +1320,11 @@ class PHSMAPPOActor(nn.Module):
         obs_dir_x = (weights * torch.cos(angles)).sum(dim=-1, keepdim=True) / weights_sum
         obs_dir_y = (weights * torch.sin(angles)).sum(dim=-1, keepdim=True) / weights_sum
         
-        k = self.obstacle_k_net(obs)
+        if self.fixed_barrier_potential:
+            k = torch.tensor(self.obstacle_barrier_k, device=obs.device, dtype=obs.dtype)
+            k = k.view(*([1] * (hazard_lidar.dim() - 1)), 1)
+        else:
+            k = self.obstacle_k_net(obs)
         grad_mag = k * 5.0 * hazard_lidar.max(dim=-1, keepdim=True)[0]
         
         grad_H = torch.cat([-grad_mag * obs_dir_x, -grad_mag * obs_dir_y], dim=-1)
@@ -1328,3 +1357,10 @@ class PHSMAPPOActor(nn.Module):
     def barrier_k_net(self):
         """Compatibility alias for obstacle_k_net."""
         return self.obstacle_k_net
+
+    def get_obstacle_k(self, obs):
+        """Return obstacle stiffness (fixed or learnable)."""
+        if self.fixed_barrier_potential:
+            k = torch.tensor(self.obstacle_barrier_k, device=obs.device, dtype=obs.dtype)
+            return k.view(*([1] * (obs.dim() - 1)), 1)
+        return self.obstacle_k_net(obs)

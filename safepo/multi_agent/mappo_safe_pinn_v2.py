@@ -240,9 +240,9 @@ class MAPPOSafePINNv2Trainer:
         self.lamda_lagr = config.get("lamda_lagr", 0.5)
         self.lamda_lagr_min = config.get("lamda_lagr_min", 0.1)
         self.lamda_lagr_max = config.get("lamda_lagr_max", 5.0)
-        self.lagrangian_update_interval = config.get("lagrangian_update_interval", 10)
+        self.lagrangian_update_interval = config.get("lagrangian_update_interval", 5)
         self.lagrangian_ema_alpha = config.get("lagrangian_ema_alpha", 0.9)
-        self.lagrangian_slow_rate = config.get("lagrangian_slow_rate", 0.005)
+        self.lagrangian_slow_rate = config.get("lagrangian_slow_rate", 0.01)
         self._ema_cost = None
         
         # Soft cost for Cost Critic training
@@ -314,9 +314,12 @@ class MAPPOSafePINNv2Trainer:
         task_potential_loss = F.mse_loss(torch.sigmoid(H_task), target_H_task)
         
         # Barrier awareness loss: k should be HIGH near hazards
-        k = actor.obstacle_k_net(obs_batch)
-        target_k = 0.3 + hazard_proximity.clamp(0, 1) * 2.0
-        barrier_k_loss = F.mse_loss(k, target_k)
+        k = actor.get_obstacle_k(obs_batch)
+        if actor.fixed_barrier_potential:
+            barrier_k_loss = torch.tensor(0.0, device=device)
+        else:
+            target_k = 0.3 + hazard_proximity.clamp(0, 1) * 2.0
+            barrier_k_loss = F.mse_loss(k, target_k)
         
         # Safety loss: H_barrier should predict danger
         H_barrier_norm = torch.sigmoid(H_barrier / 5.0)
@@ -337,7 +340,7 @@ class MAPPOSafePINNv2Trainer:
         # Cost critic guidance (disabled when decoupled)
         cost_guidance_loss = torch.tensor(0.0, device=device)
         cost_k_loss = torch.tensor(0.0, device=device)
-        if (not self.decouple_barrier_lagrange) and cost_values is not None:
+        if (not self.decouple_barrier_lagrange) and cost_values is not None and (not actor.fixed_barrier_potential):
             cost_target = torch.sigmoid(cost_values.detach() / self.cost_value_scale)
             H_barrier_norm = torch.sigmoid(H_barrier / 5.0)
             cost_guidance_loss = F.mse_loss(H_barrier_norm, cost_target)
@@ -358,6 +361,7 @@ class MAPPOSafePINNv2Trainer:
 
         aux_loss = aux_loss * self._get_aux_loss_scale()
         
+        k_std = k.std(unbiased=False).item() if k.numel() > 1 else 0.0
         aux_info = {
             'aux_task_loss': task_potential_loss.item(),
             'aux_barrier_k_loss': barrier_k_loss.item(),
@@ -369,7 +373,7 @@ class MAPPOSafePINNv2Trainer:
             'H_task_std': H_task.std().item(),
             'H_barrier_mean': H_barrier.mean().item(),
             'k_mean': k.mean().item(),
-            'k_std': k.std().item(),
+            'k_std': k_std,
             'hazard_proximity_mean': hazard_proximity.mean().item(),
             'agent_proximity_mean': agent_proximity.mean().item() if agent_lidar_start < agent_lidar_end else 0.0,
             'aux_loss_scale': self._get_aux_loss_scale(),
@@ -730,6 +734,7 @@ class Runner:
                 self.logger.log_tabular("Loss/Aux_barrier_k")
                 self.logger.log_tabular("Loss/Aux_safety")
                 self.logger.log_tabular("Loss/Aux_agent_collision")
+                self.logger.log_tabular("Loss/Aux_cost_k")
                 self.logger.log_tabular("Safe/H_task_mean")
                 self.logger.log_tabular("Safe/H_task_std")
                 self.logger.log_tabular("Safe/H_barrier_mean")
@@ -741,6 +746,8 @@ class Runner:
                 self.logger.log_tabular("Safe/cost_violation")
                 self.logger.log_tabular("Safe/barrier_weight")
                 self.logger.log_tabular("Safe/training_step")
+                self.logger.log_tabular("Safe/aux_loss_scale")
+                self.logger.log_tabular("Safe/soft_cost_weight")
                 
                 for physics_key in barrier_info.keys():
                     self.logger.log_tabular(physics_key)
