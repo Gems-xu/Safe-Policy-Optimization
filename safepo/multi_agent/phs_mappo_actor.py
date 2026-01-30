@@ -59,6 +59,8 @@ import torch.nn.functional as F
 def check(input):
     """Convert numpy array to torch tensor if needed."""
     output = torch.from_numpy(input) if type(input) == np.ndarray else input
+    if isinstance(output, torch.Tensor) and output.dtype == torch.float64:
+        output = output.float()
     return output
 
 
@@ -267,6 +269,28 @@ class PHSMAPPOActor(nn.Module):
         self.agent_id = agent_id  # Which agent this actor belongs to
         
         # ===================
+        # Task Type Detection (MultiGoal vs Velocity/MuJoCo)
+        # ===================
+        # Velocity tasks (MAMuJoCo) have different observation structure and action dims
+        # MultiGoal tasks have lidar observations and 2D action space (forward, turn)
+        env_name = config.get("env_name", "")
+        self.is_velocity_task = (
+            "Velocity" in env_name or 
+            "Ant" in env_name and "MultiGoal" not in env_name or
+            "HalfCheetah" in env_name or 
+            "Hopper" in env_name or
+            "Walker" in env_name or
+            "Swimmer" in env_name or
+            "Humanoid" in env_name and "MultiGoal" not in env_name
+        )
+        
+        # For Velocity tasks, we use Barrier PHS with R matrix for velocity safety control
+        if self.is_velocity_task:
+            print(f"[Barrier-PHS v8.0] Agent {agent_id}: VELOCITY TASK detected (env={env_name})")
+            print(f"[Barrier-PHS v8.0] Using R-matrix based PHS for velocity safety control")
+            print(f"[Barrier-PHS v8.0] H = 0.5*v^T*M*v (kinetic), R = R0 + R_learned (adaptive damping)")
+        
+        # ===================
         # Agent Type Detection (Car vs Point)
         # ===================
         # Car has ball joint sensors (ballquat_rear: 9 dims, ballangvel_rear: 3 dims)
@@ -316,8 +340,14 @@ class PHSMAPPOActor(nn.Module):
         
         # Physical parameters (v7.0)
         self.f_max = config.get("phs_f_max", 1.0)  # Max control force
-        self.drag = config.get("phs_drag", 0.1)  # Base damping
+        self.drag = config.get("phs_drag", 0.1)  # Base damping (R0 diagonal)
         self.dt = config.get("phs_dt", 0.05)  # Time step
+        
+        # Velocity Task: R matrix configuration
+        # R = R0 + R_learned where R0 is base damping, R_learned is adaptive
+        self.velocity_r_base = config.get("velocity_r_base", 0.1)  # R0 base value
+        self.velocity_r_max = config.get("velocity_r_max", 2.0)  # Max R_learned scale
+        self.velocity_safety_threshold = config.get("velocity_safety_threshold", 0.8)  # Speed threshold for safety
         
         # Barrier potential parameters
         self.r_collision = config.get("r_collision", 0.17)  # Collision radius
@@ -372,51 +402,65 @@ class PHSMAPPOActor(nn.Module):
         self.acc_indices = [0, 1]  # ax, ay
         self.magnetometer_indices = [9, 10]  # cos(θ), sin(θ) for orientation
         
-        # Lidar configuration (each lidar has 16 bins)
-        lidar_bins = 16
-        lidar_start = self.base_sensor_dim
-        
-        # ACTUAL MultiGoal lidar order (verified from _obstacles):
-        # 1. goal_red (16 bins)
-        # 2. goal_blue (16 bins)
-        # 3. hazards (16 bins)
-        # 4. vases (16 bins)
-        # 5. agents (16 bins, if present)
-        
-        # Lidar configuration (each lidar has 16 bins)
-        lidar_bins = 16
-        
-        # Goal lidars come FIRST
-        goal_red_start = lidar_start
-        goal_red_end = goal_red_start + lidar_bins
-        goal_blue_start = goal_red_end
-        goal_blue_end = goal_blue_start + lidar_bins
-        
-        # CRITICAL: Each agent should focus on its own goal!
-        # Agent 0 -> goal_red, Agent 1 -> goal_blue
-        if self.agent_id == 0:
-            self.goal_lidar_start = goal_red_start
-            self.goal_lidar_end = goal_red_end  # goal_red only
+        # ===================
+        # Lidar Configuration (MultiGoal Only)
+        # ===================
+        # For Velocity tasks, there's no lidar data - set empty ranges
+        if self.is_velocity_task:
+            # Set all lidar indices to empty ranges (start >= end)
+            self.goal_lidar_start = 0
+            self.goal_lidar_end = 0
+            self.hazard_lidar_start = 0
+            self.hazard_lidar_end = 0
+            self.vases_lidar_start = 0
+            self.vases_lidar_end = 0
+            self.agent_lidar_start = 0
+            self.agent_lidar_end = 0
+            print(f"[PHS-MAPPO v8.0] Agent {agent_id}: Velocity task - no lidar data")
         else:
-            self.goal_lidar_start = goal_blue_start
-            self.goal_lidar_end = goal_blue_end  # goal_blue only
-        
-        # Hazards lidar follows goals
-        self.hazard_lidar_start = goal_blue_end
-        self.hazard_lidar_end = self.hazard_lidar_start + lidar_bins
-        
-        # Vases lidar follows hazards
-        self.vases_lidar_start = self.hazard_lidar_end
-        self.vases_lidar_end = self.vases_lidar_start + lidar_bins
-        
-        # Agent lidar (other agents) may follow vases
-        self.agent_lidar_start = self.vases_lidar_end
-        self.agent_lidar_end = self.agent_lidar_start + lidar_bins
-        
-        # Log detected configuration
-        print(f"[PHS-MAPPO v8.0] Agent {agent_id}: type={self.agent_type}, obs_dim={self.obs_dim}, base_sensors={self.base_sensor_dim}")
-        print(f"[PHS-MAPPO v8.0] Lidar indices: goal=[{self.goal_lidar_start}:{self.goal_lidar_end}], "
-              f"hazard=[{self.hazard_lidar_start}:{self.hazard_lidar_end}], agent=[{self.agent_lidar_start}:{self.agent_lidar_end}]")
+            # MultiGoal task: Configure lidar indices
+            # Lidar configuration (each lidar has 16 bins)
+            lidar_bins = 16
+            lidar_start = self.base_sensor_dim
+            
+            # ACTUAL MultiGoal lidar order (verified from _obstacles):
+            # 1. goal_red (16 bins)
+            # 2. goal_blue (16 bins)
+            # 3. hazards (16 bins)
+            # 4. vases (16 bins)
+            # 5. agents (16 bins, if present)
+            
+            # Goal lidars come FIRST
+            goal_red_start = lidar_start
+            goal_red_end = goal_red_start + lidar_bins
+            goal_blue_start = goal_red_end
+            goal_blue_end = goal_blue_start + lidar_bins
+            
+            # CRITICAL: Each agent should focus on its own goal!
+            # Agent 0 -> goal_red, Agent 1 -> goal_blue
+            if self.agent_id == 0:
+                self.goal_lidar_start = goal_red_start
+                self.goal_lidar_end = goal_red_end  # goal_red only
+            else:
+                self.goal_lidar_start = goal_blue_start
+                self.goal_lidar_end = goal_blue_end  # goal_blue only
+            
+            # Hazards lidar follows goals
+            self.hazard_lidar_start = goal_blue_end
+            self.hazard_lidar_end = self.hazard_lidar_start + lidar_bins
+            
+            # Vases lidar follows hazards
+            self.vases_lidar_start = self.hazard_lidar_end
+            self.vases_lidar_end = self.vases_lidar_start + lidar_bins
+            
+            # Agent lidar (other agents) may follow vases
+            self.agent_lidar_start = self.vases_lidar_end
+            self.agent_lidar_end = self.agent_lidar_start + lidar_bins
+            
+            # Log detected configuration
+            print(f"[PHS-MAPPO v8.0] Agent {agent_id}: type={self.agent_type}, obs_dim={self.obs_dim}, base_sensors={self.base_sensor_dim}")
+            print(f"[PHS-MAPPO v8.0] Lidar indices: goal=[{self.goal_lidar_start}:{self.goal_lidar_end}], "
+                  f"hazard=[{self.hazard_lidar_start}:{self.hazard_lidar_end}], agent=[{self.agent_lidar_start}:{self.agent_lidar_end}]")
         
         # ===================
         # Network Modules (v8.1 - Pure Learnable Policy with PHS Features)
@@ -424,6 +468,35 @@ class PHSMAPPOActor(nn.Module):
         # 
         # v8.1 KEY INSIGHT: Use PHS gradients as INPUT features, not output bias.
         # This gives the policy physics information while maintaining clean RL optimization.
+        
+        # ========== 0. Velocity Task: Learnable R Matrix Network ==========
+        # For Velocity tasks, the core of Barrier PHS is the R matrix:
+        # R = R0 + R_learned(state)
+        # - R0: Fixed base damping (energy dissipation)
+        # - R_learned: Adaptive damping for velocity safety control
+        # H = 0.5 * v^T * M * v (pure kinetic energy)
+        # grad_H = v (velocity itself)
+        if self.is_velocity_task:
+            # R_learned network: outputs diagonal scaling factors for R matrix
+            # Higher output = more damping = safer but slower
+            self.R_learned_net = nn.Sequential(
+                nn.Linear(self.obs_dim, self.hidden_size),
+                nn.LayerNorm(self.hidden_size),
+                nn.ELU(),
+                nn.Linear(self.hidden_size, self.hidden_size // 2),
+                nn.ELU(),
+                nn.Linear(self.hidden_size // 2, self.act_dim),
+                nn.Softplus()  # Ensure positive (dissipation must be positive)
+            )
+            
+            # Velocity safety network: predicts safety-related damping boost
+            # When agent is moving too fast or in risky state, increase R
+            self.velocity_safety_net = nn.Sequential(
+                nn.Linear(self.obs_dim, self.hidden_size // 2),
+                nn.ELU(),
+                nn.Linear(self.hidden_size // 2, self.act_dim),
+                nn.Sigmoid()  # Output in [0, 1] for safety factor
+            )
         
         # ========== 1. Feature Extraction (Shared) ==========
         self.feature_norm = nn.LayerNorm(self.obs_dim)
@@ -442,12 +515,17 @@ class PHSMAPPOActor(nn.Module):
         
         # ========== 2. MAIN POLICY NETWORK (v8.1 - Direct Output) ==========
         # Standard MLP policy with PHS directional features
-        # Input: physics_hidden features + goal/barrier gradients (4 dims)
+        # For MultiGoal: Input = physics_hidden + goal/barrier gradients (4 dims)
+        # For Velocity: Input = physics_hidden only (no lidar gradients)
         # Output: action directly
         policy_hidden = self.hidden_size * 2  # 512 if hidden_size=256
         
+        # Gradient feature dimension: 4 for MultiGoal (2D goal + 2D barrier), 0 for Velocity
+        self.gradient_feature_dim = 0 if self.is_velocity_task else 4
+        policy_input_dim = self.physics_hidden + self.gradient_feature_dim
+        
         self.policy_net = nn.Sequential(
-            nn.Linear(self.physics_hidden + 4, policy_hidden),
+            nn.Linear(policy_input_dim, policy_hidden),
             nn.LayerNorm(policy_hidden),
             nn.ELU(),
             nn.Linear(policy_hidden, policy_hidden),
@@ -461,8 +539,9 @@ class PHSMAPPOActor(nn.Module):
         # ========== 3. PHS Guidance Network (Simplified) ==========
         # Computes PHS-based action bias (goal-seeking + obstacle-avoidance)
         # This provides INDUCTIVE BIAS, not the main policy!
+        # Only used for MultiGoal tasks
         self.phs_gain_net = nn.Sequential(
-            nn.Linear(self.physics_hidden + 4, self.hidden_size // 2),  # +4 for goal/barrier gradients
+            nn.Linear(policy_input_dim, self.hidden_size // 2),
             nn.ELU(),
             nn.Linear(self.hidden_size // 2, self.act_dim),
         )
@@ -521,22 +600,38 @@ class PHSMAPPOActor(nn.Module):
         
     def _init_base_phs_matrices(self):
         """Initialize base PHS system matrices with standard Hamiltonian structure."""
-        dim = self.state_dim // 2  # Position or velocity dimension (2 for 2D)
+        # For Velocity tasks, adapt state_dim to match act_dim
+        if self.is_velocity_task:
+            # For Velocity tasks, use act_dim-based state space
+            # state_dim = 2 * act_dim (positions + velocities for each actuator)
+            effective_state_dim = 2 * self.act_dim
+            dim = self.act_dim  # velocity dimension = act_dim
+        else:
+            # For MultiGoal tasks, use fixed 2D state space (x, y, vx, vy)
+            effective_state_dim = self.state_dim  # 4
+            dim = self.state_dim // 2  # 2
+        
+        # Store for use in other methods
+        self.effective_state_dim = effective_state_dim
+        self.effective_dim = dim
         
         # Standard Hamiltonian J matrix: [[0, I], [-I, 0]]
-        J_sys = torch.zeros(self.state_dim, self.state_dim)
+        J_sys = torch.zeros(effective_state_dim, effective_state_dim)
         J_sys[:dim, dim:] = torch.eye(dim)
         J_sys[dim:, :dim] = -torch.eye(dim)
         self.register_buffer('J_sys', J_sys)
         
         # Standard dissipation R matrix: [[0, 0], [0, drag*I]]
-        R_sys = torch.zeros(self.state_dim, self.state_dim)
+        R_sys = torch.zeros(effective_state_dim, effective_state_dim)
         R_sys[dim:, dim:] = self.drag * torch.eye(dim)
         self.register_buffer('R_sys', R_sys)
         
         # Control input matrix F = [[0], [I]]
-        F_sys = torch.zeros(self.state_dim, self.act_dim)
-        F_sys[dim:, :] = torch.eye(self.act_dim)
+        # F maps control inputs to velocity changes
+        F_sys = torch.zeros(effective_state_dim, self.act_dim)
+        # For both task types, control affects the velocity part (second half of state)
+        min_dim = min(dim, self.act_dim)
+        F_sys[dim:dim+min_dim, :min_dim] = torch.eye(min_dim)
         self.register_buffer('F_sys', F_sys)
         
         # Pseudo-inverse of F for control computation
@@ -671,6 +766,8 @@ class PHSMAPPOActor(nn.Module):
         # Extract goal lidar (agent-specific: red for agent 0, blue for agent 1)
         goal_end = min(self.goal_lidar_end, obs.shape[-1])
         goal_lidar = obs[..., self.goal_lidar_start:goal_end]  # [batch, ..., 16]
+        if goal_lidar.shape[-1] == 0:
+            return torch.zeros((*obs.shape[:-1], 1), device=obs.device, dtype=obs.dtype)
         
         # Max goal proximity (higher = closer to goal)
         goal_proximity = goal_lidar.max(dim=-1, keepdim=True)[0]  # [batch, ..., 1]
@@ -708,6 +805,8 @@ class PHSMAPPOActor(nn.Module):
         # Extract hazard lidar
         hazard_end = min(self.hazard_lidar_end, obs.shape[-1])
         hazard_lidar = obs[..., self.hazard_lidar_start:hazard_end]  # [batch, ..., 16]
+        if hazard_lidar.shape[-1] == 0:
+            return torch.zeros((*obs.shape[:-1], 1), device=obs.device, dtype=obs.dtype)
         
         # Max proximity (higher = closer = more dangerous)
         max_proximity = hazard_lidar.max(dim=-1, keepdim=True)[0]
@@ -950,60 +1049,67 @@ class PHSMAPPOActor(nn.Module):
         # Each agent uses its own goal lidar (red for agent 0, blue for agent 1)
         goal_end = min(self.goal_lidar_end, obs.shape[-1])
         goal_lidar = obs[..., self.goal_lidar_start:goal_end]  # [batch, ..., 16]
+        if goal_lidar.shape[-1] == 0:
+            goal_gradient = torch.zeros(obs.shape[0], 2, device=device)
+            goal_proximity_scaled = torch.zeros(obs.shape[0], 1, device=device)
+        else:
         
-        num_goal_bins = goal_lidar.shape[-1]
-        # Lidar bins are in BODY frame, spanning 360 degrees
-        # bin 0 is typically forward, angles increase counter-clockwise
-        goal_angles_body = torch.linspace(0, 2 * np.pi, num_goal_bins + 1, device=device)[:-1]
-        
-        # Use centered logits for stable weighting on raw lidar
-        goal_logits = (goal_lidar - 0.5) * 6.0
-        goal_weights = F.softmax(goal_logits, dim=-1)
-        
-        # Weighted average direction in BODY frame
-        goal_dir_forward = (goal_weights * torch.cos(goal_angles_body)).sum(dim=-1, keepdim=True)
-        goal_dir_lateral = (goal_weights * torch.sin(goal_angles_body)).sum(dim=-1, keepdim=True)
-        
-        # Goal proximity for scaling (use max value, clamp to reasonable range)
-        goal_proximity_scaled = torch.clamp(goal_lidar.max(dim=-1, keepdim=True)[0], min=0.0, max=1.0)
-        
-        # Body-frame goal gradient:
-        # forward = how much goal is in front (cos of angle to goal)
-        # turn = how much we need to turn toward goal (sin of angle to goal)
-        goal_magnitude = torch.sqrt(goal_dir_forward**2 + goal_dir_lateral**2 + 1e-6)
-        goal_gradient = torch.cat([
-            goal_dir_forward / goal_magnitude,   # Forward component (normalized)
-            goal_dir_lateral / goal_magnitude    # Turn component (normalized)
-        ], dim=-1) * (0.3 + 0.7 * goal_proximity_scaled)  # Scale by proximity
+            num_goal_bins = goal_lidar.shape[-1]
+            # Lidar bins are in BODY frame, spanning 360 degrees
+            # bin 0 is typically forward, angles increase counter-clockwise
+            goal_angles_body = torch.linspace(0, 2 * np.pi, num_goal_bins + 1, device=device)[:-1]
+
+            # Use centered logits for stable weighting on raw lidar
+            goal_logits = (goal_lidar - 0.5) * 6.0
+            goal_weights = F.softmax(goal_logits, dim=-1)
+
+            # Weighted average direction in BODY frame
+            goal_dir_forward = (goal_weights * torch.cos(goal_angles_body)).sum(dim=-1, keepdim=True)
+            goal_dir_lateral = (goal_weights * torch.sin(goal_angles_body)).sum(dim=-1, keepdim=True)
+
+            # Goal proximity for scaling (use max value, clamp to reasonable range)
+            goal_proximity_scaled = torch.clamp(goal_lidar.max(dim=-1, keepdim=True)[0], min=0.0, max=1.0)
+
+            # Body-frame goal gradient:
+            # forward = how much goal is in front (cos of angle to goal)
+            # turn = how much we need to turn toward goal (sin of angle to goal)
+            goal_magnitude = torch.sqrt(goal_dir_forward**2 + goal_dir_lateral**2 + 1e-6)
+            goal_gradient = torch.cat([
+                goal_dir_forward / goal_magnitude,   # Forward component (normalized)
+                goal_dir_lateral / goal_magnitude    # Turn component (normalized)
+            ], dim=-1) * (0.3 + 0.7 * goal_proximity_scaled)  # Scale by proximity
         
         # ========== Barrier Direction (Body Frame) ==========
         hazard_end = min(self.hazard_lidar_end, obs.shape[-1])
         hazard_lidar = obs[..., self.hazard_lidar_start:hazard_end]  # [batch, ..., 16]
-        
-        num_hazard_bins = hazard_lidar.shape[-1]
-        hazard_angles_body = torch.linspace(0, 2 * np.pi, num_hazard_bins + 1, device=device)[:-1]
-        
-        # Use centered logits for stable weighting on raw lidar
-        hazard_logits = (hazard_lidar - 0.5) * 6.0
-        hazard_weights = F.softmax(hazard_logits, dim=-1)
-        
-        # Direction TOWARD hazards in body frame
-        hazard_dir_forward = (hazard_weights * torch.cos(hazard_angles_body)).sum(dim=-1, keepdim=True)
-        hazard_dir_lateral = (hazard_weights * torch.sin(hazard_angles_body)).sum(dim=-1, keepdim=True)
-        
-        # Barrier gradient points AWAY from hazards (negate direction)
-        # If hazard is in front: go backward (negative forward)
-        # If hazard is on left: turn right (negative turn)
-        max_hazard = torch.clamp(hazard_lidar.max(dim=-1, keepdim=True)[0], min=0.0, max=1.0)
+        if hazard_lidar.shape[-1] == 0:
+            barrier_gradient = torch.zeros(obs.shape[0], 2, device=device)
+            repulsion_strength = torch.zeros(obs.shape[0], 1, device=device)
+        else:
+            num_hazard_bins = hazard_lidar.shape[-1]
+            hazard_angles_body = torch.linspace(0, 2 * np.pi, num_hazard_bins + 1, device=device)[:-1]
 
-        # Repulsion strength increases quadratically near hazards
-        repulsion_strength = max_hazard.pow(2)
-        
-        hazard_magnitude = torch.sqrt(hazard_dir_forward**2 + hazard_dir_lateral**2 + 1e-6)
-        barrier_gradient = torch.cat([
-            -hazard_dir_forward / hazard_magnitude,  # Backward if hazard in front
-            -hazard_dir_lateral / hazard_magnitude   # Turn away from hazard
-        ], dim=-1) * repulsion_strength
+            # Use centered logits for stable weighting on raw lidar
+            hazard_logits = (hazard_lidar - 0.5) * 6.0
+            hazard_weights = F.softmax(hazard_logits, dim=-1)
+
+            # Direction TOWARD hazards in body frame
+            hazard_dir_forward = (hazard_weights * torch.cos(hazard_angles_body)).sum(dim=-1, keepdim=True)
+            hazard_dir_lateral = (hazard_weights * torch.sin(hazard_angles_body)).sum(dim=-1, keepdim=True)
+
+            # Barrier gradient points AWAY from hazards (negate direction)
+            # If hazard is in front: go backward (negative forward)
+            # If hazard is on left: turn right (negative turn)
+            max_hazard = torch.clamp(hazard_lidar.max(dim=-1, keepdim=True)[0], min=0.0, max=1.0)
+
+            # Repulsion strength increases quadratically near hazards
+            repulsion_strength = max_hazard.pow(2)
+
+            hazard_magnitude = torch.sqrt(hazard_dir_forward**2 + hazard_dir_lateral**2 + 1e-6)
+            barrier_gradient = torch.cat([
+                -hazard_dir_forward / hazard_magnitude,  # Backward if hazard in front
+                -hazard_dir_lateral / hazard_magnitude   # Turn away from hazard
+            ], dim=-1) * repulsion_strength
         
         return goal_gradient, barrier_gradient, goal_proximity_scaled, repulsion_strength
     
@@ -1011,12 +1117,14 @@ class PHSMAPPOActor(nn.Module):
         """
         Compute action using Barrier PHS Actor (true port-Hamiltonian action mapping).
         
-        Action generation:
-            dx_target = π_θ([features]) + guidance
+        For MultiGoal tasks:
+            dx_target = π_θ([features, goal_grad, barrier_grad]) + guidance
             dx = (J - R) ∇H_total + F * a
             a = F^+ (dx_target - (J - R) ∇H_total)
         
-        This injects Barrier PHS structure directly into action generation.
+        For Velocity tasks:
+            Uses simplified MLP policy without 2D lidar gradients.
+            a = π_θ([features])
         """
         batch_size = obs.shape[0]
         is_multi_agent = obs.dim() == 3
@@ -1030,25 +1138,135 @@ class PHSMAPPOActor(nn.Module):
             state_features_flat = state_features
             n_agents = 1
         
-        # ========== 1. Compute Directional Gradients (as features + guidance) ==========
+        # ========== VELOCITY TASK: Barrier PHS with R Matrix Control ==========
+        if self.is_velocity_task:
+            # ========== Core Barrier PHS for Velocity Tasks ==========
+            # H = 0.5 * v^T * M * v (pure kinetic energy)
+            # ∇H = M * v ≈ v (assuming unit mass)
+            # dx/dt = (J - R) * ∇H + F * u
+            # R = R0 + R_learned(obs) where:
+            #   - R0: Fixed base damping (energy dissipation)
+            #   - R_learned: Adaptive damping for velocity safety control
+            
+            # ========== 1. Extract velocity from observation ==========
+            # MAMuJoCo observation structure: [qpos, qvel, agent_id_onehot]
+            # Velocity typically in the middle portion
+            num_agents_detected = self.n_agents
+            state_raw_dim = self.obs_dim - num_agents_detected  # Remove agent_id one-hot
+            n_qpos = state_raw_dim // 2  # Rough split
+            n_qvel = state_raw_dim - n_qpos
+            
+            vel_start = n_qpos
+            vel_end = n_qpos + min(n_qvel, self.act_dim)  # Only need act_dim velocities
+            
+            # Extract velocity components relevant to control
+            obs_vel = obs_flat[:, vel_start:vel_end]  # [batch, act_dim or less]
+            
+            # Pad if necessary
+            if obs_vel.shape[-1] < self.act_dim:
+                pad_size = self.act_dim - obs_vel.shape[-1]
+                obs_vel = torch.cat([obs_vel, torch.zeros(obs_vel.shape[0], pad_size, device=obs_vel.device)], dim=-1)
+            elif obs_vel.shape[-1] > self.act_dim:
+                obs_vel = obs_vel[:, :self.act_dim]
+            
+            # ========== 2. Compute Kinetic Energy Hamiltonian ==========
+            # H = 0.5 * ||v||^2 (unit mass assumption)
+            H_kin = 0.5 * (obs_vel ** 2).sum(dim=-1, keepdim=True)  # [batch, 1]
+            
+            # ∇H = v (gradient of kinetic energy w.r.t. velocity)
+            grad_H_vel = obs_vel  # [batch, act_dim]
+            
+            # ========== 3. Compute Adaptive R Matrix ==========
+            # R_learned: learnable dissipation based on state
+            R_diag_learned = self.R_learned_net(obs_flat)  # [batch, act_dim], positive via Softplus
+            
+            # Safety factor: boost damping when moving fast or in risky state
+            safety_factor = self.velocity_safety_net(obs_flat)  # [batch, act_dim], in [0, 1]
+            
+            # Compute velocity magnitude for adaptive damping
+            vel_magnitude = torch.norm(obs_vel, dim=-1, keepdim=True)  # [batch, 1]
+            vel_normalized = vel_magnitude / (self.velocity_safety_threshold + 1e-6)
+            vel_risk = torch.clamp(vel_normalized - 1.0, min=0.0)  # Risk when exceeding threshold
+            
+            # Total R diagonal: R0 + R_learned * (1 + safety_factor * vel_risk)
+            R_diag_total = (
+                self.velocity_r_base + 
+                R_diag_learned * (1.0 + safety_factor * vel_risk * self.velocity_r_max)
+            )  # [batch, act_dim]
+            
+            # ========== 4. Policy Network for Desired Dynamics ==========
+            policy_output = self.policy_net(state_features_flat)  # [batch, act_dim]
+            
+            residual = self.residual_mlp(state_features_flat)
+            residual_w = torch.sigmoid(self.residual_weight) * 0.3
+            
+            dx_target = policy_output + residual_w * residual
+            
+            # ========== 5. PHS Dynamics: (J - R) * ∇H ==========
+            # For velocity-only state, we simplify to just the velocity dynamics
+            # J = 0 (no position-velocity coupling in pure velocity control)
+            # So drift = -R * ∇H = -R * v (pure dissipation)
+            
+            phs_drift = -R_diag_total * grad_H_vel  # [batch, act_dim]
+            
+            # ========== 6. Compute Control Action ==========
+            # dx = drift + u  =>  u = dx_target - drift
+            u_mean = dx_target - phs_drift
+            
+            # Scale action
+            u_mean = torch.tanh(u_mean) * self.f_max
+            
+            # Reshape if multi-agent
+            if is_multi_agent:
+                u_mean = u_mean.view(batch_size, n_agents, -1)
+            
+            # ========== 7. Logging Info ==========
+            H_info = {
+                'H_goal': torch.tensor(0.0),
+                'H_task_learned': torch.tensor(0.0),
+                'H_task': torch.tensor(0.0),
+                'H_kin': H_kin.mean().detach(),
+                'H_barrier_obs': torch.tensor(0.0),
+                'H_barrier_agent': torch.tensor(0.0),
+                'barrier_weight': self._get_current_barrier_weight(),
+                'goal_prox': torch.tensor(0.0),
+                'hazard_prox': torch.tensor(0.0),
+                'agent_type': self.agent_type,
+                'policy_output_mean': policy_output.mean().item(),
+                'goal_grad_forward': 0.0,
+                'goal_grad_turn': 0.0,
+                'dx_target_mean': dx_target.mean().item(),
+                # Velocity task specific metrics
+                'R_learned_mean': R_diag_learned.mean().item(),
+                'R_total_mean': R_diag_total.mean().item(),
+                'safety_factor_mean': safety_factor.mean().item(),
+                'vel_magnitude_mean': vel_magnitude.mean().item(),
+                'phs_drift_mean': phs_drift.mean().item(),
+            }
+            
+            return u_mean, H_info, state_features
+        
+        # ========== MULTIGOAL TASK: Full PHS with 2D Gradients ==========
+        # 1. Compute Directional Gradients (as features + guidance)
         goal_grad, barrier_grad, goal_prox, hazard_prox = self._compute_directional_gradient(obs_flat)
 
-        # ========== 2. Policy Output (desired state change) ==========
+        # 2. Policy Output (desired state change)
         policy_input = torch.cat([state_features_flat, goal_grad, barrier_grad], dim=-1)
         policy_output = self.policy_net(policy_input)  # [batch, act_dim]
 
         residual = self.residual_mlp(state_features_flat)
         residual_w = torch.sigmoid(self.residual_weight) * 0.3
 
-        # Guidance encourages goal progress and basic avoidance
+        # Guidance encourages goal progress and basic avoidance (2D)
         dx_guidance = (
             self.phs_goal_guidance_weight * goal_grad +
             self.phs_barrier_guidance_weight * barrier_grad
         )
 
+        # For MultiGoal, act_dim should be 2, so this works
         dx_target_body = policy_output + residual_w * residual + dx_guidance
 
-        # ========== 3. PHS Drift (Barrier + Task) ==========
+        # 3. PHS Drift (Barrier + Task)
         if is_multi_agent:
             H_total, grad_H_vel, H_info = self._compute_hamiltonian_gradient(
                 obs, state_features, laplacian, detach=False
@@ -1060,15 +1278,28 @@ class PHSMAPPOActor(nn.Module):
             )
 
         # Assemble gradient in state space (pos part = 0, vel part = grad_H_vel)
-        grad_H_state = torch.zeros(dx_target_body.shape[0], self.state_dim, device=obs.device, dtype=obs.dtype)
-        grad_H_state[:, -self.act_dim:] = grad_H_vel
+        # Use effective_state_dim for proper dimensions
+        grad_H_state = torch.zeros(dx_target_body.shape[0], self.effective_state_dim, device=obs.device, dtype=obs.dtype)
+        effective_dim = self.effective_dim
+        
+        # Handle grad_H_vel dimension mismatch
+        if grad_H_vel.shape[-1] > effective_dim:
+            grad_vel = grad_H_vel[:, :effective_dim]
+        elif grad_H_vel.shape[-1] < effective_dim:
+            pad = torch.zeros(grad_H_vel.shape[0], effective_dim - grad_H_vel.shape[-1], device=obs.device, dtype=obs.dtype)
+            grad_vel = torch.cat([grad_H_vel, pad], dim=-1)
+        else:
+            grad_vel = grad_H_vel
+        grad_H_state[:, effective_dim:] = grad_vel
 
         J_R = self.J_sys - self.R_sys
         phs_drift = torch.matmul(J_R, grad_H_state.unsqueeze(-1)).squeeze(-1)
 
         # Desired state change in state space
         dx_target_state = torch.zeros_like(grad_H_state)
-        dx_target_state[:, :self.act_dim] = dx_target_body
+        # For MultiGoal, act_dim=2 and effective_dim=2, so this should work
+        min_dim = min(self.act_dim, effective_dim)
+        dx_target_state[:, :min_dim] = dx_target_body[:, :min_dim]
 
         # Compute port action a via pseudo-inverse of F
         u_body = torch.matmul(self.F_pinv, (dx_target_state - phs_drift).unsqueeze(-1)).squeeze(-1)
@@ -1248,6 +1479,68 @@ class PHSMAPPOActor(nn.Module):
         obs = check(obs).to(self.device)
         is_multi_agent = obs.dim() == 3
         
+        # For Velocity tasks, compute R-matrix based PHS physics info
+        if self.is_velocity_task:
+            obs_norm = self.feature_norm(obs)
+            state_features = self.state_encoder(obs_norm)
+            
+            if is_multi_agent:
+                obs_flat = obs.view(-1, obs.shape[-1])
+                state_features_flat = state_features.view(-1, state_features.shape[-1])
+            else:
+                obs_flat = obs
+                state_features_flat = state_features
+            
+            # Extract velocity from observation
+            num_agents_detected = self.n_agents
+            state_raw_dim = self.obs_dim - num_agents_detected
+            n_qpos = state_raw_dim // 2
+            vel_start = n_qpos
+            vel_end = n_qpos + min(state_raw_dim - n_qpos, self.act_dim)
+            
+            obs_vel = obs_flat[:, vel_start:vel_end]
+            if obs_vel.shape[-1] < self.act_dim:
+                pad_size = self.act_dim - obs_vel.shape[-1]
+                obs_vel = torch.cat([obs_vel, torch.zeros(obs_vel.shape[0], pad_size, device=obs_vel.device)], dim=-1)
+            elif obs_vel.shape[-1] > self.act_dim:
+                obs_vel = obs_vel[:, :self.act_dim]
+            
+            # Compute kinetic energy
+            H_kin = 0.5 * (obs_vel ** 2).sum(dim=-1, keepdim=True)
+            
+            # Compute R matrix components
+            R_diag_learned = self.R_learned_net(obs_flat)
+            safety_factor = self.velocity_safety_net(obs_flat)
+            vel_magnitude = torch.norm(obs_vel, dim=-1, keepdim=True)
+            vel_normalized = vel_magnitude / (self.velocity_safety_threshold + 1e-6)
+            vel_risk = torch.clamp(vel_normalized - 1.0, min=0.0)
+            R_diag_total = self.velocity_r_base + R_diag_learned * (1.0 + safety_factor * vel_risk * self.velocity_r_max)
+            
+            return {
+                'H_total': H_kin.mean().detach(),
+                'H_goal': torch.tensor(0.0),
+                'H_task_learned': torch.tensor(0.0),
+                'H_task': torch.tensor(0.0),
+                'H_kin': H_kin.mean().detach(),
+                'H_barrier_obs': torch.tensor(0.0),
+                'H_barrier_agent': torch.tensor(0.0),
+                'grad_H': obs_vel.detach(),  # ∇H = v for kinetic energy
+                'proximity': torch.zeros(obs_flat.shape[0], 1, device=obs.device),
+                'barrier_weight': self._get_current_barrier_weight(),
+                'goal_grad_forward': torch.tensor(0.0),
+                'goal_grad_turn': torch.tensor(0.0),
+                'barrier_grad_forward': torch.tensor(0.0),
+                'barrier_grad_turn': torch.tensor(0.0),
+                'goal_prox': torch.tensor(0.0),
+                'hazard_prox': torch.tensor(0.0),
+                # R-matrix specific metrics
+                'R_learned_mean': R_diag_learned.mean().detach(),
+                'R_total_mean': R_diag_total.mean().detach(),
+                'safety_factor_mean': safety_factor.mean().detach(),
+                'vel_magnitude_mean': vel_magnitude.mean().detach(),
+                'vel_risk_mean': vel_risk.mean().detach(),
+            }
+        
         obs_norm = self.feature_norm(obs)
         state_features = self.state_encoder(obs_norm)
         
@@ -1270,7 +1563,11 @@ class PHSMAPPOActor(nn.Module):
         # Extract lidar info
         hazard_end = min(self.hazard_lidar_end, obs.shape[-1])
         hazard_lidar = obs[..., self.hazard_lidar_start:hazard_end]
-        proximity = hazard_lidar.max(dim=-1, keepdim=True)[0]
+        if hazard_lidar.shape[-1] == 0:
+            grad_H = torch.zeros((*obs.shape[:-1], 2), device=obs.device, dtype=obs.dtype)
+            proximity = torch.zeros((*obs.shape[:-1], 1), device=obs.device, dtype=obs.dtype)
+        else:
+            proximity = hazard_lidar.max(dim=-1, keepdim=True)[0]
         
         return {
             'H_total': H_total.detach(),
@@ -1310,6 +1607,9 @@ class PHSMAPPOActor(nn.Module):
         # Compute approximate gradient direction
         hazard_end = min(self.hazard_lidar_end, obs.shape[-1])
         hazard_lidar = obs[..., self.hazard_lidar_start:hazard_end]
+        if hazard_lidar.shape[-1] == 0:
+            grad_H = torch.zeros((*obs.shape[:-1], 2), device=obs.device, dtype=obs.dtype)
+            return H_barrier, grad_H
         
         num_bins = hazard_lidar.shape[-1]
         angles = torch.linspace(0, 2 * np.pi, num_bins + 1, device=self.device)[:-1]
@@ -1335,6 +1635,11 @@ class PHSMAPPOActor(nn.Module):
         """Extract hazard lidar for compatibility."""
         hazard_end = min(self.hazard_lidar_end, obs.shape[-1])
         hazard_lidar = obs[..., self.hazard_lidar_start:hazard_end]
+
+        if hazard_lidar.shape[-1] == 0:
+            zeros_shape = (*obs.shape[:-1], 1)
+            zeros = torch.zeros(zeros_shape, device=obs.device, dtype=obs.dtype)
+            return hazard_lidar, zeros
         
         agent_end = min(self.agent_lidar_end, obs.shape[-1])
         if self.agent_lidar_start < agent_end:
@@ -1350,6 +1655,10 @@ class PHSMAPPOActor(nn.Module):
         """Extract goal lidar for compatibility."""
         goal_end = min(self.goal_lidar_end, obs.shape[-1])
         goal_lidar = obs[..., self.goal_lidar_start:goal_end]
+        if goal_lidar.shape[-1] == 0:
+            zeros_shape = (*obs.shape[:-1], 1)
+            zeros = torch.zeros(zeros_shape, device=obs.device, dtype=obs.dtype)
+            return goal_lidar, zeros
         goal_proximity = goal_lidar.max(dim=-1, keepdim=True)[0]
         return goal_lidar, goal_proximity
     

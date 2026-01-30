@@ -734,6 +734,7 @@ class Runner:
                 self.logger.log_tabular("Loss/Aux_barrier_k")
                 self.logger.log_tabular("Loss/Aux_safety")
                 self.logger.log_tabular("Loss/Aux_agent_collision")
+                self.logger.log_tabular("Loss/Aux_cost_value")
                 self.logger.log_tabular("Loss/Aux_cost_k")
                 self.logger.log_tabular("Safe/H_task_mean")
                 self.logger.log_tabular("Safe/H_task_std")
@@ -1187,6 +1188,17 @@ class Runner:
                     one_episode_costs[:, eval_i] = 0
 
             if eval_episode >= eval_episodes:
+                # # Upload video for the first episode (fixed-interval recording)
+                # if len(first_episode_frames) > 0 and should_record_video:
+                #     if self.video_recorder.enabled:
+                #         self.video_recorder.recorder.frames = first_episode_frames
+                #         caption = f"Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
+                #         self.video_recorder.recorder.upload_to_wandb(
+                #             caption=caption,
+                #             step=total_steps,
+                #             key="eval/video"
+                #         )
+
                 # Save potential field video
                 if len(potential_field_frames) > 0 and should_record_video and is_multi_goal_task:
                     viz_dir = os.path.join(os.path.dirname(self.save_dir), "vizs")
@@ -1245,6 +1257,10 @@ class Runner:
 
 def train(args, cfg_train):
     agent_index = [[[0, 1, 2, 3, 4, 5]], [[0, 1, 2, 3, 4, 5]]]
+    
+    # Add task/env_name to config for task type detection in PHSMAPPOActor
+    cfg_train["env_name"] = args.task
+    cfg_train["task"] = args.task
     
     if args.task in multi_agent_velocity_map:
         env = make_ma_mujoco_env(

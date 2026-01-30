@@ -12,9 +12,9 @@ algorithm_name: mappo_safe_pinn_v7
 experiment_name: phs_mappo_v7
 seed: 0
 run_dir: ./runs
-num_env_steps: 30000000
+num_env_steps: 10000000
 episode_length: 1000
-n_rollout_threads: 30
+n_rollout_threads: 10
 n_eval_rollout_threads: 1
 hidden_size: 256
 use_render: False
