@@ -212,6 +212,9 @@ class MAPPOSafePINNv2Trainer:
         self.config = config
         self.tpdv = dict(dtype=torch.float32, device=self.config["device"])
         self.policy = policy
+        
+        # Detect task type for conditional logging
+        self.is_velocity_task = config.get("env_name", "") in multi_agent_velocity_map
 
         self.value_normalizer = PopArt(1, device=self.config["device"])
         self.cost_value_normalizer = PopArt(1, device=self.config["device"])
@@ -525,34 +528,39 @@ class MAPPOSafePINNv2Trainer:
                 value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info \
                     = self.ppo_update(sample)
         
-        # Log metrics
+        # Log metrics - conditionally based on task type
         lagrangian_info = {
             "Loss/Loss_reward_critic": value_loss.item(),
             "Loss/Loss_actor": policy_loss.item(),
             "Loss/Loss_cost_critic": aux_info.get('cost_loss', 0.0),
-            "Loss/Aux_task_potential": aux_info['aux_task_loss'],
-            "Loss/Aux_barrier_k": aux_info['aux_barrier_k_loss'],
-            "Loss/Aux_safety": aux_info['aux_safety_loss'],
-            "Loss/Aux_agent_collision": aux_info.get('aux_agent_collision_loss', 0.0),
-            "Loss/Aux_cost_value": aux_info.get('aux_cost_value_loss', 0.0),
-            "Loss/Aux_cost_k": aux_info.get('aux_cost_k_loss', 0.0),
-            "Safe/H_task_mean": aux_info['H_task_mean'],
-            "Safe/H_task_std": aux_info['H_task_std'],
-            "Safe/H_barrier_mean": aux_info['H_barrier_mean'],
-            "Safe/k_mean": aux_info['k_mean'],
-            "Safe/k_std": aux_info['k_std'],
-            "Safe/hazard_proximity": aux_info['hazard_proximity_mean'],
-            "Safe/agent_proximity": aux_info.get('agent_proximity_mean', 0.0),
             "Safe/lamda_lagr": aux_info.get('lamda_lagr', 0.0),
             "Safe/cost_violation": aux_info.get('cost_violation', 0.0),
-            "Safe/barrier_weight": self.policy.actor._get_current_barrier_weight(),
-            "Safe/training_step": self._training_step,
-            "Safe/aux_loss_scale": aux_info.get('aux_loss_scale', 0.0),
-            "Safe/soft_cost_weight": self._get_soft_cost_weight(),
             "Misc/Reward_critic_norm": critic_grad_norm.item(),
             "Misc/Entropy": dist_entropy.item(),
             "Misc/Ratio": imp_weights.detach().mean().item(),
         }
+        
+        # For non-velocity tasks (multi-goal), add potential/barrier metrics
+        if not self.is_velocity_task:
+            lagrangian_info.update({
+                "Loss/Aux_task_potential": aux_info['aux_task_loss'],
+                "Loss/Aux_barrier_k": aux_info['aux_barrier_k_loss'],
+                "Loss/Aux_safety": aux_info['aux_safety_loss'],
+                "Loss/Aux_agent_collision": aux_info.get('aux_agent_collision_loss', 0.0),
+                "Loss/Aux_cost_value": aux_info.get('aux_cost_value_loss', 0.0),
+                "Loss/Aux_cost_k": aux_info.get('aux_cost_k_loss', 0.0),
+                "Safe/H_task_mean": aux_info['H_task_mean'],
+                "Safe/H_task_std": aux_info['H_task_std'],
+                "Safe/H_barrier_mean": aux_info['H_barrier_mean'],
+                "Safe/k_mean": aux_info['k_mean'],
+                "Safe/k_std": aux_info['k_std'],
+                "Safe/hazard_proximity": aux_info['hazard_proximity_mean'],
+                "Safe/agent_proximity": aux_info.get('agent_proximity_mean', 0.0),
+                "Safe/barrier_weight": self.policy.actor._get_current_barrier_weight(),
+                "Safe/training_step": self._training_step,
+                "Safe/aux_loss_scale": aux_info.get('aux_loss_scale', 0.0),
+                "Safe/soft_cost_weight": self._get_soft_cost_weight(),
+            })
         
         logger.store(**lagrangian_info)
 
@@ -583,6 +591,21 @@ class Runner:
 
         self.eval_count = 0
         self.video_record_freq = config.get("video_record_freq", 1)
+        
+        # Detect task type for conditional logging
+        self.is_velocity_task = config.get("env_name", "") in multi_agent_velocity_map
+        self.is_multi_goal_task = config.get("env_name", "") in multi_agent_goal_tasks
+        
+        # Velocity thresholds for different scenarios (from safety_gymnasium)
+        self.velocity_thresholds = {
+            'Ant': 2.6222,
+            'HalfCheetah': 3.2096,
+            'Hopper': 0.7402,
+            'Walker2d': 0.6094,
+            'Swimmer': 0.2282,
+            'Humanoid': 2.3475,
+        }
+        self.current_velocity_threshold = self._get_velocity_threshold()
 
         torch.autograd.set_detect_anomaly(False)
         torch.backends.cudnn.enabled = True
@@ -659,10 +682,12 @@ class Runner:
 
             done_episodes_rewards = []
             done_episodes_costs = []
+            last_infos = None  # Store last infos for velocity logging
 
             for step in range(self.config["episode_length"]):
                 values, actions, action_log_probs, rnn_states, rnn_states_critic, cost_preds, rnn_states_cost = self.collect(step)
                 obs, share_obs, rewards, costs, dones, infos, _ = self.envs.step(actions)
+                last_infos = infos  # Save for later velocity info extraction
 
                 dones_env = torch.all(dones, dim=1)
 
@@ -703,8 +728,6 @@ class Runner:
                 aver_episode_costs = torch.stack(done_episodes_costs).mean()
                 self.return_aver_cost(aver_episode_costs)
                 
-                barrier_info = self.collect_barrier_physics_info(obs)
-                
                 log_dict = {
                     "Metrics/EpRet": aver_episode_rewards.item(),
                     "Metrics/EpCost": aver_episode_costs.item(),
@@ -712,8 +735,17 @@ class Runner:
                     "Eval/EpCost": eval_costs,
                 }
                 
-                log_dict["Safe/lamda_lagr"] = self.trainer[0].lamda_lagr
-                log_dict.update(barrier_info)
+                # For velocity tasks: add velocity metrics, skip potential-related Safe params
+                if self.is_velocity_task:
+                    velocity_info = self.collect_velocity_info(last_infos)
+                    log_dict.update(velocity_info)
+                    log_dict["Safe/lamda_lagr"] = self.trainer[0].lamda_lagr
+                    log_dict["Safe/cost_violation"] = self.trainer[0]._ema_cost - self.config.get("cost_limit", 25.0) if self.trainer[0]._ema_cost else 0.0
+                else:
+                    # For multi-goal tasks: include all barrier/potential metrics
+                    barrier_info = self.collect_barrier_physics_info(obs)
+                    log_dict["Safe/lamda_lagr"] = self.trainer[0].lamda_lagr
+                    log_dict.update(barrier_info)
                 
                 self.logger.store(**log_dict)
                 
@@ -721,7 +753,6 @@ class Runner:
                 self.logger.log_tabular("Metrics/EpCost", min_and_max=True, std=True)
                 self.logger.log_tabular("Eval/EpRet")
                 self.logger.log_tabular("Eval/EpCost")
-                self.logger.log_tabular("Train/Epoch", episode)
                 self.logger.log_tabular("Train/TotalSteps", total_num_steps)
                 self.logger.log_tabular("Loss/Loss_reward_critic")
                 self.logger.log_tabular("Loss/Loss_cost_critic")
@@ -730,28 +761,40 @@ class Runner:
                 self.logger.log_tabular("Misc/Entropy")
                 self.logger.log_tabular("Misc/Ratio")
                 
-                self.logger.log_tabular("Loss/Aux_task_potential")
-                self.logger.log_tabular("Loss/Aux_barrier_k")
-                self.logger.log_tabular("Loss/Aux_safety")
-                self.logger.log_tabular("Loss/Aux_agent_collision")
-                self.logger.log_tabular("Loss/Aux_cost_value")
-                self.logger.log_tabular("Loss/Aux_cost_k")
-                self.logger.log_tabular("Safe/H_task_mean")
-                self.logger.log_tabular("Safe/H_task_std")
-                self.logger.log_tabular("Safe/H_barrier_mean")
-                self.logger.log_tabular("Safe/k_mean")
-                self.logger.log_tabular("Safe/k_std")
-                self.logger.log_tabular("Safe/hazard_proximity")
-                self.logger.log_tabular("Safe/agent_proximity")
-                self.logger.log_tabular("Safe/lamda_lagr")
-                self.logger.log_tabular("Safe/cost_violation")
-                self.logger.log_tabular("Safe/barrier_weight")
-                self.logger.log_tabular("Safe/training_step")
-                self.logger.log_tabular("Safe/aux_loss_scale")
-                self.logger.log_tabular("Safe/soft_cost_weight")
-                
-                for physics_key in barrier_info.keys():
-                    self.logger.log_tabular(physics_key)
+                if self.is_velocity_task:
+                    # Velocity task specific logging
+                    self.logger.log_tabular("Safe/lamda_lagr")
+                    self.logger.log_tabular("Safe/cost_violation")
+                    if 'Velocity/x_velocity' in log_dict:
+                        self.logger.log_tabular("Velocity/x_velocity")
+                    if 'Velocity/velocity_ratio' in log_dict:
+                        self.logger.log_tabular("Velocity/velocity_ratio")
+                    if 'Velocity/y_velocity' in log_dict:
+                        self.logger.log_tabular("Velocity/y_velocity")
+                else:
+                    # Multi-goal task: log all potential/barrier metrics
+                    self.logger.log_tabular("Loss/Aux_task_potential")
+                    self.logger.log_tabular("Loss/Aux_barrier_k")
+                    self.logger.log_tabular("Loss/Aux_safety")
+                    self.logger.log_tabular("Loss/Aux_agent_collision")
+                    self.logger.log_tabular("Loss/Aux_cost_value")
+                    self.logger.log_tabular("Loss/Aux_cost_k")
+                    self.logger.log_tabular("Safe/H_task_mean")
+                    self.logger.log_tabular("Safe/H_task_std")
+                    self.logger.log_tabular("Safe/H_barrier_mean")
+                    self.logger.log_tabular("Safe/k_mean")
+                    self.logger.log_tabular("Safe/k_std")
+                    self.logger.log_tabular("Safe/hazard_proximity")
+                    self.logger.log_tabular("Safe/agent_proximity")
+                    self.logger.log_tabular("Safe/lamda_lagr")
+                    self.logger.log_tabular("Safe/cost_violation")
+                    self.logger.log_tabular("Safe/barrier_weight")
+                    self.logger.log_tabular("Safe/training_step")
+                    self.logger.log_tabular("Safe/aux_loss_scale")
+                    self.logger.log_tabular("Safe/soft_cost_weight")
+                    
+                    for physics_key in barrier_info.keys():
+                        self.logger.log_tabular(physics_key)
                 
                 self.logger.log_tabular("Time/Total", end - start)
                 self.logger.log_tabular("Time/FPS", int(total_num_steps / (end - start)))
@@ -760,14 +803,53 @@ class Runner:
                 pbar.set_postfix({
                     'EpRet': f"{aver_episode_rewards.item():.2f}",
                     'EpCost': f"{aver_episode_costs.item():.2f}",
-                    # 'λ': f"{self.trainer[0].lamda_lagr:.2f}",
-                    # 'bw': f"{self.trainer[0].policy.actor._get_current_barrier_weight():.3f}",
                 })
         pbar.close()
 
     def return_aver_cost(self, aver_episode_costs):
         for agent_id in range(self.num_agents):
             self.buffer[agent_id].return_aver_insert(aver_episode_costs)
+
+    def _get_velocity_threshold(self):
+        """Get velocity threshold based on scenario type."""
+        env_name = self.config.get("env_name", "")
+        for scenario, threshold in self.velocity_thresholds.items():
+            if scenario in env_name:
+                return threshold
+        return 1.0  # Default threshold
+
+    def collect_velocity_info(self, infos):
+        """Collect velocity information from environment infos for velocity tasks."""
+        velocity_info = {}
+        if not self.is_velocity_task:
+            return velocity_info
+        
+        x_velocities = []
+        y_velocities = []
+        
+        # infos is a tuple of lists, one per rollout thread
+        for thread_infos in infos:
+            if isinstance(thread_infos, (list, tuple)):
+                for agent_info in thread_infos:
+                    if isinstance(agent_info, dict):
+                        if 'x_velocity' in agent_info:
+                            x_velocities.append(agent_info['x_velocity'])
+                        if 'y_velocity' in agent_info:
+                            y_velocities.append(agent_info['y_velocity'])
+            elif isinstance(thread_infos, dict):
+                if 'x_velocity' in thread_infos:
+                    x_velocities.append(thread_infos['x_velocity'])
+                if 'y_velocity' in thread_infos:
+                    y_velocities.append(thread_infos['y_velocity'])
+        
+        if x_velocities:
+            avg_x_vel = np.mean(x_velocities)
+            velocity_info['Velocity/x_velocity'] = avg_x_vel
+            velocity_info['Velocity/velocity_ratio'] = avg_x_vel / self.current_velocity_threshold
+        if y_velocities:
+            velocity_info['Velocity/y_velocity'] = np.mean(y_velocities)
+        
+        return velocity_info
 
     def warmup(self):
         obs, share_obs, _ = self.envs.reset()
@@ -1188,16 +1270,16 @@ class Runner:
                     one_episode_costs[:, eval_i] = 0
 
             if eval_episode >= eval_episodes:
-                # # Upload video for the first episode (fixed-interval recording)
-                # if len(first_episode_frames) > 0 and should_record_video:
-                #     if self.video_recorder.enabled:
-                #         self.video_recorder.recorder.frames = first_episode_frames
-                #         caption = f"Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
-                #         self.video_recorder.recorder.upload_to_wandb(
-                #             caption=caption,
-                #             step=total_steps,
-                #             key="eval/video"
-                #         )
+                # Upload video for the first episode (fixed-interval recording)
+                if len(first_episode_frames) > 0 and should_record_video:
+                    if self.video_recorder.enabled:
+                        self.video_recorder.recorder.frames = first_episode_frames
+                        caption = f"Eval #{self.eval_count} - Reward: {first_episode_reward:.2f}, Cost: {first_episode_cost:.2f}"
+                        self.video_recorder.recorder.upload_to_wandb(
+                            caption=caption,
+                            step=total_steps,
+                            key="eval/video"
+                        )
 
                 # Save potential field video
                 if len(potential_field_frames) > 0 and should_record_video and is_multi_goal_task:
