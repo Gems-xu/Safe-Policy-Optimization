@@ -346,8 +346,13 @@ class PHSMAPPOActor(nn.Module):
         # Velocity Task: R matrix configuration
         # R = R0 + R_learned where R0 is base damping, R_learned is adaptive
         self.velocity_r_base = config.get("velocity_r_base", 0.1)  # R0 base value
-        self.velocity_r_max = config.get("velocity_r_max", 2.0)  # Max R_learned scale
+        self.velocity_r_max = config.get("velocity_r_max", 1.0)  # Max R_learned scale
         self.velocity_safety_threshold = config.get("velocity_safety_threshold", 0.8)  # Speed threshold for safety
+        self.velocity_posture_threshold = config.get("velocity_posture_threshold", 0.35)
+        self.velocity_posture_r_scale = config.get("velocity_posture_r_scale", 1.2)
+        self.velocity_posture_gate = config.get("velocity_posture_gate", 0.5)
+        self.velocity_posture_correction_weight = config.get("velocity_posture_correction_weight", 0.25)
+        self.velocity_posture_correction_max = config.get("velocity_posture_correction_max", 0.5)
         
         # Barrier potential parameters
         self.r_collision = config.get("r_collision", 0.17)  # Collision radius
@@ -496,6 +501,26 @@ class PHSMAPPOActor(nn.Module):
                 nn.ELU(),
                 nn.Linear(self.hidden_size // 2, self.act_dim),
                 nn.Sigmoid()  # Output in [0, 1] for safety factor
+            )
+
+            # Infer qpos/qvel split for MuJoCo velocity tasks
+            self.velocity_state_raw_dim = max(self.obs_dim - self.n_agents, 1)
+            self.velocity_n_qpos = self.velocity_state_raw_dim // 2
+            self.velocity_n_qvel = max(self.velocity_state_raw_dim - self.velocity_n_qpos, 1)
+
+            # Project full qvel to act_dim for better control alignment
+            self.velocity_proj_net = nn.Sequential(
+                nn.Linear(self.velocity_n_qvel, self.hidden_size // 2),
+                nn.ELU(),
+                nn.Linear(self.hidden_size // 2, self.act_dim)
+            )
+
+            # Posture correction network: map qpos to corrective action
+            self.velocity_posture_net = nn.Sequential(
+                nn.Linear(self.velocity_n_qpos, self.hidden_size // 2),
+                nn.ELU(),
+                nn.Linear(self.hidden_size // 2, self.act_dim),
+                nn.Tanh()
             )
         
         # ========== 1. Feature Extraction (Shared) ==========
@@ -675,6 +700,14 @@ class PHSMAPPOActor(nn.Module):
         
         for m in self.std_net:
             init_layer(m, gain=0.1)
+
+        if self.is_velocity_task:
+            for m in self.velocity_proj_net:
+                if isinstance(m, nn.Linear):
+                    init_layer(m, gain=0.5)
+            for m in self.velocity_posture_net:
+                if isinstance(m, nn.Linear):
+                    init_layer(m, gain=0.3)
     
     def _get_current_barrier_weight(self):
         """
@@ -1151,27 +1184,36 @@ class PHSMAPPOActor(nn.Module):
             # ========== 1. Extract velocity from observation ==========
             # MAMuJoCo observation structure: [qpos, qvel, agent_id_onehot]
             # Velocity typically in the middle portion
-            num_agents_detected = self.n_agents
-            state_raw_dim = self.obs_dim - num_agents_detected  # Remove agent_id one-hot
-            n_qpos = state_raw_dim // 2  # Rough split
-            n_qvel = state_raw_dim - n_qpos
-            
-            vel_start = n_qpos
-            vel_end = n_qpos + min(n_qvel, self.act_dim)  # Only need act_dim velocities
-            
-            # Extract velocity components relevant to control
-            obs_vel = obs_flat[:, vel_start:vel_end]  # [batch, act_dim or less]
-            
-            # Pad if necessary
-            if obs_vel.shape[-1] < self.act_dim:
-                pad_size = self.act_dim - obs_vel.shape[-1]
-                obs_vel = torch.cat([obs_vel, torch.zeros(obs_vel.shape[0], pad_size, device=obs_vel.device)], dim=-1)
-            elif obs_vel.shape[-1] > self.act_dim:
-                obs_vel = obs_vel[:, :self.act_dim]
+            vel_start = self.velocity_n_qpos
+            vel_end = vel_start + self.velocity_n_qvel
+
+            # Extract full qvel
+            obs_vel_full = obs_flat[:, vel_start:vel_end]
+            if obs_vel_full.shape[-1] < self.velocity_n_qvel:
+                pad_size = self.velocity_n_qvel - obs_vel_full.shape[-1]
+                obs_vel_full = torch.cat(
+                    [obs_vel_full, torch.zeros(obs_vel_full.shape[0], pad_size, device=obs_vel_full.device)], dim=-1
+                )
+            elif obs_vel_full.shape[-1] > self.velocity_n_qvel:
+                obs_vel_full = obs_vel_full[:, :self.velocity_n_qvel]
+
+            # Project full velocity to control-relevant space
+            obs_vel = self.velocity_proj_net(obs_vel_full)
+
+            # Estimate posture risk from qpos (exclude root x translation)
+            qpos = obs_flat[:, :self.velocity_n_qpos]
+            if qpos.shape[-1] > 1:
+                posture_dev = torch.mean(torch.abs(qpos[:, 1:]), dim=-1, keepdim=True)
+            else:
+                posture_dev = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+            posture_risk = torch.clamp(posture_dev - self.velocity_posture_threshold, min=0.0)
+            posture_correction = -self.velocity_posture_net(qpos)
+            posture_correction = -self.velocity_posture_net(qpos)
+            posture_correction = -self.velocity_posture_net(qpos)
             
             # ========== 2. Compute Kinetic Energy Hamiltonian ==========
             # H = 0.5 * ||v||^2 (unit mass assumption)
-            H_kin = 0.5 * (obs_vel ** 2).sum(dim=-1, keepdim=True)  # [batch, 1]
+            H_kin = 0.5 * (obs_vel_full ** 2).sum(dim=-1, keepdim=True)  # [batch, 1]
             
             # ∇H = v (gradient of kinetic energy w.r.t. velocity)
             grad_H_vel = obs_vel  # [batch, act_dim]
@@ -1190,8 +1232,8 @@ class PHSMAPPOActor(nn.Module):
             
             # Total R diagonal: R0 + R_learned * (1 + safety_factor * vel_risk)
             R_diag_total = (
-                self.velocity_r_base + 
-                R_diag_learned * (1.0 + safety_factor * vel_risk * self.velocity_r_max)
+                self.velocity_r_base +
+                R_diag_learned * (1.0 + safety_factor * vel_risk * self.velocity_r_max + posture_risk * self.velocity_posture_r_scale)
             )  # [batch, act_dim]
             
             # ========== 4. Policy Network for Desired Dynamics ==========
@@ -1200,7 +1242,13 @@ class PHSMAPPOActor(nn.Module):
             residual = self.residual_mlp(state_features_flat)
             residual_w = torch.sigmoid(self.residual_weight) * 0.3
             
-            dx_target = policy_output + residual_w * residual
+            posture_gate = 1.0 - torch.clamp(self.velocity_posture_gate * posture_risk, min=0.0, max=0.8)
+            posture_scale = torch.clamp(
+                self.velocity_posture_correction_weight * posture_risk,
+                min=0.0,
+                max=self.velocity_posture_correction_max
+            )
+            dx_target = (policy_output + residual_w * residual) * posture_gate + posture_scale * posture_correction
             
             # ========== 5. PHS Dynamics: (J - R) * ∇H ==========
             # For velocity-only state, we simplify to just the velocity dynamics
@@ -1242,6 +1290,8 @@ class PHSMAPPOActor(nn.Module):
                 'safety_factor_mean': safety_factor.mean().item(),
                 'vel_magnitude_mean': vel_magnitude.mean().item(),
                 'phs_drift_mean': phs_drift.mean().item(),
+                'posture_risk_mean': posture_risk.mean().item(),
+                'posture_correction_mean': posture_correction.mean().item(),
             }
             
             return u_mean, H_info, state_features
@@ -1491,22 +1541,31 @@ class PHSMAPPOActor(nn.Module):
                 obs_flat = obs
                 state_features_flat = state_features
             
-            # Extract velocity from observation
-            num_agents_detected = self.n_agents
-            state_raw_dim = self.obs_dim - num_agents_detected
-            n_qpos = state_raw_dim // 2
-            vel_start = n_qpos
-            vel_end = n_qpos + min(state_raw_dim - n_qpos, self.act_dim)
-            
-            obs_vel = obs_flat[:, vel_start:vel_end]
-            if obs_vel.shape[-1] < self.act_dim:
-                pad_size = self.act_dim - obs_vel.shape[-1]
-                obs_vel = torch.cat([obs_vel, torch.zeros(obs_vel.shape[0], pad_size, device=obs_vel.device)], dim=-1)
-            elif obs_vel.shape[-1] > self.act_dim:
-                obs_vel = obs_vel[:, :self.act_dim]
+            # Extract full velocity from observation
+            vel_start = self.velocity_n_qpos
+            vel_end = vel_start + self.velocity_n_qvel
+            obs_vel_full = obs_flat[:, vel_start:vel_end]
+            if obs_vel_full.shape[-1] < self.velocity_n_qvel:
+                pad_size = self.velocity_n_qvel - obs_vel_full.shape[-1]
+                obs_vel_full = torch.cat(
+                    [obs_vel_full, torch.zeros(obs_vel_full.shape[0], pad_size, device=obs_vel_full.device)], dim=-1
+                )
+            elif obs_vel_full.shape[-1] > self.velocity_n_qvel:
+                obs_vel_full = obs_vel_full[:, :self.velocity_n_qvel]
+
+            # Project to control-relevant velocity
+            obs_vel = self.velocity_proj_net(obs_vel_full)
+
+            # Posture risk from qpos (exclude root x translation)
+            qpos = obs_flat[:, :self.velocity_n_qpos]
+            if qpos.shape[-1] > 1:
+                posture_dev = torch.mean(torch.abs(qpos[:, 1:]), dim=-1, keepdim=True)
+            else:
+                posture_dev = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+            posture_risk = torch.clamp(posture_dev - self.velocity_posture_threshold, min=0.0)
             
             # Compute kinetic energy
-            H_kin = 0.5 * (obs_vel ** 2).sum(dim=-1, keepdim=True)
+            H_kin = 0.5 * (obs_vel_full ** 2).sum(dim=-1, keepdim=True)
             
             # Compute R matrix components
             R_diag_learned = self.R_learned_net(obs_flat)
@@ -1514,7 +1573,10 @@ class PHSMAPPOActor(nn.Module):
             vel_magnitude = torch.norm(obs_vel, dim=-1, keepdim=True)
             vel_normalized = vel_magnitude / (self.velocity_safety_threshold + 1e-6)
             vel_risk = torch.clamp(vel_normalized - 1.0, min=0.0)
-            R_diag_total = self.velocity_r_base + R_diag_learned * (1.0 + safety_factor * vel_risk * self.velocity_r_max)
+            R_diag_total = (
+                self.velocity_r_base +
+                R_diag_learned * (1.0 + safety_factor * vel_risk * self.velocity_r_max + posture_risk * self.velocity_posture_r_scale)
+            )
             
             return {
                 'H_total': H_kin.mean().detach(),
@@ -1539,6 +1601,8 @@ class PHSMAPPOActor(nn.Module):
                 'safety_factor_mean': safety_factor.mean().detach(),
                 'vel_magnitude_mean': vel_magnitude.mean().detach(),
                 'vel_risk_mean': vel_risk.mean().detach(),
+                'posture_risk_mean': posture_risk.mean().detach(),
+                'posture_correction_mean': posture_correction.mean().detach(),
             }
         
         obs_norm = self.feature_norm(obs)

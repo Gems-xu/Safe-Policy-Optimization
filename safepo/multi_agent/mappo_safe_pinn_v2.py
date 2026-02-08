@@ -301,6 +301,26 @@ class MAPPOSafePINNv2Trainer:
         1. Task potential guidance toward goal
         2. Barrier stiffness response to hazards
         """
+        if self.is_velocity_task:
+            device = obs_batch.device
+            zero = torch.tensor(0.0, device=device)
+            aux_info = {
+                'aux_task_loss': 0.0,
+                'aux_barrier_k_loss': 0.0,
+                'aux_safety_loss': 0.0,
+                'aux_agent_collision_loss': 0.0,
+                'aux_cost_value_loss': 0.0,
+                'aux_cost_k_loss': 0.0,
+                'H_task_mean': 0.0,
+                'H_task_std': 0.0,
+                'H_barrier_mean': 0.0,
+                'k_mean': 0.0,
+                'k_std': 0.0,
+                'hazard_proximity_mean': 0.0,
+                'agent_proximity_mean': 0.0,
+                'aux_loss_scale': self._get_aux_loss_scale(),
+            }
+            return zero, aux_info
         device = obs_batch.device
         actor = self.policy.actor
         
@@ -1343,6 +1363,60 @@ def train(args, cfg_train):
     # Add task/env_name to config for task type detection in PHSMAPPOActor
     cfg_train["env_name"] = args.task
     cfg_train["task"] = args.task
+
+    # Velocity task: set scenario-aware safety threshold (if not overridden)
+    if args.task in multi_agent_velocity_map:
+        cfg_train.setdefault("normalize_obs", False)
+        cfg_train.setdefault("normalize_share_obs", True)
+        cfg_train.setdefault("terminate_on_fall", True)
+        fall_height_thresholds = {
+            'Ant': 0.28,
+            'HalfCheetah': 0.35,
+            'Hopper': 0.45,
+            'Walker2d': 0.80,
+            'Swimmer': 0.10,
+            'Humanoid': 1.00,
+        }
+        cfg_train.setdefault("fall_height_threshold", fall_height_thresholds.get(args.scenario, 0.3))
+        velocity_thresholds = {
+            'Ant': 2.6222,
+            'HalfCheetah': 3.2096,
+            'Hopper': 0.7402,
+            'Walker2d': 0.6094,
+            'Swimmer': 0.2282,
+            'Humanoid': 2.3475,
+        }
+        posture_thresholds = {
+            'Ant': 0.45,
+            'HalfCheetah': 0.28,
+            'Hopper': 0.35,
+            'Walker2d': 0.35,
+            'Swimmer': 0.25,
+            'Humanoid': 0.60,
+        }
+        posture_correction_weights = {
+            'Ant': 0.20,
+            'HalfCheetah': 0.35,
+            'Hopper': 0.25,
+            'Walker2d': 0.25,
+            'Swimmer': 0.15,
+            'Humanoid': 0.20,
+        }
+        scenario_threshold = velocity_thresholds.get(args.scenario, 1.0)
+        cfg_train.setdefault("velocity_safety_threshold", scenario_threshold)
+        cfg_train.setdefault("velocity_posture_threshold", posture_thresholds.get(args.scenario, 0.35))
+        cfg_train.setdefault("velocity_posture_correction_weight", posture_correction_weights.get(args.scenario, 0.25))
+
+        # HalfCheetah-specific tuning by agent configuration
+        if args.scenario == "HalfCheetah":
+            if args.agent_conf == "2x3":
+                cfg_train.setdefault("velocity_posture_threshold", 0.24)
+                cfg_train.setdefault("velocity_posture_correction_weight", 0.50)
+                cfg_train.setdefault("velocity_posture_r_scale", 1.6)
+            elif args.agent_conf == "6x1":
+                cfg_train.setdefault("velocity_safety_threshold", 3.6)
+                cfg_train.setdefault("velocity_r_base", 0.06)
+                cfg_train.setdefault("velocity_posture_correction_weight", 0.20)
     
     if args.task in multi_agent_velocity_map:
         env = make_ma_mujoco_env(

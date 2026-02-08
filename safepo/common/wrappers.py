@@ -405,6 +405,10 @@ if SafeMAEnv is not None:
             local_categories: list[list[str]] | None = None,
             global_categories: tuple[str, ...] | None = None,
             render_mode: str | None = None,
+            normalize_obs: bool = True,
+            normalize_share_obs: bool = True,
+            terminate_on_fall: bool = False,
+            fall_height_threshold: float = 0.3,
             **kwargs,
         ):
             super().__init__(
@@ -417,6 +421,10 @@ if SafeMAEnv is not None:
                 render_mode=render_mode,
                 **kwargs,
             )
+            self.normalize_obs = normalize_obs
+            self.normalize_share_obs = normalize_share_obs
+            self.terminate_on_fall = terminate_on_fall
+            self.fall_height_threshold = fall_height_threshold
             self.num_agents = len(self.agent_action_partitions)
             self.n_actions = max([len(l) for l in self.agent_action_partitions])
             
@@ -442,7 +450,8 @@ if SafeMAEnv is not None:
                 agent_id_feats = np.zeros(self.num_agents, dtype=np.float32)
                 agent_id_feats[a] = 1.0
                 obs_i = np.concatenate([state, agent_id_feats])
-                obs_i = (obs_i - np.mean(obs_i)) / np.std(obs_i)
+                if self.normalize_obs:
+                    obs_i = (obs_i - np.mean(obs_i)) / (np.std(obs_i) + 1e-8)
                 obs_n.append(obs_i)
             return obs_n
 
@@ -451,7 +460,10 @@ if SafeMAEnv is not None:
 
         def _get_share_obs(self):
             state = self.env.state()
-            state_normed = (state - np.mean(state)) / (np.std(state)+1e-8)
+            if self.normalize_share_obs:
+                state_normed = (state - np.mean(state)) / (np.std(state) + 1e-8)
+            else:
+                state_normed = state
             share_obs = []
             for _ in range(self.num_agents):
                 share_obs.append(state_normed)
@@ -467,6 +479,26 @@ if SafeMAEnv is not None:
                     self.n_actions,
                 )
             )
+
+        def _is_fallen(self) -> bool:
+            env = getattr(self, 'env', None)
+            if env is None:
+                return False
+            single_env = getattr(env, 'single_agent_env', None)
+            if single_env is None:
+                return False
+            if hasattr(single_env, 'is_healthy'):
+                try:
+                    return not bool(single_env.is_healthy)
+                except Exception:
+                    pass
+            if hasattr(single_env, 'get_body_com'):
+                try:
+                    torso_z = float(single_env.get_body_com('torso')[2])
+                    return torso_z < self.fall_height_threshold
+                except Exception:
+                    pass
+            return False
 
         def reset(self, seed=None):
             obs_dict, info = super().reset(seed=seed)
@@ -490,6 +522,12 @@ if SafeMAEnv is not None:
                     action = action.cpu().numpy()
                 dict_actions[agent] = action
             _, rewards, costs, terminations, truncations, infos = super().step(dict_actions)
+
+            if self.terminate_on_fall and self._is_fallen():
+                for agent in self.possible_agents:
+                    terminations[agent] = True
+                    if isinstance(infos.get(agent, None), dict):
+                        infos[agent]['fell'] = True
             dones={}
             for agent_id, agent in enumerate(self.possible_agents):
                 dones[agent] = terminations[agent] or truncations[agent]

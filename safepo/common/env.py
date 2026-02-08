@@ -145,6 +145,10 @@ def make_ma_mujoco_env(scenario, agent_conf, seed, cfg_train):
                 scenario=scenario,
                 agent_conf=agent_conf,
                 render_mode=render_mode if rank == 0 else None,  # Only enable render for first env
+                normalize_obs=cfg_train.get('normalize_obs', True),
+                normalize_share_obs=cfg_train.get('normalize_share_obs', True),
+                terminate_on_fall=cfg_train.get('terminate_on_fall', False),
+                fall_height_threshold=cfg_train.get('fall_height_threshold', 0.3),
             )
             env.reset(seed=seed + rank * 1000)
             return env
