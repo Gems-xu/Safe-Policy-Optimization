@@ -77,7 +77,7 @@ if torch.cuda.is_available():
 
 from safepo.common.env import make_ma_mujoco_env, make_ma_isaac_env, make_ma_multi_goal_env
 from safepo.common.popart import PopArt
-from safepo.common.model import MultiAgentCritic as Critic
+from safepo.common.model import MultiAgentActor as Actor, MultiAgentCritic as Critic
 from safepo.common.buffer import SeparatedReplayBuffer
 from safepo.common.logger import EpochLogger
 from safepo.common.video_recorder import MultiAgentVideoRecorder, setup_headless_rendering
@@ -120,15 +120,22 @@ class MAPPOSafePINNv2Policy:
         self.n_agents = n_agents
         self.agent_id = agent_id
 
-        # Use new PHS-MAPPO Actor with embedded physics
-        self.actor = PHSMAPPOActor(
-            config, 
-            self.obs_space, 
-            self.act_space, 
-            self.config["device"],
-            n_agents=n_agents,
-            agent_id=agent_id  # Pass agent_id so it knows which goal to focus on
-        )
+        self.is_velocity_task = config.get("env_name", "") in multi_agent_velocity_map
+        use_baseline_actor = self.is_velocity_task and config.get("velocity_use_baseline_actor", False)
+
+        if use_baseline_actor:
+            # Match original MAPPO/MAPPOLAG actor for velocity tasks
+            self.actor = Actor(config, self.obs_space, self.act_space, self.config["device"])
+        else:
+            # Use new PHS-MAPPO Actor with embedded physics
+            self.actor = PHSMAPPOActor(
+                config,
+                self.obs_space,
+                self.act_space,
+                self.config["device"],
+                n_agents=n_agents,
+                agent_id=agent_id  # Pass agent_id so it knows which goal to focus on
+            )
         
         # Standard Critic for reward
         self.critic = Critic(config, self.share_obs_space, self.config["device"])
@@ -517,7 +524,8 @@ class MAPPOSafePINNv2Trainer:
         
         # Update training step for barrier warmup
         self._training_step += 1
-        self.policy.actor.set_training_step(self._training_step)
+        if hasattr(self.policy.actor, "set_training_step"):
+            self.policy.actor.set_training_step(self._training_step)
 
         return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info
 
@@ -615,6 +623,10 @@ class Runner:
         # Detect task type for conditional logging
         self.is_velocity_task = config.get("env_name", "") in multi_agent_velocity_map
         self.is_multi_goal_task = config.get("env_name", "") in multi_agent_goal_tasks
+        self.scenario = config.get("scenario", "")
+        self.posture_reward_weight = float(config.get("posture_reward_weight", 0.0))
+        self.posture_reward_threshold = float(config.get("posture_reward_threshold", 0.0))
+        self.posture_reward_clip = float(config.get("posture_reward_clip", 1.0))
         
         # Velocity thresholds for different scenarios (from safety_gymnasium)
         self.velocity_thresholds = {
@@ -991,6 +1003,23 @@ class Runner:
             
             agent_env_cost = costs[:, agent_id].unsqueeze(-1)
             agent_reward = rewards[:, agent_id].unsqueeze(-1)
+
+            # HalfCheetah 2x3 posture shaping (only for this algo)
+            if (
+                self.is_velocity_task
+                and self.scenario == "HalfCheetah"
+                and self.posture_reward_weight > 0.0
+                and not self.config.get("normalize_obs", True)
+            ):
+                obs_dim = obs_to_insert.shape[-1]
+                state_raw_dim = max(obs_dim - self.num_agents, 1)
+                n_qpos = state_raw_dim // 2
+                if n_qpos > 1:
+                    qpos = obs_to_insert[:, :n_qpos]
+                    posture_dev = torch.mean(torch.abs(qpos[:, 1:]), dim=-1, keepdim=True)
+                    excess = torch.clamp(posture_dev - self.posture_reward_threshold, min=0.0)
+                    posture_penalty = torch.clamp(excess, max=self.posture_reward_clip)
+                    agent_reward = agent_reward - self.posture_reward_weight * posture_penalty
             
             # Soft cost augmentation
             if soft_cost_weight > 0:
@@ -1363,11 +1392,23 @@ def train(args, cfg_train):
     # Add task/env_name to config for task type detection in PHSMAPPOActor
     cfg_train["env_name"] = args.task
     cfg_train["task"] = args.task
+    cfg_train["scenario"] = args.scenario
 
     # Velocity task: set scenario-aware safety threshold (if not overridden)
     if args.task in multi_agent_velocity_map:
-        cfg_train.setdefault("normalize_obs", False)
-        cfg_train.setdefault("normalize_share_obs", True)
+        use_baseline_actor = False
+        if args.scenario == "HalfCheetah" and args.agent_conf == "2x3":
+            use_baseline_actor = True
+        if args.scenario == "Ant":
+            use_baseline_actor = True
+        cfg_train.setdefault("velocity_use_baseline_actor", use_baseline_actor)
+
+        if cfg_train.get("velocity_use_baseline_actor", False):
+            cfg_train.setdefault("normalize_obs", True)
+            cfg_train.setdefault("normalize_share_obs", True)
+        else:
+            cfg_train.setdefault("normalize_obs", False)
+            cfg_train.setdefault("normalize_share_obs", True)
         cfg_train.setdefault("terminate_on_fall", True)
         fall_height_thresholds = {
             'Ant': 0.28,
@@ -1413,6 +1454,9 @@ def train(args, cfg_train):
                 cfg_train.setdefault("velocity_posture_threshold", 0.24)
                 cfg_train.setdefault("velocity_posture_correction_weight", 0.50)
                 cfg_train.setdefault("velocity_posture_r_scale", 1.6)
+                cfg_train.setdefault("posture_reward_weight", 0.10)
+                cfg_train.setdefault("posture_reward_threshold", 0.20)
+                cfg_train.setdefault("posture_reward_clip", 1.0)
             elif args.agent_conf == "6x1":
                 cfg_train.setdefault("velocity_safety_threshold", 3.6)
                 cfg_train.setdefault("velocity_r_base", 0.06)
