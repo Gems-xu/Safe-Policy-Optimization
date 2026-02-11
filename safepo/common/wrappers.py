@@ -409,6 +409,8 @@ if SafeMAEnv is not None:
             normalize_share_obs: bool = True,
             terminate_on_fall: bool = False,
             fall_height_threshold: float = 0.3,
+            adaptive_fall_threshold: bool = True,
+            fall_pitch_threshold: float = 0.5,  # radians (~28 degrees)
             **kwargs,
         ):
             super().__init__(
@@ -425,6 +427,11 @@ if SafeMAEnv is not None:
             self.normalize_share_obs = normalize_share_obs
             self.terminate_on_fall = terminate_on_fall
             self.fall_height_threshold = fall_height_threshold
+            self.adaptive_fall_threshold = adaptive_fall_threshold
+            self.fall_pitch_threshold = fall_pitch_threshold
+            self._initial_fall_threshold = fall_height_threshold
+            self._training_steps = 0
+            self._fall_threshold_warmup_steps = 50000  # Gradually tighten threshold
             self.num_agents = len(self.agent_action_partitions)
             self.n_actions = max([len(l) for l in self.agent_action_partitions])
             
@@ -480,25 +487,90 @@ if SafeMAEnv is not None:
                 )
             )
 
-        def _is_fallen(self) -> bool:
+        def _is_fallen(self) -> tuple[bool, float]:
+            """
+            Enhanced fall detection with pitch/roll angle and adaptive thresholds.
+            
+            Returns:
+                is_fallen: bool - whether agent has fallen
+                fall_risk: float - fall risk score in [0, 1] for near-fall warning
+            """
             env = getattr(self, 'env', None)
             if env is None:
-                return False
+                return False, 0.0
             single_env = getattr(env, 'single_agent_env', None)
             if single_env is None:
-                return False
+                return False, 0.0
+            
+            fall_risk = 0.0
+            
+            # Check is_healthy first (if available)
             if hasattr(single_env, 'is_healthy'):
                 try:
-                    return not bool(single_env.is_healthy)
+                    if not bool(single_env.is_healthy):
+                        return True, 1.0
                 except Exception:
                     pass
+            
+            # Check torso height
             if hasattr(single_env, 'get_body_com'):
                 try:
                     torso_z = float(single_env.get_body_com('torso')[2])
-                    return torso_z < self.fall_height_threshold
+                    
+                    # Adaptive threshold: start lenient, gradually tighten
+                    if self.adaptive_fall_threshold:
+                        progress = min(self._training_steps / self._fall_threshold_warmup_steps, 1.0)
+                        # Start at 0.7 * threshold, gradually tighten to full threshold
+                        current_threshold = self._initial_fall_threshold * (0.7 + 0.3 * progress)
+                    else:
+                        current_threshold = self.fall_height_threshold
+                    
+                    # Calculate fall risk based on height
+                    # When torso_z approaches threshold, fall_risk increases
+                    height_margin = torso_z - current_threshold
+                    if height_margin < 0:
+                        return True, 1.0
+                    elif height_margin < 0.15:  # Warning zone: within 15cm of threshold
+                        fall_risk = max(fall_risk, 1.0 - height_margin / 0.15)
+                    
                 except Exception:
                     pass
-            return False
+            
+            # Check pitch/roll angle (for HalfCheetah, Ant, etc.)
+            if hasattr(single_env, 'data') and hasattr(single_env.data, 'qpos'):
+                try:
+                    # For most MuJoCo robots, qpos includes orientation quaternion
+                    # typically at indices [3:7] (after x,y,z position)
+                    qpos = single_env.data.qpos
+                    if len(qpos) >= 7:
+                        # Extract quaternion (w, x, y, z format in MuJoCo)
+                        quat = qpos[3:7]
+                        
+                        # Convert quaternion to pitch angle
+                        # pitch = arcsin(2(w*y - z*x))
+                        w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+                        pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0))
+                        
+                        # Check if pitch exceeds threshold (tilted too much)
+                        pitch_abs = abs(pitch)
+                        if pitch_abs > self.fall_pitch_threshold:
+                            return True, 1.0
+                        elif pitch_abs > self.fall_pitch_threshold * 0.7:  # Warning zone
+                            pitch_risk = (pitch_abs - self.fall_pitch_threshold * 0.7) / (self.fall_pitch_threshold * 0.3)
+                            fall_risk = max(fall_risk, pitch_risk)
+                    elif len(qpos) >= 3:
+                        # HalfCheetah-style: qpos[2] is root pitch angle (no quaternion)
+                        pitch = float(qpos[2])
+                        pitch_abs = abs(pitch)
+                        if pitch_abs > self.fall_pitch_threshold:
+                            return True, 1.0
+                        elif pitch_abs > self.fall_pitch_threshold * 0.7:
+                            pitch_risk = (pitch_abs - self.fall_pitch_threshold * 0.7) / (self.fall_pitch_threshold * 0.3)
+                            fall_risk = max(fall_risk, pitch_risk)
+                except Exception:
+                    pass
+            
+            return False, fall_risk
 
         def reset(self, seed=None):
             obs_dict, info = super().reset(seed=seed)
@@ -523,11 +595,22 @@ if SafeMAEnv is not None:
                 dict_actions[agent] = action
             _, rewards, costs, terminations, truncations, infos = super().step(dict_actions)
 
-            if self.terminate_on_fall and self._is_fallen():
+            # Enhanced fall detection with risk assessment
+            if self.terminate_on_fall:
+                is_fallen, fall_risk = self._is_fallen()
+                if is_fallen:
+                    for agent in self.possible_agents:
+                        terminations[agent] = True
+                        if isinstance(infos.get(agent, None), dict):
+                            infos[agent]['fell'] = True
+                # Add fall risk to info even if not fallen (for monitoring)
                 for agent in self.possible_agents:
-                    terminations[agent] = True
                     if isinstance(infos.get(agent, None), dict):
-                        infos[agent]['fell'] = True
+                        infos[agent]['fall_risk'] = fall_risk
+            
+            # Increment training steps for adaptive threshold
+            self._training_steps += 1
+            
             dones={}
             for agent_id, agent in enumerate(self.possible_agents):
                 dones[agent] = terminations[agent] or truncations[agent]

@@ -77,7 +77,7 @@ if torch.cuda.is_available():
 
 from safepo.common.env import make_ma_mujoco_env, make_ma_isaac_env, make_ma_multi_goal_env
 from safepo.common.popart import PopArt
-from safepo.common.model import MultiAgentActor as Actor, MultiAgentCritic as Critic
+from safepo.common.model import MultiAgentCritic as Critic
 from safepo.common.buffer import SeparatedReplayBuffer
 from safepo.common.logger import EpochLogger
 from safepo.common.video_recorder import MultiAgentVideoRecorder, setup_headless_rendering
@@ -120,22 +120,15 @@ class MAPPOSafePINNv2Policy:
         self.n_agents = n_agents
         self.agent_id = agent_id
 
-        self.is_velocity_task = config.get("env_name", "") in multi_agent_velocity_map
-        use_baseline_actor = self.is_velocity_task and config.get("velocity_use_baseline_actor", False)
-
-        if use_baseline_actor:
-            # Match original MAPPO/MAPPOLAG actor for velocity tasks
-            self.actor = Actor(config, self.obs_space, self.act_space, self.config["device"])
-        else:
-            # Use new PHS-MAPPO Actor with embedded physics
-            self.actor = PHSMAPPOActor(
-                config,
-                self.obs_space,
-                self.act_space,
-                self.config["device"],
-                n_agents=n_agents,
-                agent_id=agent_id  # Pass agent_id so it knows which goal to focus on
-            )
+        # Use new PHS-MAPPO Actor with embedded physics
+        self.actor = PHSMAPPOActor(
+            config,
+            self.obs_space,
+            self.act_space,
+            self.config["device"],
+            n_agents=n_agents,
+            agent_id=agent_id  # Pass agent_id so it knows which goal to focus on
+        )
         
         # Standard Critic for reward
         self.critic = Critic(config, self.share_obs_space, self.config["device"])
@@ -524,8 +517,7 @@ class MAPPOSafePINNv2Trainer:
         
         # Update training step for barrier warmup
         self._training_step += 1
-        if hasattr(self.policy.actor, "set_training_step"):
-            self.policy.actor.set_training_step(self._training_step)
+        self.policy.actor.set_training_step(self._training_step)
 
         return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, aux_info
 
@@ -1396,20 +1388,12 @@ def train(args, cfg_train):
 
     # Velocity task: set scenario-aware safety threshold (if not overridden)
     if args.task in multi_agent_velocity_map:
-        use_baseline_actor = False
-        if args.scenario == "HalfCheetah" and args.agent_conf == "2x3":
-            use_baseline_actor = True
-        if args.scenario == "Ant":
-            use_baseline_actor = True
-        cfg_train.setdefault("velocity_use_baseline_actor", use_baseline_actor)
-
-        if cfg_train.get("velocity_use_baseline_actor", False):
-            cfg_train.setdefault("normalize_obs", True)
-            cfg_train.setdefault("normalize_share_obs", True)
-        else:
-            cfg_train.setdefault("normalize_obs", False)
-            cfg_train.setdefault("normalize_share_obs", True)
+        cfg_train.setdefault("normalize_obs", False)
+        cfg_train.setdefault("normalize_share_obs", True)
         cfg_train.setdefault("terminate_on_fall", True)
+        cfg_train.setdefault("adaptive_fall_threshold", True)  # Gradually tighten during training
+        cfg_train.setdefault("fall_pitch_threshold", 0.5)  # ~28 degrees tilt limit
+        
         fall_height_thresholds = {
             'Ant': 0.28,
             'HalfCheetah': 0.35,
@@ -1419,6 +1403,8 @@ def train(args, cfg_train):
             'Humanoid': 1.00,
         }
         cfg_train.setdefault("fall_height_threshold", fall_height_thresholds.get(args.scenario, 0.3))
+        
+        # Enhanced velocity and base damping parameters
         velocity_thresholds = {
             'Ant': 2.6222,
             'HalfCheetah': 3.2096,
@@ -1427,40 +1413,74 @@ def train(args, cfg_train):
             'Swimmer': 0.2282,
             'Humanoid': 2.3475,
         }
+        base_damping = {
+            'Ant': 0.12,           # Lower damping for leg freedom
+            'HalfCheetah': 0.15,   # Higher damping for stability
+            'Hopper': 0.20,
+            'Walker2d': 0.18,
+            'Swimmer': 0.08,
+            'Humanoid': 0.16,
+        }
         posture_thresholds = {
-            'Ant': 0.45,
-            'HalfCheetah': 0.28,
+            'Ant': 0.40,           # More lenient for Ant
+            'HalfCheetah': 0.30,   # Stricter for HalfCheetah
             'Hopper': 0.35,
             'Walker2d': 0.35,
             'Swimmer': 0.25,
             'Humanoid': 0.60,
         }
         posture_correction_weights = {
-            'Ant': 0.20,
-            'HalfCheetah': 0.35,
+            'Ant': 0.25,           # Higher correction for stability
+            'HalfCheetah': 0.40,   # Strong correction to prevent pitch
             'Hopper': 0.25,
             'Walker2d': 0.25,
             'Swimmer': 0.15,
             'Humanoid': 0.20,
         }
+        
         scenario_threshold = velocity_thresholds.get(args.scenario, 1.0)
         cfg_train.setdefault("velocity_safety_threshold", scenario_threshold)
+        cfg_train.setdefault("velocity_r_base", base_damping.get(args.scenario, 0.10))
         cfg_train.setdefault("velocity_posture_threshold", posture_thresholds.get(args.scenario, 0.35))
         cfg_train.setdefault("velocity_posture_correction_weight", posture_correction_weights.get(args.scenario, 0.25))
 
-        # HalfCheetah-specific tuning by agent configuration
+        # Enhanced HalfCheetah-specific tuning by agent configuration
         if args.scenario == "HalfCheetah":
             if args.agent_conf == "2x3":
-                cfg_train.setdefault("velocity_posture_threshold", 0.24)
-                cfg_train.setdefault("velocity_posture_correction_weight", 0.50)
-                cfg_train.setdefault("velocity_posture_r_scale", 1.6)
-                cfg_train.setdefault("posture_reward_weight", 0.10)
-                cfg_train.setdefault("posture_reward_threshold", 0.20)
-                cfg_train.setdefault("posture_reward_clip", 1.0)
+                # 2x3: Front vs Back legs coordination is critical
+                cfg_train.setdefault("velocity_posture_threshold", 0.25)
+                cfg_train.setdefault("velocity_posture_correction_weight", 0.55)
+                cfg_train.setdefault("velocity_posture_r_scale", 1.8)  # Strong damping when unstable
+                cfg_train.setdefault("velocity_r_base", 0.18)  # Higher base damping
+                cfg_train.setdefault("velocity_pitch_threshold", 0.35)
+                cfg_train.setdefault("velocity_pitch_r_scale", 2.2)
+                cfg_train.setdefault("velocity_pitch_gate", 0.7)
+                cfg_train.setdefault("fall_pitch_threshold", 0.35)
+                cfg_train.setdefault("fall_height_threshold", 0.33)
+                cfg_train.setdefault("posture_reward_weight", 0.12)
+                cfg_train.setdefault("posture_reward_threshold", 0.18)
+                cfg_train.setdefault("posture_reward_clip", 0.8)
             elif args.agent_conf == "6x1":
                 cfg_train.setdefault("velocity_safety_threshold", 3.6)
                 cfg_train.setdefault("velocity_r_base", 0.06)
                 cfg_train.setdefault("velocity_posture_correction_weight", 0.20)
+        
+        # Enhanced Ant-specific tuning by agent configuration
+        elif args.scenario == "Ant":
+            if args.agent_conf == "2x4":
+                # 2x4: Two legs each, need strong coordination
+                cfg_train.setdefault("velocity_posture_threshold", 0.38)
+                cfg_train.setdefault("velocity_posture_correction_weight", 0.30)
+                cfg_train.setdefault("velocity_posture_r_scale", 1.5)
+                cfg_train.setdefault("velocity_r_base", 0.14)
+                cfg_train.setdefault("fall_height_threshold", 0.26)  # Stricter for 2x4
+            elif args.agent_conf == "4x2":
+                # 4x2: Four agents, one joint each, very challenging
+                cfg_train.setdefault("velocity_posture_threshold", 0.42)
+                cfg_train.setdefault("velocity_posture_correction_weight", 0.35)
+                cfg_train.setdefault("velocity_posture_r_scale", 1.4)
+                cfg_train.setdefault("velocity_r_base", 0.12)
+                cfg_train.setdefault("fall_height_threshold", 0.27)
     
     if args.task in multi_agent_velocity_map:
         env = make_ma_mujoco_env(

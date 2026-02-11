@@ -353,6 +353,9 @@ class PHSMAPPOActor(nn.Module):
         self.velocity_posture_gate = config.get("velocity_posture_gate", 0.5)
         self.velocity_posture_correction_weight = config.get("velocity_posture_correction_weight", 0.25)
         self.velocity_posture_correction_max = config.get("velocity_posture_correction_max", 0.5)
+        self.velocity_pitch_threshold = config.get("velocity_pitch_threshold", 0.45)
+        self.velocity_pitch_r_scale = config.get("velocity_pitch_r_scale", 1.8)
+        self.velocity_pitch_gate = config.get("velocity_pitch_gate", 0.6)
         
         # Barrier potential parameters
         self.r_collision = config.get("r_collision", 0.17)  # Collision radius
@@ -482,10 +485,27 @@ class PHSMAPPOActor(nn.Module):
         # H = 0.5 * v^T * M * v (pure kinetic energy)
         # grad_H = v (velocity itself)
         if self.is_velocity_task:
-            # R_learned network: outputs diagonal scaling factors for R matrix
-            # Higher output = more damping = safer but slower
-            self.R_learned_net = nn.Sequential(
-                nn.Linear(self.obs_dim, self.hidden_size),
+            # Infer qpos/qvel split for MuJoCo velocity tasks (before networks)
+            self.velocity_state_raw_dim = max(self.obs_dim - self.n_agents, 1)
+            self.velocity_n_qpos = self.velocity_state_raw_dim // 2
+            self.velocity_n_qvel = max(self.velocity_state_raw_dim - self.velocity_n_qpos, 1)
+            
+            # NEW: Per-agent coordination for multi-agent velocity tasks
+            # When n_agents > 1, agents need to coordinate their actions
+            self.use_agent_coordination = (self.n_agents > 1)
+            if self.use_agent_coordination:
+                # Agent coordination via attention mechanism
+                coord_hidden = self.hidden_size // 2
+                self.coord_query = nn.Linear(self.obs_dim, coord_hidden)
+                self.coord_key = nn.Linear(self.obs_dim, coord_hidden)
+                self.coord_value = nn.Linear(self.obs_dim, coord_hidden)
+                self.coord_out = nn.Linear(coord_hidden, self.act_dim)
+                print(f"[PHS-MAPPO v8.5] Agent {agent_id}: Enabled agent coordination for multi-agent velocity task")
+            
+            # NEW: Joint-aware R-matrix (different damping for different action dimensions)
+            # Some joints need more freedom (limb swing), others need stability (torso)
+            self.R_joint_net = nn.Sequential(
+                nn.Linear(self.obs_dim + self.act_dim, self.hidden_size),
                 nn.LayerNorm(self.hidden_size),
                 nn.ELU(),
                 nn.Linear(self.hidden_size, self.hidden_size // 2),
@@ -503,11 +523,6 @@ class PHSMAPPOActor(nn.Module):
                 nn.Sigmoid()  # Output in [0, 1] for safety factor
             )
 
-            # Infer qpos/qvel split for MuJoCo velocity tasks
-            self.velocity_state_raw_dim = max(self.obs_dim - self.n_agents, 1)
-            self.velocity_n_qpos = self.velocity_state_raw_dim // 2
-            self.velocity_n_qvel = max(self.velocity_state_raw_dim - self.velocity_n_qpos, 1)
-
             # Project full qvel to act_dim for better control alignment
             self.velocity_proj_net = nn.Sequential(
                 nn.Linear(self.velocity_n_qvel, self.hidden_size // 2),
@@ -515,12 +530,22 @@ class PHSMAPPOActor(nn.Module):
                 nn.Linear(self.hidden_size // 2, self.act_dim)
             )
 
-            # Posture correction network: map qpos to corrective action
+            # NEW: Per-agent posture correction network
+            # Different agents (front legs vs back legs) need different correction strategies
             self.velocity_posture_net = nn.Sequential(
-                nn.Linear(self.velocity_n_qpos, self.hidden_size // 2),
+                nn.Linear(self.velocity_n_qpos + 1, self.hidden_size // 2),  # +1 for agent_id
+                nn.LayerNorm(self.hidden_size // 2),
                 nn.ELU(),
                 nn.Linear(self.hidden_size // 2, self.act_dim),
                 nn.Tanh()
+            )
+            
+            # NEW: Stability risk predictor - predicts fall risk from state
+            self.stability_risk_net = nn.Sequential(
+                nn.Linear(self.velocity_n_qpos + self.velocity_n_qvel, self.hidden_size // 4),
+                nn.ELU(),
+                nn.Linear(self.hidden_size // 4, 1),
+                nn.Sigmoid()  # Output fall risk in [0, 1]
             )
         
         # ========== 1. Feature Extraction (Shared) ==========
@@ -1200,16 +1225,42 @@ class PHSMAPPOActor(nn.Module):
             # Project full velocity to control-relevant space
             obs_vel = self.velocity_proj_net(obs_vel_full)
 
-            # Estimate posture risk from qpos (exclude root x translation)
+            # ========== Enhanced Posture and Stability Analysis ==========
             qpos = obs_flat[:, :self.velocity_n_qpos]
+            qvel = obs_flat[:, self.velocity_n_qpos:self.velocity_n_qpos + self.velocity_n_qvel]
+            
+            # Stability risk estimation (comprehensive fall risk prediction)
+            qpos_qvel_combined = torch.cat([qpos, qvel], dim=-1)
+            stability_risk = self.stability_risk_net(qpos_qvel_combined)  # [batch, 1]
+            
+            # Posture deviation (exclude root x translation)
             if qpos.shape[-1] > 1:
+                # For HalfCheetah/Ant: qpos[0] = root_x, qpos[1] = root_z, qpos[2:] = joint angles
+                # Focus on non-translational DOFs
                 posture_dev = torch.mean(torch.abs(qpos[:, 1:]), dim=-1, keepdim=True)
             else:
                 posture_dev = torch.zeros(qpos.shape[0], 1, device=qpos.device)
             posture_risk = torch.clamp(posture_dev - self.velocity_posture_threshold, min=0.0)
-            posture_correction = -self.velocity_posture_net(qpos)
-            posture_correction = -self.velocity_posture_net(qpos)
-            posture_correction = -self.velocity_posture_net(qpos)
+
+            # Pitch risk: HalfCheetah-like forward fall is captured by root pitch angle
+            if qpos.shape[-1] > 2:
+                root_pitch = qpos[:, 2:3]
+                pitch_risk = torch.clamp(torch.abs(root_pitch) - self.velocity_pitch_threshold, min=0.0)
+            else:
+                pitch_risk = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+            
+            # Per-agent posture correction with agent_id as input
+            if is_multi_agent:
+                # Create agent_id feature: normalize to [-1, 1]
+                agent_id_feature = torch.full((qpos.shape[0], 1), 
+                                             (self.agent_id - self.n_agents/2) / (self.n_agents/2),
+                                             device=qpos.device)
+                qpos_with_id = torch.cat([qpos, agent_id_feature], dim=-1)
+            else:
+                agent_id_feature = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+                qpos_with_id = torch.cat([qpos, agent_id_feature], dim=-1)
+            
+            posture_correction = -self.velocity_posture_net(qpos_with_id)
             
             # ========== 2. Compute Kinetic Energy Hamiltonian ==========
             # H = 0.5 * ||v||^2 (unit mass assumption)
@@ -1218,9 +1269,11 @@ class PHSMAPPOActor(nn.Module):
             # ∇H = v (gradient of kinetic energy w.r.t. velocity)
             grad_H_vel = obs_vel  # [batch, act_dim]
             
-            # ========== 3. Compute Adaptive R Matrix ==========
-            # R_learned: learnable dissipation based on state
-            R_diag_learned = self.R_learned_net(obs_flat)  # [batch, act_dim], positive via Softplus
+            # ========== 3. Compute Joint-Aware Adaptive R Matrix ==========
+            # Joint-aware R-matrix: different joints need different damping
+            # Input: state + current velocity (velocity provides context for damping)
+            R_input = torch.cat([obs_flat, obs_vel], dim=-1)  # [batch, obs_dim + act_dim]
+            R_diag_learned = self.R_joint_net(R_input)  # [batch, act_dim], positive via Softplus
             
             # Safety factor: boost damping when moving fast or in risky state
             safety_factor = self.velocity_safety_net(obs_flat)  # [batch, act_dim], in [0, 1]
@@ -1230,25 +1283,63 @@ class PHSMAPPOActor(nn.Module):
             vel_normalized = vel_magnitude / (self.velocity_safety_threshold + 1e-6)
             vel_risk = torch.clamp(vel_normalized - 1.0, min=0.0)  # Risk when exceeding threshold
             
-            # Total R diagonal: R0 + R_learned * (1 + safety_factor * vel_risk)
+            # Total R diagonal: R0 + R_learned * (1 + safety + posture + stability)
+            # Higher stability_risk -> more damping to prevent fall
             R_diag_total = (
                 self.velocity_r_base +
-                R_diag_learned * (1.0 + safety_factor * vel_risk * self.velocity_r_max + posture_risk * self.velocity_posture_r_scale)
+                R_diag_learned * (1.0 + 
+                                 safety_factor * vel_risk * self.velocity_r_max + 
+                                 posture_risk * self.velocity_posture_r_scale +
+                                 stability_risk * 2.0 +
+                                 pitch_risk * self.velocity_pitch_r_scale)  # Strong damping when fall risk is high
             )  # [batch, act_dim]
             
-            # ========== 4. Policy Network for Desired Dynamics ==========
+            # ========== 4. Policy Network with Agent Coordination ==========
             policy_output = self.policy_net(state_features_flat)  # [batch, act_dim]
             
             residual = self.residual_mlp(state_features_flat)
             residual_w = torch.sigmoid(self.residual_weight) * 0.3
             
-            posture_gate = 1.0 - torch.clamp(self.velocity_posture_gate * posture_risk, min=0.0, max=0.8)
+            # NEW: Agent coordination for multi-agent velocity tasks
+            coordination_signal = torch.zeros_like(policy_output)
+            if self.use_agent_coordination and is_multi_agent:
+                # Reshape to [batch, n_agents, obs_dim] for coordination
+                obs_ma_view = obs_flat.view(batch_size, n_agents, -1)
+                
+                # Compute attention: each agent attends to other agents
+                Q = self.coord_query(obs_ma_view)  # [batch, n_agents, coord_hidden]
+                K = self.coord_key(obs_ma_view)    # [batch, n_agents, coord_hidden]
+                V = self.coord_value(obs_ma_view)  # [batch, n_agents, coord_hidden]
+                
+                # Scaled dot-product attention
+                scores = torch.matmul(Q, K.transpose(-2, -1)) / (Q.shape[-1] ** 0.5)
+                # Mask self-attention (agent shouldn't attend to itself)
+                mask = torch.eye(n_agents, device=obs.device).unsqueeze(0).bool()
+                scores = scores.masked_fill(mask, float('-inf'))
+                attn_weights = F.softmax(scores, dim=-1)  # [batch, n_agents, n_agents]
+                
+                # Aggregate information from other agents
+                coord_context = torch.matmul(attn_weights, V)  # [batch, n_agents, coord_hidden]
+                coord_context_flat = coord_context.view(batch_size * n_agents, -1)
+                coordination_signal = self.coord_out(coord_context_flat)  # [batch*n_agents, act_dim]
+            
+            # Gating based on posture risk and stability risk
+            # When unstable, rely more on posture correction and less on policy
+            combined_risk = posture_risk + stability_risk + pitch_risk
+            posture_gate = 1.0 - torch.clamp(self.velocity_posture_gate * combined_risk, min=0.0, max=0.8)
+            posture_gate = posture_gate * (1.0 - torch.clamp(self.velocity_pitch_gate * pitch_risk, min=0.0, max=0.6))
             posture_scale = torch.clamp(
-                self.velocity_posture_correction_weight * posture_risk,
+                self.velocity_posture_correction_weight * combined_risk,
                 min=0.0,
                 max=self.velocity_posture_correction_max
             )
-            dx_target = (policy_output + residual_w * residual) * posture_gate + posture_scale * posture_correction
+            
+            # Combine policy, coordination, and posture correction
+            # coordination_signal helps balance forces across agents
+            coordination_weight = 0.3 if self.use_agent_coordination else 0.0
+            dx_target = ((policy_output + residual_w * residual) * posture_gate + 
+                        coordination_weight * coordination_signal +
+                        posture_scale * posture_correction)
             
             # ========== 5. PHS Dynamics: (J - R) * ∇H ==========
             # For velocity-only state, we simplify to just the velocity dynamics
@@ -1268,7 +1359,7 @@ class PHSMAPPOActor(nn.Module):
             if is_multi_agent:
                 u_mean = u_mean.view(batch_size, n_agents, -1)
             
-            # ========== 7. Logging Info ==========
+            # ========== 7. Enhanced Logging Info ==========
             H_info = {
                 'H_goal': torch.tensor(0.0),
                 'H_task_learned': torch.tensor(0.0),
@@ -1292,6 +1383,11 @@ class PHSMAPPOActor(nn.Module):
                 'phs_drift_mean': phs_drift.mean().item(),
                 'posture_risk_mean': posture_risk.mean().item(),
                 'posture_correction_mean': posture_correction.mean().item(),
+                # NEW: Enhanced stability metrics
+                'stability_risk_mean': stability_risk.mean().item(),
+                'coordination_signal_mean': coordination_signal.mean().item() if self.use_agent_coordination else 0.0,
+                'combined_risk_mean': combined_risk.mean().item(),
+                'pitch_risk_mean': pitch_risk.mean().item(),
             }
             
             return u_mean, H_info, state_features

@@ -149,6 +149,8 @@ def make_ma_mujoco_env(scenario, agent_conf, seed, cfg_train):
                 normalize_share_obs=cfg_train.get('normalize_share_obs', True),
                 terminate_on_fall=cfg_train.get('terminate_on_fall', False),
                 fall_height_threshold=cfg_train.get('fall_height_threshold', 0.3),
+                adaptive_fall_threshold=cfg_train.get('adaptive_fall_threshold', True),
+                fall_pitch_threshold=cfg_train.get('fall_pitch_threshold', 0.5),
             )
             env.reset(seed=seed + rank * 1000)
             return env
