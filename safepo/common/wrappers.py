@@ -150,8 +150,20 @@ class MultiGoalEnv():
         # Get action and observation spaces for each agent
         self.action_spaces = {}
         self.observation_spaces = {}
+        self._raw_action_spaces = {}
+        self._action_low = {}
+        self._action_high = {}
         for agent in self.possible_agents:
-            self.action_spaces[agent] = self.env.action_space(agent)
+            raw_space = self.env.action_space(agent)
+            self._raw_action_spaces[agent] = raw_space
+            self._action_low[agent] = np.asarray(raw_space.low, dtype=np.float64)
+            self._action_high[agent] = np.asarray(raw_space.high, dtype=np.float64)
+            self.action_spaces[agent] = Box(
+                low=-1.0,
+                high=1.0,
+                shape=raw_space.shape,
+                dtype=np.float64,
+            )
         
         # n_actions is the action dimension (e.g., 2 for Point robot)
         self.n_actions = self.action_spaces['agent_0'].shape[0]
@@ -327,6 +339,13 @@ class MultiGoalEnv():
             infos: List of info dicts for each agent
             available_actions: Available actions mask
         """
+        def _rescale_action(agent, action):
+            action_np = np.asarray(action, dtype=np.float64)
+            action_np = np.clip(action_np, -1.0, 1.0)
+            low = self._action_low[agent]
+            high = self._action_high[agent]
+            return low + 0.5 * (action_np + 1.0) * (high - low)
+
         # Convert actions to dict format expected by PettingZoo environment
         if isinstance(actions, (list, tuple)):
             action_dict = {}
@@ -334,13 +353,13 @@ class MultiGoalEnv():
                 action = actions[i]
                 if hasattr(action, 'cpu'):
                     action = action.cpu().numpy()
-                action_dict[agent] = action
+                action_dict[agent] = _rescale_action(agent, action)
         elif isinstance(actions, np.ndarray):
             action_dict = {}
             for i, agent in enumerate(self.possible_agents):
-                action_dict[agent] = actions[i]
+                action_dict[agent] = _rescale_action(agent, actions[i])
         else:
-            action_dict = actions
+            action_dict = {agent: _rescale_action(agent, actions[agent]) for agent in self.possible_agents}
         
         # Step the environment
         obs_dict, rewards_dict, costs_dict, terminations_dict, truncations_dict, infos_dict = self.env.step(action_dict)

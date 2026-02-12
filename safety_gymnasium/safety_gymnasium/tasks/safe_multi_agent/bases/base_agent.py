@@ -220,6 +220,7 @@ class BaseAgent(abc.ABC):  # pylint: disable=too-many-instance-attributes
         self.sensor_conf = SensorConf()
         self.sensor_info = SensorInfo()
         self.body_info = [BodyInfo(), BodyInfo()]
+        self.action_indices = {'agent_0': [], 'agent_1': []}
         self._init_body_info()
         self.debug_info = DebugInfo()
 
@@ -249,16 +250,58 @@ class BaseAgent(abc.ABC):  # pylint: disable=too-many-instance-attributes
 
         Access directly from mujoco instance created on agent xml model.
         """
+        all_geom_names = [
+            self.engine.model.geom(i).name
+            for i in range(self.engine.model.ngeom)
+            if self.engine.model.geom(i).name not in ('', 'floor')
+        ]
+
+        all_actuator_names = [
+            self.engine.model.actuator(i).name
+            for i in range(self.engine.model.nu)
+        ]
+
+        agent_1_geom_names = [name for name in all_geom_names if name.endswith('1')]
+        agent_0_geom_names = [name for name in all_geom_names if not name.endswith('1')]
+
+        use_suffix_partition = len(agent_0_geom_names) > 0 and len(agent_1_geom_names) > 0
+
+        agent_1_action_indices = [
+            i for i, name in enumerate(all_actuator_names) if name.endswith('1')
+        ]
+        agent_0_action_indices = [
+            i for i, name in enumerate(all_actuator_names) if not name.endswith('1')
+        ]
+        use_suffix_partition_for_action = (
+            len(agent_0_action_indices) > 0
+            and len(agent_1_action_indices) > 0
+        )
+
+        if use_suffix_partition_for_action:
+            self.action_indices = {
+                'agent_0': agent_0_action_indices,
+                'agent_1': agent_1_action_indices,
+            }
+        else:
+            divide_index = int(self.engine.model.nu / 2)
+            self.action_indices = {
+                'agent_0': list(range(0, divide_index)),
+                'agent_1': list(range(divide_index, self.engine.model.nu)),
+            }
+
         for i in range(2):
             self.body_info[i].nq = int(self.engine.model.nq / 2)
             self.body_info[i].nv = int(self.engine.model.nv / 2)
-            self.body_info[i].nu = int(self.engine.model.nu / 2)
+            self.body_info[i].nu = len(self.action_indices[f'agent_{i}'])
             self.body_info[i].nbody = int(self.engine.model.nbody / 2)
-            self.body_info[i].geom_names = [
-                self.engine.model.geom(i).name
-                for i in range(self.engine.model.ngeom)
-                if self.engine.model.geom(i).name != 'floor'
-            ][i * 2 : (i + 1) * 2]
+            if use_suffix_partition:
+                self.body_info[i].geom_names = agent_0_geom_names if i == 0 else agent_1_geom_names
+            else:
+                split_idx = int(len(all_geom_names) / 2)
+                if i == 0:
+                    self.body_info[i].geom_names = all_geom_names[:split_idx]
+                else:
+                    self.body_info[i].geom_names = all_geom_names[split_idx:]
 
     def _build_action_space(self) -> gymnasium.spaces.Box:
         """Build the action space for this agent.
@@ -267,16 +310,17 @@ class BaseAgent(abc.ABC):  # pylint: disable=too-many-instance-attributes
         """
         bounds = self.engine.model.actuator_ctrlrange.copy().astype(np.float32)
         low, high = bounds.T
-        divide_index = int(len(low) / 2)
+        agent_0_indices = self.action_indices['agent_0']
+        agent_1_indices = self.action_indices['agent_1']
         return {
             'agent_0': spaces.Box(
-                low=low[:divide_index],
-                high=high[:divide_index],
+                low=low[agent_0_indices],
+                high=high[agent_0_indices],
                 dtype=np.float64,
             ),
             'agent_1': spaces.Box(
-                low=low[divide_index:],
-                high=high[divide_index:],
+                low=low[agent_1_indices],
+                high=high[agent_1_indices],
                 dtype=np.float64,
             ),
         }
@@ -346,6 +390,12 @@ class BaseAgent(abc.ABC):  # pylint: disable=too-many-instance-attributes
           2. When the environment is created, used to update the engine instance.
         """
         self.engine = engine
+        if self.engine.model is None or self.engine.data is None:
+            return
+        if hasattr(self, 'body_info'):
+            self._init_body_info()
+        if hasattr(self, 'action_space'):
+            self.action_space = self._build_action_space()
 
     def apply_action(self, action: np.ndarray, noise: np.ndarray | None = None) -> None:
         """Apply an action to the agent.

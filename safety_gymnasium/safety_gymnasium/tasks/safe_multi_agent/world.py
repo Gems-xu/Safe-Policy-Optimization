@@ -494,6 +494,7 @@ class World:  # pylint: disable=too-many-instance-attributes
         # Recompute simulation intrinsics from new position
         mujoco.mj_forward(model, data)  # pylint: disable=no-member
         self.engine.update(model, data)
+        self.bind_engine()
 
     def rebuild(self, config=None, state=True):
         """Build a new sim from a model if the model changed."""

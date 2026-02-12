@@ -211,11 +211,15 @@ class Builder(gymnasium.Env, gymnasium.utils.EzPickle):
             action[agent] = np.array(action[agent], copy=False)  # cast to ndarray
             if action[agent].shape != self.action_space(agent).shape:  # check action dimension
                 raise ValueError('Action dimension mismatch')
-            global_action[
-                index
-                * self.action_space(agent).shape[0] : (index + 1)
-                * self.action_space(agent).shape[0]
-            ] = action[agent]
+            action_indices = self.task.agent.action_indices.get(agent)
+            if action_indices is not None and len(action_indices) == self.action_space(agent).shape[0]:
+                global_action[action_indices] = action[agent]
+            else:
+                global_action[
+                    index
+                    * self.action_space(agent).shape[0] : (index + 1)
+                    * self.action_space(agent).shape[0]
+                ] = action[agent]
 
         exception = self.task.simulation_forward(global_action)
         if exception:

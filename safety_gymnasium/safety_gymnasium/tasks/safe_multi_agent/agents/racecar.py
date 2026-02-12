@@ -34,7 +34,7 @@ class Racecar(BaseAgent):
         random_generator: RandomGenerator,
         placements: Optional[list] = None,
         locations: Optional[list] = None,
-        keepout: float = 0.4,
+        keepout: float = 0.6,
         rot: Optional[float] = None,
     ) -> None:
         super().__init__(
