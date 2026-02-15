@@ -356,6 +356,30 @@ class PHSMAPPOActor(nn.Module):
         self.velocity_pitch_threshold = config.get("velocity_pitch_threshold", 0.45)
         self.velocity_pitch_r_scale = config.get("velocity_pitch_r_scale", 1.8)
         self.velocity_pitch_gate = config.get("velocity_pitch_gate", 0.6)
+        self.velocity_speed_r_scale = config.get("velocity_speed_r_scale", 1.4)
+        self.velocity_speed_gate = config.get("velocity_speed_gate", 0.5)
+        self.velocity_energy_r_scale = config.get("velocity_energy_r_scale", 2.0)
+        self.velocity_directional_r_scale = config.get("velocity_directional_r_scale", 1.2)
+        self.velocity_r_total_max = config.get("velocity_r_total_max", 8.0)
+        self.velocity_preemptive_ratio = config.get("velocity_preemptive_ratio", 0.86)
+        self.velocity_preemptive_r_scale = config.get("velocity_preemptive_r_scale", 1.5)
+        self.velocity_thigh_r_relief = config.get("velocity_thigh_r_relief", 0.20)
+        self.velocity_distal_r_boost = config.get("velocity_distal_r_boost", 0.30)
+        self.velocity_thigh_action_gain = config.get("velocity_thigh_action_gain", 1.18)
+        self.velocity_distal_action_gain = config.get("velocity_distal_action_gain", 0.92)
+        self.velocity_front_action_boost = config.get("velocity_front_action_boost", 1.16)
+        self.velocity_height_threshold = config.get("velocity_height_threshold", 0.55)
+        self.velocity_height_r_scale = config.get("velocity_height_r_scale", 2.2)
+        self.velocity_pitch_rate_threshold = config.get("velocity_pitch_rate_threshold", 1.2)
+        self.velocity_pitch_rate_r_scale = config.get("velocity_pitch_rate_r_scale", 1.8)
+        self.velocity_back_thigh_target = config.get("velocity_back_thigh_target", -0.20)
+        self.velocity_front_thigh_target = config.get("velocity_front_thigh_target", 0.60)
+        self.velocity_thigh_target_gain = config.get("velocity_thigh_target_gain", 0.35)
+        self.velocity_thigh_target_max = config.get("velocity_thigh_target_max", 0.45)
+        self.velocity_thigh_recovery_gain = config.get("velocity_thigh_recovery_gain", 1.2)
+        self.velocity_thigh_recovery_threshold = config.get("velocity_thigh_recovery_threshold", 0.05)
+        self.velocity_front_lift_bias = config.get("velocity_front_lift_bias", 0.18)
+        self.velocity_back_push_bias = config.get("velocity_back_push_bias", 0.12)
         
         # Barrier potential parameters
         self.r_collision = config.get("r_collision", 0.17)  # Collision radius
@@ -1248,6 +1272,36 @@ class PHSMAPPOActor(nn.Module):
                 pitch_risk = torch.clamp(torch.abs(root_pitch) - self.velocity_pitch_threshold, min=0.0)
             else:
                 pitch_risk = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+
+            # Height risk and pitch-rate risk for anti-forward-fall stabilization
+            if qpos.shape[-1] > 1:
+                torso_height = qpos[:, 1:2]
+                height_risk = torch.clamp(self.velocity_height_threshold - torso_height, min=0.0)
+            else:
+                torso_height = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+                height_risk = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+            if qvel.shape[-1] > 2:
+                pitch_rate = qvel[:, 2:3]
+                pitch_rate_risk = torch.clamp(torch.abs(pitch_rate) - self.velocity_pitch_rate_threshold, min=0.0)
+            else:
+                pitch_rate = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+                pitch_rate_risk = torch.zeros(qpos.shape[0], 1, device=qpos.device)
+
+            # Speed risk: align with env cost (sqrt(vx^2 + vy^2) threshold)
+            if qvel.shape[-1] >= 1:
+                forward_speed = torch.abs(qvel[:, 0:1])
+            else:
+                forward_speed = torch.zeros(qvel.shape[0], 1, device=qvel.device)
+            if qvel.shape[-1] >= 2:
+                planar_speed = torch.norm(qvel[:, :2], dim=-1, keepdim=True)
+            else:
+                planar_speed = forward_speed
+            speed_ratio = planar_speed / (self.velocity_safety_threshold + 1e-6)
+            speed_risk = torch.clamp(
+                speed_ratio - 1.0,
+                min=0.0,
+            )
+            preemptive_speed_risk = torch.clamp(speed_ratio - self.velocity_preemptive_ratio, min=0.0)
             
             # Per-agent posture correction with agent_id as input
             if is_multi_agent:
@@ -1268,6 +1322,10 @@ class PHSMAPPOActor(nn.Module):
             
             # ∇H = v (gradient of kinetic energy w.r.t. velocity)
             grad_H_vel = obs_vel  # [batch, act_dim]
+
+            # Energy risk based on kinetic energy overshoot
+            H_safe = 0.5 * (self.velocity_safety_threshold ** 2)
+            energy_risk = torch.clamp((H_kin - H_safe) / (H_safe + 1e-6), min=0.0)
             
             # ========== 3. Compute Joint-Aware Adaptive R Matrix ==========
             # Joint-aware R-matrix: different joints need different damping
@@ -1282,6 +1340,11 @@ class PHSMAPPOActor(nn.Module):
             vel_magnitude = torch.norm(obs_vel, dim=-1, keepdim=True)  # [batch, 1]
             vel_normalized = vel_magnitude / (self.velocity_safety_threshold + 1e-6)
             vel_risk = torch.clamp(vel_normalized - 1.0, min=0.0)  # Risk when exceeding threshold
+            vel_risk = torch.maximum(vel_risk, speed_risk)
+
+            # Directional damping: increase damping along current motion direction
+            dir_weight = grad_H_vel.pow(2)
+            dir_weight = dir_weight / (dir_weight.sum(dim=-1, keepdim=True) + 1e-6)
             
             # Total R diagonal: R0 + R_learned * (1 + safety + posture + stability)
             # Higher stability_risk -> more damping to prevent fall
@@ -1291,8 +1354,24 @@ class PHSMAPPOActor(nn.Module):
                                  safety_factor * vel_risk * self.velocity_r_max + 
                                  posture_risk * self.velocity_posture_r_scale +
                                  stability_risk * 2.0 +
-                                 pitch_risk * self.velocity_pitch_r_scale)  # Strong damping when fall risk is high
+                                 pitch_risk * self.velocity_pitch_r_scale +
+                                 height_risk * self.velocity_height_r_scale +
+                                 pitch_rate_risk * self.velocity_pitch_rate_r_scale +
+                                 speed_risk * self.velocity_speed_r_scale +
+                                 energy_risk * self.velocity_energy_r_scale +
+                                 preemptive_speed_risk * self.velocity_preemptive_r_scale) +
+                self.velocity_directional_r_scale * dir_weight * (speed_risk + energy_risk + preemptive_speed_risk + pitch_rate_risk)
             )  # [batch, act_dim]
+
+            # HalfCheetah joint-aware damping prior:
+            # lower damping on thigh (to increase stride amplitude), higher on distal joints.
+            if "HalfCheetah" in self.config.get("env_name", "") and self.act_dim >= 3:
+                joint_prior = torch.ones_like(R_diag_total)
+                thigh_scale = max(1.0 - float(self.velocity_thigh_r_relief), 0.55)
+                joint_prior[:, 0:1] = thigh_scale
+                joint_prior[:, 1:] = 1.0 + self.velocity_distal_r_boost
+                R_diag_total = R_diag_total * joint_prior
+            R_diag_total = torch.clamp(R_diag_total, min=self.velocity_r_base, max=self.velocity_r_total_max)
             
             # ========== 4. Policy Network with Agent Coordination ==========
             policy_output = self.policy_net(state_features_flat)  # [batch, act_dim]
@@ -1340,6 +1419,66 @@ class PHSMAPPOActor(nn.Module):
             dx_target = ((policy_output + residual_w * residual) * posture_gate + 
                         coordination_weight * coordination_signal +
                         posture_scale * posture_correction)
+
+            # HalfCheetah thigh extension target correction (small, local, PHS-consistent)
+            thigh_target_correction = torch.zeros_like(dx_target)
+            if "HalfCheetah" in self.config.get("env_name", "") and qpos.shape[-1] > 6:
+                recovery_risk = pitch_risk + height_risk + 0.5 * pitch_rate_risk
+                recovery_excess = torch.clamp(recovery_risk - self.velocity_thigh_recovery_threshold, min=0.0)
+                recovery_scale = 1.0 + self.velocity_thigh_recovery_gain * torch.clamp(recovery_excess, max=1.0)
+                thigh_angle = None
+                thigh_target = None
+                if self.n_agents == 2 and self.act_dim >= 3:
+                    if self.agent_id == 0:
+                        thigh_angle = qpos[:, 3:4]  # bthigh
+                        thigh_target = self.velocity_back_thigh_target
+                    elif self.agent_id == 1:
+                        thigh_angle = qpos[:, 6:7]  # fthigh
+                        thigh_target = self.velocity_front_thigh_target
+                    if thigh_angle is not None:
+                        thigh_err = thigh_target - thigh_angle
+                        thigh_cmd = torch.clamp(
+                            self.velocity_thigh_target_gain * thigh_err,
+                            min=-self.velocity_thigh_target_max,
+                            max=self.velocity_thigh_target_max,
+                        )
+                        thigh_cmd = torch.clamp(thigh_cmd * recovery_scale, min=-self.velocity_thigh_target_max, max=self.velocity_thigh_target_max)
+                        if self.agent_id == 1:
+                            thigh_cmd = torch.clamp(thigh_cmd + self.velocity_front_lift_bias * recovery_excess, min=-self.velocity_thigh_target_max, max=self.velocity_thigh_target_max)
+                        elif self.agent_id == 0:
+                            thigh_cmd = torch.clamp(thigh_cmd - self.velocity_back_push_bias * recovery_excess, min=-self.velocity_thigh_target_max, max=self.velocity_thigh_target_max)
+                        thigh_target_correction[:, 0:1] = thigh_cmd
+                elif self.n_agents >= 6 and self.act_dim == 1:
+                    if self.agent_id == 0:
+                        thigh_angle = qpos[:, 3:4]
+                        thigh_target = self.velocity_back_thigh_target
+                    elif self.agent_id == 3:
+                        thigh_angle = qpos[:, 6:7]
+                        thigh_target = self.velocity_front_thigh_target
+                    if thigh_angle is not None:
+                        thigh_err = thigh_target - thigh_angle
+                        thigh_cmd = torch.clamp(
+                            self.velocity_thigh_target_gain * thigh_err,
+                            min=-self.velocity_thigh_target_max,
+                            max=self.velocity_thigh_target_max,
+                        )
+                        thigh_target_correction[:, 0:1] = torch.clamp(
+                            thigh_cmd * recovery_scale,
+                            min=-self.velocity_thigh_target_max,
+                            max=self.velocity_thigh_target_max,
+                        )
+            dx_target = dx_target + thigh_target_correction
+
+            # HalfCheetah actuation rebalance for gait quality:
+            # amplify thigh channel and slightly suppress distal channels.
+            if "HalfCheetah" in self.config.get("env_name", "") and self.act_dim >= 3:
+                action_gain = torch.ones_like(dx_target)
+                action_gain[:, 0:1] = self.velocity_thigh_action_gain
+                action_gain[:, 1:] = self.velocity_distal_action_gain
+                if self.n_agents == 2 and self.agent_id == 1:
+                    # Front half agent gets extra drive to avoid "rear-dominant" gait and forward collapse.
+                    action_gain = action_gain * self.velocity_front_action_boost
+                dx_target = dx_target * action_gain
             
             # ========== 5. PHS Dynamics: (J - R) * ∇H ==========
             # For velocity-only state, we simplify to just the velocity dynamics
@@ -1388,6 +1527,16 @@ class PHSMAPPOActor(nn.Module):
                 'coordination_signal_mean': coordination_signal.mean().item() if self.use_agent_coordination else 0.0,
                 'combined_risk_mean': combined_risk.mean().item(),
                 'pitch_risk_mean': pitch_risk.mean().item(),
+                'speed_risk_mean': speed_risk.mean().item(),
+                'forward_speed_mean': forward_speed.mean().item(),
+                'planar_speed_mean': planar_speed.mean().item(),
+                'energy_risk_mean': energy_risk.mean().item(),
+                'preemptive_speed_risk_mean': preemptive_speed_risk.mean().item(),
+                'height_risk_mean': height_risk.mean().item(),
+                'pitch_rate_risk_mean': pitch_rate_risk.mean().item(),
+                'torso_height_mean': torso_height.mean().item(),
+                'thigh_target_corr_mean': thigh_target_correction.mean().item(),
+                'recovery_risk_mean': (pitch_risk + height_risk + 0.5 * pitch_rate_risk).mean().item(),
             }
             
             return u_mean, H_info, state_features
@@ -1664,7 +1813,8 @@ class PHSMAPPOActor(nn.Module):
             H_kin = 0.5 * (obs_vel_full ** 2).sum(dim=-1, keepdim=True)
             
             # Compute R matrix components
-            R_diag_learned = self.R_learned_net(obs_flat)
+            R_input = torch.cat([obs_flat, obs_vel], dim=-1)
+            R_diag_learned = self.R_joint_net(R_input)
             safety_factor = self.velocity_safety_net(obs_flat)
             vel_magnitude = torch.norm(obs_vel, dim=-1, keepdim=True)
             vel_normalized = vel_magnitude / (self.velocity_safety_threshold + 1e-6)
@@ -1698,7 +1848,7 @@ class PHSMAPPOActor(nn.Module):
                 'vel_magnitude_mean': vel_magnitude.mean().detach(),
                 'vel_risk_mean': vel_risk.mean().detach(),
                 'posture_risk_mean': posture_risk.mean().detach(),
-                'posture_correction_mean': posture_correction.mean().detach(),
+                'posture_correction_mean': torch.tensor(0.0, device=obs.device),
             }
         
         obs_norm = self.feature_norm(obs)

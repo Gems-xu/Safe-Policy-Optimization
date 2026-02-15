@@ -619,15 +619,17 @@ class Runner:
         self.posture_reward_weight = float(config.get("posture_reward_weight", 0.0))
         self.posture_reward_threshold = float(config.get("posture_reward_threshold", 0.0))
         self.posture_reward_clip = float(config.get("posture_reward_clip", 1.0))
+        self.speed_violation_weight = float(config.get("speed_violation_weight", 0.0))
+        self.speed_violation_clip = float(config.get("speed_violation_clip", 0.5))
         
         # Velocity thresholds for different scenarios (from safety_gymnasium)
         self.velocity_thresholds = {
-            'Ant': 2.6222,
-            'HalfCheetah': 3.2096,
-            'Hopper': 0.7402,
-            'Walker2d': 0.6094,
-            'Swimmer': 0.2282,
-            'Humanoid': 2.3475,
+            'Ant': {'2x4': 2.522, '4x2': 2.418},
+            'HalfCheetah': {'6x1': 2.932, '2x3': 3.227},
+            'Hopper': {'3x1': 0.9613},
+            'Humanoid': {'9|8': 0.58},
+            'Swimmer': {'2x1': 0.04891},
+            'Walker2d': {'2x3': 1.641},
         }
         self.current_velocity_threshold = self._get_velocity_threshold()
 
@@ -793,6 +795,12 @@ class Runner:
                         self.logger.log_tabular("Velocity/x_velocity")
                     if 'Velocity/velocity_ratio' in log_dict:
                         self.logger.log_tabular("Velocity/velocity_ratio")
+                    if 'Velocity/max_speed' in log_dict:
+                        self.logger.log_tabular("Velocity/max_speed")
+                    if 'Velocity/max_speed_ratio' in log_dict:
+                        self.logger.log_tabular("Velocity/max_speed_ratio")
+                    if 'Velocity/max_speed_violation' in log_dict:
+                        self.logger.log_tabular("Velocity/max_speed_violation")
                     if 'Velocity/y_velocity' in log_dict:
                         self.logger.log_tabular("Velocity/y_velocity")
                 else:
@@ -837,8 +845,11 @@ class Runner:
     def _get_velocity_threshold(self):
         """Get velocity threshold based on scenario type."""
         env_name = self.config.get("env_name", "")
+        agent_conf = self.config.get("agent_conf", "")
         for scenario, threshold in self.velocity_thresholds.items():
             if scenario in env_name:
+                if isinstance(threshold, dict):
+                    return threshold.get(agent_conf, next(iter(threshold.values())))
                 return threshold
         return 1.0  # Default threshold
 
@@ -850,6 +861,7 @@ class Runner:
         
         x_velocities = []
         y_velocities = []
+        speeds = []
         
         # infos is a tuple of lists, one per rollout thread
         for thread_infos in infos:
@@ -865,13 +877,28 @@ class Runner:
                     x_velocities.append(thread_infos['x_velocity'])
                 if 'y_velocity' in thread_infos:
                     y_velocities.append(thread_infos['y_velocity'])
+
+        if x_velocities:
+            for idx, x_vel in enumerate(x_velocities):
+                y_vel = y_velocities[idx] if idx < len(y_velocities) else 0.0
+                speeds.append(float(np.sqrt(x_vel ** 2 + y_vel ** 2)))
         
         if x_velocities:
-            avg_x_vel = np.mean(x_velocities)
+            avg_x_vel = float(np.mean(x_velocities))
             velocity_info['Velocity/x_velocity'] = avg_x_vel
-            velocity_info['Velocity/velocity_ratio'] = avg_x_vel / self.current_velocity_threshold
         if y_velocities:
-            velocity_info['Velocity/y_velocity'] = np.mean(y_velocities)
+            avg_y_vel = float(np.mean(y_velocities))
+            velocity_info['Velocity/y_velocity'] = avg_y_vel
+        if x_velocities:
+            avg_y_vel = float(np.mean(y_velocities)) if y_velocities else 0.0
+            avg_speed = float(np.sqrt(avg_x_vel ** 2 + avg_y_vel ** 2))
+            velocity_info['Velocity/speed'] = avg_speed
+            velocity_info['Velocity/velocity_ratio'] = avg_speed / self.current_velocity_threshold
+        if speeds:
+            max_speed = float(np.max(speeds))
+            velocity_info['Velocity/max_speed'] = max_speed
+            velocity_info['Velocity/max_speed_ratio'] = max_speed / self.current_velocity_threshold
+            velocity_info['Velocity/max_speed_violation'] = max(0.0, max_speed - self.current_velocity_threshold)
         
         return velocity_info
 
@@ -986,6 +1013,9 @@ class Runner:
         )
 
         soft_cost_weight = self.trainer[0]._get_soft_cost_weight()
+
+        # Keep training reward unchanged for velocity tasks;
+        # speed safety is handled by damping matrix in PHS actor.
         
         for agent_id in range(self.num_agents):
             if 'Frank' in self.config['env_name']:
@@ -1012,7 +1042,7 @@ class Runner:
                     excess = torch.clamp(posture_dev - self.posture_reward_threshold, min=0.0)
                     posture_penalty = torch.clamp(excess, max=self.posture_reward_clip)
                     agent_reward = agent_reward - self.posture_reward_weight * posture_penalty
-            
+
             # Soft cost augmentation
             if soft_cost_weight > 0:
                 with torch.no_grad():
@@ -1437,33 +1467,105 @@ def train(args, cfg_train):
             'Swimmer': 0.15,
             'Humanoid': 0.20,
         }
+        speed_r_scales = {
+            'Ant': 1.2,
+            'HalfCheetah': 1.8,
+            'Hopper': 1.4,
+            'Walker2d': 1.4,
+            'Swimmer': 1.0,
+            'Humanoid': 1.4,
+        }
+        speed_gates = {
+            'Ant': 0.4,
+            'HalfCheetah': 0.6,
+            'Hopper': 0.5,
+            'Walker2d': 0.5,
+            'Swimmer': 0.3,
+            'Humanoid': 0.5,
+        }
         
         scenario_threshold = velocity_thresholds.get(args.scenario, 1.0)
         cfg_train.setdefault("velocity_safety_threshold", scenario_threshold)
         cfg_train.setdefault("velocity_r_base", base_damping.get(args.scenario, 0.10))
         cfg_train.setdefault("velocity_posture_threshold", posture_thresholds.get(args.scenario, 0.35))
         cfg_train.setdefault("velocity_posture_correction_weight", posture_correction_weights.get(args.scenario, 0.25))
+        cfg_train.setdefault("velocity_speed_r_scale", speed_r_scales.get(args.scenario, 1.2))
+        cfg_train.setdefault("velocity_speed_gate", speed_gates.get(args.scenario, 0.5))
 
         # Enhanced HalfCheetah-specific tuning by agent configuration
         if args.scenario == "HalfCheetah":
+            cfg_train.setdefault("lamda_lagr_max", 22.0)
+            cfg_train.setdefault("lagrangian_slow_rate", 0.05)
+            cfg_train.setdefault("lagrangian_update_interval", 1)
+            cfg_train.setdefault("cost_limit", 10.0)
             if args.agent_conf == "2x3":
                 # 2x3: Front vs Back legs coordination is critical
+                cfg_train.setdefault("velocity_safety_threshold", 2.75)
                 cfg_train.setdefault("velocity_posture_threshold", 0.25)
                 cfg_train.setdefault("velocity_posture_correction_weight", 0.55)
                 cfg_train.setdefault("velocity_posture_r_scale", 1.8)  # Strong damping when unstable
-                cfg_train.setdefault("velocity_r_base", 0.18)  # Higher base damping
+                cfg_train.setdefault("velocity_r_base", 0.22)  # recover stride amplitude
+                cfg_train.setdefault("velocity_speed_r_scale", 3.2)
+                cfg_train.setdefault("velocity_energy_r_scale", 3.6)
+                cfg_train.setdefault("velocity_directional_r_scale", 2.0)
+                cfg_train.setdefault("velocity_preemptive_ratio", 0.78)
+                cfg_train.setdefault("velocity_preemptive_r_scale", 2.1)
+                cfg_train.setdefault("velocity_height_threshold", 0.58)
+                cfg_train.setdefault("velocity_height_r_scale", 2.4)
+                cfg_train.setdefault("velocity_pitch_rate_threshold", 1.0)
+                cfg_train.setdefault("velocity_pitch_rate_r_scale", 2.1)
+                cfg_train.setdefault("velocity_r_total_max", 12.0)
+                cfg_train.setdefault("velocity_thigh_r_relief", 0.40)
+                cfg_train.setdefault("velocity_distal_r_boost", 0.42)
+                cfg_train.setdefault("velocity_thigh_action_gain", 1.65)
+                cfg_train.setdefault("velocity_distal_action_gain", 0.76)
+                cfg_train.setdefault("velocity_front_action_boost", 1.40)
+                cfg_train.setdefault("velocity_back_thigh_target", -0.05)
+                cfg_train.setdefault("velocity_front_thigh_target", 0.95)
+                cfg_train.setdefault("velocity_thigh_target_gain", 0.62)
+                cfg_train.setdefault("velocity_thigh_target_max", 0.70)
+                cfg_train.setdefault("velocity_thigh_recovery_gain", 1.5)
+                cfg_train.setdefault("velocity_thigh_recovery_threshold", 0.04)
+                cfg_train.setdefault("velocity_front_lift_bias", 0.24)
+                cfg_train.setdefault("velocity_back_push_bias", 0.14)
+                cfg_train.setdefault("velocity_speed_gate", 0.0)
+                cfg_train.setdefault("speed_violation_weight", 0.0)
+                cfg_train.setdefault("speed_violation_clip", 0.0)
                 cfg_train.setdefault("velocity_pitch_threshold", 0.35)
-                cfg_train.setdefault("velocity_pitch_r_scale", 2.2)
+                cfg_train.setdefault("velocity_pitch_r_scale", 2.6)
                 cfg_train.setdefault("velocity_pitch_gate", 0.7)
                 cfg_train.setdefault("fall_pitch_threshold", 0.35)
                 cfg_train.setdefault("fall_height_threshold", 0.33)
-                cfg_train.setdefault("posture_reward_weight", 0.12)
+                cfg_train.setdefault("posture_reward_weight", 0.03)
                 cfg_train.setdefault("posture_reward_threshold", 0.18)
                 cfg_train.setdefault("posture_reward_clip", 0.8)
             elif args.agent_conf == "6x1":
-                cfg_train.setdefault("velocity_safety_threshold", 3.6)
-                cfg_train.setdefault("velocity_r_base", 0.06)
+                cfg_train.setdefault("velocity_safety_threshold", 2.80)
+                cfg_train.setdefault("velocity_r_base", 0.16)
                 cfg_train.setdefault("velocity_posture_correction_weight", 0.20)
+                cfg_train.setdefault("velocity_speed_r_scale", 3.0)
+                cfg_train.setdefault("velocity_energy_r_scale", 3.4)
+                cfg_train.setdefault("velocity_directional_r_scale", 1.8)
+                cfg_train.setdefault("velocity_preemptive_ratio", 0.80)
+                cfg_train.setdefault("velocity_preemptive_r_scale", 2.0)
+                cfg_train.setdefault("velocity_height_threshold", 0.58)
+                cfg_train.setdefault("velocity_height_r_scale", 2.2)
+                cfg_train.setdefault("velocity_pitch_rate_threshold", 1.0)
+                cfg_train.setdefault("velocity_pitch_rate_r_scale", 2.0)
+                cfg_train.setdefault("velocity_r_total_max", 11.5)
+                cfg_train.setdefault("velocity_thigh_r_relief", 0.34)
+                cfg_train.setdefault("velocity_distal_r_boost", 0.40)
+                cfg_train.setdefault("velocity_thigh_action_gain", 1.45)
+                cfg_train.setdefault("velocity_distal_action_gain", 0.80)
+                cfg_train.setdefault("velocity_back_thigh_target", -0.04)
+                cfg_train.setdefault("velocity_front_thigh_target", 0.90)
+                cfg_train.setdefault("velocity_thigh_target_gain", 0.52)
+                cfg_train.setdefault("velocity_thigh_target_max", 0.62)
+                cfg_train.setdefault("velocity_thigh_recovery_gain", 1.3)
+                cfg_train.setdefault("velocity_thigh_recovery_threshold", 0.05)
+                cfg_train.setdefault("velocity_speed_gate", 0.0)
+                cfg_train.setdefault("speed_violation_weight", 0.0)
+                cfg_train.setdefault("speed_violation_clip", 0.0)
         
         # Enhanced Ant-specific tuning by agent configuration
         elif args.scenario == "Ant":
