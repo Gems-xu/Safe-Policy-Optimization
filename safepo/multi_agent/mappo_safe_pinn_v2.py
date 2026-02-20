@@ -1494,78 +1494,101 @@ def train(args, cfg_train):
 
         # Enhanced HalfCheetah-specific tuning by agent configuration
         if args.scenario == "HalfCheetah":
-            cfg_train.setdefault("lamda_lagr_max", 22.0)
-            cfg_train.setdefault("lagrangian_slow_rate", 0.05)
-            cfg_train.setdefault("lagrangian_update_interval", 1)
-            cfg_train.setdefault("cost_limit", 10.0)
+            # IMPORTANT: use hard override (not setdefault). These task-specific
+            # settings must take precedence over generic velocity defaults above.
+            cfg_train["lamda_lagr_max"] = 22.0
+            cfg_train["lagrangian_slow_rate"] = 0.05
+            cfg_train["lagrangian_update_interval"] = 1
+            cfg_train["cost_limit"] = 10.0
             if args.agent_conf == "2x3":
                 # 2x3: Front vs Back legs coordination is critical
-                cfg_train.setdefault("velocity_safety_threshold", 2.75)
-                cfg_train.setdefault("velocity_posture_threshold", 0.25)
-                cfg_train.setdefault("velocity_posture_correction_weight", 0.55)
-                cfg_train.setdefault("velocity_posture_r_scale", 1.8)  # Strong damping when unstable
-                cfg_train.setdefault("velocity_r_base", 0.22)  # recover stride amplitude
-                cfg_train.setdefault("velocity_speed_r_scale", 3.2)
-                cfg_train.setdefault("velocity_energy_r_scale", 3.6)
-                cfg_train.setdefault("velocity_directional_r_scale", 2.0)
-                cfg_train.setdefault("velocity_preemptive_ratio", 0.78)
-                cfg_train.setdefault("velocity_preemptive_r_scale", 2.1)
-                cfg_train.setdefault("velocity_height_threshold", 0.58)
-                cfg_train.setdefault("velocity_height_r_scale", 2.4)
-                cfg_train.setdefault("velocity_pitch_rate_threshold", 1.0)
-                cfg_train.setdefault("velocity_pitch_rate_r_scale", 2.1)
-                cfg_train.setdefault("velocity_r_total_max", 12.0)
-                cfg_train.setdefault("velocity_thigh_r_relief", 0.40)
-                cfg_train.setdefault("velocity_distal_r_boost", 0.42)
-                cfg_train.setdefault("velocity_thigh_action_gain", 1.65)
-                cfg_train.setdefault("velocity_distal_action_gain", 0.76)
-                cfg_train.setdefault("velocity_front_action_boost", 1.40)
-                cfg_train.setdefault("velocity_back_thigh_target", -0.05)
-                cfg_train.setdefault("velocity_front_thigh_target", 0.95)
-                cfg_train.setdefault("velocity_thigh_target_gain", 0.62)
-                cfg_train.setdefault("velocity_thigh_target_max", 0.70)
-                cfg_train.setdefault("velocity_thigh_recovery_gain", 1.5)
-                cfg_train.setdefault("velocity_thigh_recovery_threshold", 0.04)
-                cfg_train.setdefault("velocity_front_lift_bias", 0.24)
-                cfg_train.setdefault("velocity_back_push_bias", 0.14)
-                cfg_train.setdefault("velocity_speed_gate", 0.0)
-                cfg_train.setdefault("speed_violation_weight", 0.0)
-                cfg_train.setdefault("speed_violation_clip", 0.0)
-                cfg_train.setdefault("velocity_pitch_threshold", 0.35)
-                cfg_train.setdefault("velocity_pitch_r_scale", 2.6)
-                cfg_train.setdefault("velocity_pitch_gate", 0.7)
-                cfg_train.setdefault("fall_pitch_threshold", 0.35)
-                cfg_train.setdefault("fall_height_threshold", 0.33)
-                cfg_train.setdefault("posture_reward_weight", 0.03)
-                cfg_train.setdefault("posture_reward_threshold", 0.18)
-                cfg_train.setdefault("posture_reward_clip", 0.8)
+                cfg_train["velocity_safety_threshold"] = 3.05
+                cfg_train["velocity_posture_threshold"] = 0.20
+                cfg_train["velocity_posture_correction_weight"] = 0.22
+                cfg_train["velocity_posture_correction_max"] = 0.22
+                cfg_train["velocity_policy_gate_floor"] = 0.60
+                cfg_train["velocity_stability_threshold"] = 0.72
+                cfg_train["velocity_stability_r_scale"] = 1.0
+                cfg_train["velocity_coordination_weight"] = 0.06
+                cfg_train["velocity_posture_r_scale"] = 0.8
+                cfg_train["velocity_r_base"] = 0.11
+                cfg_train["velocity_speed_r_scale"] = 1.6
+                cfg_train["velocity_energy_r_scale"] = 1.8
+                cfg_train["velocity_directional_r_scale"] = 0.9
+                cfg_train["velocity_preemptive_ratio"] = 0.90
+                cfg_train["velocity_preemptive_r_scale"] = 1.0
+                cfg_train["velocity_height_threshold"] = 0.56
+                cfg_train["velocity_height_r_scale"] = 1.4
+                cfg_train["velocity_pitch_rate_threshold"] = 1.0
+                cfg_train["velocity_pitch_rate_r_scale"] = 1.4
+                cfg_train["velocity_r_total_max"] = 7.0
+                cfg_train["velocity_thigh_r_relief"] = 0.26
+                cfg_train["velocity_distal_r_boost"] = 0.20
+                cfg_train["velocity_thigh_action_gain"] = 1.52
+                cfg_train["velocity_distal_action_gain"] = 0.96
+                cfg_train["velocity_front_action_boost"] = 1.24
+                cfg_train["velocity_back_thigh_target"] = -0.12
+                cfg_train["velocity_front_thigh_target"] = 0.68
+                cfg_train["velocity_thigh_target_gain"] = 0.30
+                cfg_train["velocity_thigh_target_max"] = 0.32
+                cfg_train["velocity_thigh_recovery_gain"] = 0.8
+                cfg_train["velocity_thigh_recovery_threshold"] = 0.10
+                cfg_train["velocity_front_lift_bias"] = 0.03
+                cfg_train["velocity_back_push_bias"] = 0.03
+                cfg_train["velocity_speed_gate"] = 0.0
+                cfg_train["speed_violation_weight"] = 0.0
+                cfg_train["speed_violation_clip"] = 0.0
+                cfg_train["velocity_pitch_threshold"] = 0.32
+                cfg_train["velocity_pitch_r_scale"] = 1.6
+                cfg_train["velocity_pitch_gate"] = 0.30
+                cfg_train["velocity_phs_blend_base"] = 0.20
+                cfg_train["velocity_phs_blend_risk_scale"] = 0.55
+                cfg_train["velocity_phs_comp_max"] = 0.40
+                cfg_train["fall_pitch_threshold"] = 0.33
+                cfg_train["fall_height_threshold"] = 0.33
+                cfg_train["posture_reward_weight"] = 0.0
+                cfg_train["posture_reward_threshold"] = 0.18
+                cfg_train["posture_reward_clip"] = 0.5
             elif args.agent_conf == "6x1":
-                cfg_train.setdefault("velocity_safety_threshold", 2.80)
-                cfg_train.setdefault("velocity_r_base", 0.16)
-                cfg_train.setdefault("velocity_posture_correction_weight", 0.20)
-                cfg_train.setdefault("velocity_speed_r_scale", 3.0)
-                cfg_train.setdefault("velocity_energy_r_scale", 3.4)
-                cfg_train.setdefault("velocity_directional_r_scale", 1.8)
-                cfg_train.setdefault("velocity_preemptive_ratio", 0.80)
-                cfg_train.setdefault("velocity_preemptive_r_scale", 2.0)
-                cfg_train.setdefault("velocity_height_threshold", 0.58)
-                cfg_train.setdefault("velocity_height_r_scale", 2.2)
-                cfg_train.setdefault("velocity_pitch_rate_threshold", 1.0)
-                cfg_train.setdefault("velocity_pitch_rate_r_scale", 2.0)
-                cfg_train.setdefault("velocity_r_total_max", 11.5)
-                cfg_train.setdefault("velocity_thigh_r_relief", 0.34)
-                cfg_train.setdefault("velocity_distal_r_boost", 0.40)
-                cfg_train.setdefault("velocity_thigh_action_gain", 1.45)
-                cfg_train.setdefault("velocity_distal_action_gain", 0.80)
-                cfg_train.setdefault("velocity_back_thigh_target", -0.04)
-                cfg_train.setdefault("velocity_front_thigh_target", 0.90)
-                cfg_train.setdefault("velocity_thigh_target_gain", 0.52)
-                cfg_train.setdefault("velocity_thigh_target_max", 0.62)
-                cfg_train.setdefault("velocity_thigh_recovery_gain", 1.3)
-                cfg_train.setdefault("velocity_thigh_recovery_threshold", 0.05)
-                cfg_train.setdefault("velocity_speed_gate", 0.0)
-                cfg_train.setdefault("speed_violation_weight", 0.0)
-                cfg_train.setdefault("speed_violation_clip", 0.0)
+                cfg_train["velocity_safety_threshold"] = 2.95
+                cfg_train["velocity_r_base"] = 0.12
+                cfg_train["velocity_posture_correction_weight"] = 0.18
+                cfg_train["velocity_posture_correction_max"] = 0.20
+                cfg_train["velocity_policy_gate_floor"] = 0.62
+                cfg_train["velocity_stability_threshold"] = 0.74
+                cfg_train["velocity_stability_r_scale"] = 0.9
+                cfg_train["velocity_coordination_weight"] = 0.0
+                cfg_train["velocity_speed_r_scale"] = 2.2
+                cfg_train["velocity_energy_r_scale"] = 2.5
+                cfg_train["velocity_directional_r_scale"] = 1.2
+                cfg_train["velocity_preemptive_ratio"] = 0.88
+                cfg_train["velocity_preemptive_r_scale"] = 1.2
+                cfg_train["velocity_height_threshold"] = 0.58
+                cfg_train["velocity_height_r_scale"] = 1.6
+                cfg_train["velocity_pitch_rate_threshold"] = 1.0
+                cfg_train["velocity_pitch_rate_r_scale"] = 1.5
+                cfg_train["velocity_r_total_max"] = 8.5
+                cfg_train["velocity_thigh_r_relief"] = 0.30
+                cfg_train["velocity_distal_r_boost"] = 0.22
+                cfg_train["velocity_thigh_action_gain"] = 1.65
+                cfg_train["velocity_distal_action_gain"] = 0.90
+                cfg_train["velocity_front_action_boost"] = 1.22
+                cfg_train["velocity_back_thigh_target"] = -0.08
+                cfg_train["velocity_front_thigh_target"] = 0.80
+                cfg_train["velocity_thigh_target_gain"] = 0.38
+                cfg_train["velocity_thigh_target_max"] = 0.42
+                cfg_train["velocity_thigh_recovery_gain"] = 0.9
+                cfg_train["velocity_thigh_recovery_threshold"] = 0.08
+                cfg_train["velocity_pitch_threshold"] = 0.34
+                cfg_train["velocity_pitch_r_scale"] = 1.7
+                cfg_train["velocity_pitch_gate"] = 0.32
+                cfg_train["velocity_phs_blend_base"] = 0.18
+                cfg_train["velocity_phs_blend_risk_scale"] = 0.60
+                cfg_train["velocity_phs_comp_max"] = 0.36
+                cfg_train["posture_reward_weight"] = 0.0
+                cfg_train["velocity_speed_gate"] = 0.0
+                cfg_train["speed_violation_weight"] = 0.0
+                cfg_train["speed_violation_clip"] = 0.0
         
         # Enhanced Ant-specific tuning by agent configuration
         elif args.scenario == "Ant":
