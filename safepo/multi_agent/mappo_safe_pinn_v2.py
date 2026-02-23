@@ -619,6 +619,9 @@ class Runner:
         self.posture_reward_weight = float(config.get("posture_reward_weight", 0.0))
         self.posture_reward_threshold = float(config.get("posture_reward_threshold", 0.0))
         self.posture_reward_clip = float(config.get("posture_reward_clip", 1.0))
+        self.front_distal_collapse_weight = float(config.get("front_distal_collapse_weight", 0.0))
+        self.front_shin_abs_target = float(config.get("front_shin_abs_target", 0.40))
+        self.front_foot_abs_target = float(config.get("front_foot_abs_target", 0.28))
         self.speed_violation_weight = float(config.get("speed_violation_weight", 0.0))
         self.speed_violation_clip = float(config.get("speed_violation_clip", 0.5))
         
@@ -1038,10 +1041,35 @@ class Runner:
                 n_qpos = state_raw_dim // 2
                 if n_qpos > 1:
                     qpos = obs_to_insert[:, :n_qpos]
-                    posture_dev = torch.mean(torch.abs(qpos[:, 1:]), dim=-1, keepdim=True)
+                    pitch_idx = 2 if n_qpos >= 9 else 1
+                    posture_dev = torch.abs(qpos[:, pitch_idx:pitch_idx + 1])
                     excess = torch.clamp(posture_dev - self.posture_reward_threshold, min=0.0)
                     posture_penalty = torch.clamp(excess, max=self.posture_reward_clip)
                     agent_reward = agent_reward - self.posture_reward_weight * posture_penalty
+
+            # 6x1 HalfCheetah anti-collapse shaping:
+            # discourage front leg distal joints from collapsing near zero amplitude.
+            if (
+                self.is_velocity_task
+                and self.scenario == "HalfCheetah"
+                and self.config.get("agent_conf", "") == "6x1"
+                and self.front_distal_collapse_weight > 0.0
+                and agent_id in (3, 4, 5)
+                and not self.config.get("normalize_obs", True)
+            ):
+                obs_dim = obs_to_insert.shape[-1]
+                state_raw_dim = max(obs_dim - self.num_agents, 1)
+                n_qpos = state_raw_dim // 2
+                if n_qpos >= 8:
+                    fshin_idx = 7 if n_qpos >= 9 else 6
+                    ffoot_idx = 8 if n_qpos >= 9 else 7
+                    fshin = torch.abs(obs_to_insert[:, fshin_idx:fshin_idx + 1])
+                    ffoot = torch.abs(obs_to_insert[:, ffoot_idx:ffoot_idx + 1])
+                    collapse_penalty = (
+                        torch.clamp(self.front_shin_abs_target - fshin, min=0.0) +
+                        torch.clamp(self.front_foot_abs_target - ffoot, min=0.0)
+                    )
+                    agent_reward = agent_reward - self.front_distal_collapse_weight * collapse_penalty
 
             # Soft cost augmentation
             if soft_cost_weight > 0:
@@ -1415,6 +1443,7 @@ def train(args, cfg_train):
     cfg_train["env_name"] = args.task
     cfg_train["task"] = args.task
     cfg_train["scenario"] = args.scenario
+    cfg_train["agent_conf"] = args.agent_conf
 
     # Velocity task: set scenario-aware safety threshold (if not overridden)
     if args.task in multi_agent_velocity_map:
@@ -1550,62 +1579,158 @@ def train(args, cfg_train):
                 cfg_train["posture_reward_threshold"] = 0.18
                 cfg_train["posture_reward_clip"] = 0.5
             elif args.agent_conf == "6x1":
+                cfg_train["actor_lr"] = 1.0e-4
                 cfg_train["velocity_safety_threshold"] = 2.95
-                cfg_train["velocity_r_base"] = 0.12
-                cfg_train["velocity_posture_correction_weight"] = 0.18
+                cfg_train["velocity_r_base"] = 0.10
+                cfg_train["velocity_posture_correction_weight"] = 0.14
                 cfg_train["velocity_posture_correction_max"] = 0.20
                 cfg_train["velocity_policy_gate_floor"] = 0.62
                 cfg_train["velocity_stability_threshold"] = 0.74
                 cfg_train["velocity_stability_r_scale"] = 0.9
                 cfg_train["velocity_coordination_weight"] = 0.0
-                cfg_train["velocity_speed_r_scale"] = 2.2
-                cfg_train["velocity_energy_r_scale"] = 2.5
-                cfg_train["velocity_directional_r_scale"] = 1.2
+                cfg_train["velocity_speed_r_scale"] = 1.8
+                cfg_train["velocity_energy_r_scale"] = 2.0
+                cfg_train["velocity_directional_r_scale"] = 1.0
                 cfg_train["velocity_preemptive_ratio"] = 0.88
                 cfg_train["velocity_preemptive_r_scale"] = 1.2
                 cfg_train["velocity_height_threshold"] = 0.58
-                cfg_train["velocity_height_r_scale"] = 1.6
+                cfg_train["velocity_height_r_scale"] = 1.4
                 cfg_train["velocity_pitch_rate_threshold"] = 1.0
-                cfg_train["velocity_pitch_rate_r_scale"] = 1.5
-                cfg_train["velocity_r_total_max"] = 8.5
+                cfg_train["velocity_pitch_rate_r_scale"] = 1.3
+                cfg_train["velocity_r_total_max"] = 7.6
                 cfg_train["velocity_thigh_r_relief"] = 0.30
-                cfg_train["velocity_distal_r_boost"] = 0.22
+                cfg_train["velocity_distal_r_boost"] = 0.12
                 cfg_train["velocity_thigh_action_gain"] = 1.65
-                cfg_train["velocity_distal_action_gain"] = 0.90
-                cfg_train["velocity_front_action_boost"] = 1.22
+                cfg_train["velocity_distal_action_gain"] = 0.95
+                cfg_train["velocity_front_action_boost"] = 1.28
+                cfg_train["velocity_front_distal_r_relief"] = 0.60
+                cfg_train["velocity_front_shin_abs_target"] = 0.42
+                cfg_train["velocity_front_foot_abs_target"] = 0.30
+                cfg_train["velocity_front_distal_extension_gain"] = 2.2
+                cfg_train["velocity_front_distal_extension_max"] = 0.55
+                cfg_train["velocity_control_warmup_steps"] = 12000
+                cfg_train["velocity_front_distal_warmup_steps"] = 18000
+                cfg_train["front_distal_collapse_weight"] = 0.01
+                cfg_train["front_shin_abs_target"] = 0.40
+                cfg_train["front_foot_abs_target"] = 0.28
                 cfg_train["velocity_back_thigh_target"] = -0.08
                 cfg_train["velocity_front_thigh_target"] = 0.80
                 cfg_train["velocity_thigh_target_gain"] = 0.38
                 cfg_train["velocity_thigh_target_max"] = 0.42
                 cfg_train["velocity_thigh_recovery_gain"] = 0.9
-                cfg_train["velocity_thigh_recovery_threshold"] = 0.08
+                cfg_train["velocity_thigh_recovery_threshold"] = 0.06
                 cfg_train["velocity_pitch_threshold"] = 0.34
-                cfg_train["velocity_pitch_r_scale"] = 1.7
-                cfg_train["velocity_pitch_gate"] = 0.32
-                cfg_train["velocity_phs_blend_base"] = 0.18
-                cfg_train["velocity_phs_blend_risk_scale"] = 0.60
-                cfg_train["velocity_phs_comp_max"] = 0.36
+                cfg_train["velocity_pitch_r_scale"] = 1.5
+                cfg_train["velocity_pitch_gate"] = 0.28
+                cfg_train["velocity_phs_blend_base"] = 0.15
+                cfg_train["velocity_phs_blend_risk_scale"] = 0.55
+                cfg_train["velocity_phs_comp_max"] = 0.30
                 cfg_train["posture_reward_weight"] = 0.0
                 cfg_train["velocity_speed_gate"] = 0.0
                 cfg_train["speed_violation_weight"] = 0.0
                 cfg_train["speed_violation_clip"] = 0.0
         
         # Enhanced Ant-specific tuning by agent configuration
+        # IMPORTANT: use hard override (not setdefault). These task-specific
+        # settings must take precedence over generic velocity defaults above.
         elif args.scenario == "Ant":
+            # Ant locomotion is fundamentally different from HalfCheetah:
+            # - 4-legged, moves in 2D plane (not just forward)
+            # - Complex gait coordination between legs
+            # - PHS R-matrix damping should be MINIMAL at normal speed,
+            #   only activate near velocity safety threshold
+            # - Posture is torso-tilt based (not joint-angle based)
+            cfg_train["cost_limit"] = 25.0
+
             if args.agent_conf == "2x4":
-                # 2x4: Two legs each, need strong coordination
-                cfg_train.setdefault("velocity_posture_threshold", 0.38)
-                cfg_train.setdefault("velocity_posture_correction_weight", 0.30)
-                cfg_train.setdefault("velocity_posture_r_scale", 1.5)
-                cfg_train.setdefault("velocity_r_base", 0.14)
-                cfg_train.setdefault("fall_height_threshold", 0.26)  # Stricter for 2x4
+                # 2x4: Two agents, 4 joints each (2 legs per agent)
+                # OBSERVATION: velocity_ratio ~0.4-0.5, agent is too slow
+                # ROOT CAUSE: R-matrix damping + posture correction still too
+                #   aggressive, PHS compensation fights the reward signal
+                # FIX: Near-zero PHS at normal speed, only intervene near limit
+                cfg_train["velocity_safety_threshold"] = 2.55
+                cfg_train["velocity_r_base"] = 0.015            # Near-zero base damping
+                cfg_train["velocity_posture_threshold"] = 0.65   # Very lenient (Ant tilt-based now)
+                cfg_train["velocity_posture_correction_weight"] = 0.03  # Almost no posture override
+                cfg_train["velocity_posture_correction_max"] = 0.06
+                cfg_train["velocity_posture_r_scale"] = 0.25     # Minimal posture damping
+                cfg_train["velocity_policy_gate_floor"] = 0.92   # Almost full policy freedom
+                cfg_train["velocity_stability_threshold"] = 0.82
+                cfg_train["velocity_stability_r_scale"] = 0.35
+                cfg_train["velocity_coordination_weight"] = 0.06  # Light coordination
+                cfg_train["velocity_phs_blend_base"] = 0.02      # Near-zero PHS at normal speed
+                cfg_train["velocity_phs_blend_risk_scale"] = 0.50 # Strong at high risk
+                cfg_train["velocity_phs_comp_max"] = 0.08        # Very tight PHS cap
+                cfg_train["velocity_speed_r_scale"] = 0.8         # Activates near limit
+                cfg_train["velocity_speed_gate"] = 0.0
+                cfg_train["velocity_energy_r_scale"] = 0.4
+                cfg_train["velocity_directional_r_scale"] = 0.2
+                cfg_train["velocity_preemptive_ratio"] = 0.90     # Activate at 90% threshold
+                cfg_train["velocity_preemptive_r_scale"] = 0.6
+                cfg_train["velocity_pitch_threshold"] = 0.55
+                cfg_train["velocity_pitch_r_scale"] = 0.5
+                cfg_train["velocity_pitch_gate"] = 0.20
+                cfg_train["velocity_height_threshold"] = 0.50     # Ant standing ~0.75
+                cfg_train["velocity_height_r_scale"] = 0.6
+                cfg_train["velocity_pitch_rate_threshold"] = 2.0
+                cfg_train["velocity_pitch_rate_r_scale"] = 0.5
+                cfg_train["velocity_r_total_max"] = 2.5          # Tight damping cap
+                cfg_train["fall_height_threshold"] = 0.22
+                cfg_train["speed_violation_weight"] = 0.0
+                cfg_train["speed_violation_clip"] = 0.0
+                cfg_train["posture_reward_weight"] = 0.0
+                cfg_train["lamda_lagr"] = 0.05
+                cfg_train["lamda_lagr_max"] = 1.5
+                cfg_train["lagrangian_slow_rate"] = 0.003
+                cfg_train["lagrangian_update_interval"] = 5
+                cfg_train["lagrangian_ema_alpha"] = 0.95
+
             elif args.agent_conf == "4x2":
-                # 4x2: Four agents, one joint each, very challenging
-                cfg_train.setdefault("velocity_posture_threshold", 0.42)
-                cfg_train.setdefault("velocity_posture_correction_weight", 0.35)
-                cfg_train.setdefault("velocity_posture_r_scale", 1.4)
-                cfg_train.setdefault("velocity_r_base", 0.12)
-                cfg_train.setdefault("fall_height_threshold", 0.27)
+                # 4x2: Four agents, 2 joints each (1 leg per agent)
+                # OBSERVATION: Peak at ~170 then collapses to ~10 by 10M
+                # ROOT CAUSE: Classic Lagrangian integral windup. Agent learns
+                #   fast gait → speed violations → λ ramps → crushes 4-agent
+                #   coordination → reward collapses → lose learned gait.
+                # FIX: Very strict λ cap (0.5), ultra-slow updates, minimal PHS
+                cfg_train["velocity_safety_threshold"] = 2.45
+                cfg_train["velocity_r_base"] = 0.01             # Minimal base damping
+                cfg_train["velocity_posture_threshold"] = 0.65
+                cfg_train["velocity_posture_correction_weight"] = 0.02  # Near-zero posture override
+                cfg_train["velocity_posture_correction_max"] = 0.05
+                cfg_train["velocity_posture_r_scale"] = 0.15
+                cfg_train["velocity_policy_gate_floor"] = 0.95   # Almost never suppress policy
+                cfg_train["velocity_stability_threshold"] = 0.85
+                cfg_train["velocity_stability_r_scale"] = 0.2
+                cfg_train["velocity_coordination_weight"] = 0.04  # Light coordination
+                cfg_train["velocity_phs_blend_base"] = 0.01      # Near-zero PHS nominal
+                cfg_train["velocity_phs_blend_risk_scale"] = 0.40 # Moderate at risk
+                cfg_train["velocity_phs_comp_max"] = 0.05        # Very tight PHS cap
+                cfg_train["velocity_speed_r_scale"] = 0.6         # Only near limit
+                cfg_train["velocity_speed_gate"] = 0.0
+                cfg_train["velocity_energy_r_scale"] = 0.3
+                cfg_train["velocity_directional_r_scale"] = 0.15
+                cfg_train["velocity_preemptive_ratio"] = 0.92
+                cfg_train["velocity_preemptive_r_scale"] = 0.4
+                cfg_train["velocity_pitch_threshold"] = 0.55
+                cfg_train["velocity_pitch_r_scale"] = 0.35
+                cfg_train["velocity_pitch_gate"] = 0.15
+                cfg_train["velocity_height_threshold"] = 0.50     # Ant standing ~0.75
+                cfg_train["velocity_height_r_scale"] = 0.4
+                cfg_train["velocity_pitch_rate_threshold"] = 2.0
+                cfg_train["velocity_pitch_rate_r_scale"] = 0.3
+                cfg_train["velocity_r_total_max"] = 1.5          # Very tight damping cap
+                cfg_train["fall_height_threshold"] = 0.22
+                cfg_train["speed_violation_weight"] = 0.0
+                cfg_train["speed_violation_clip"] = 0.0
+                cfg_train["posture_reward_weight"] = 0.0
+                # Anti-collapse: ultra-conservative Lagrangian
+                cfg_train["lamda_lagr"] = 0.03                   # Start near zero
+                cfg_train["lamda_lagr_max"] = 0.5                # CRITICAL: very strict cap
+                cfg_train["lagrangian_slow_rate"] = 0.0005       # Ultra-slow updates
+                cfg_train["lagrangian_ema_alpha"] = 0.99          # Very smooth cost tracking
+                cfg_train["lagrangian_update_interval"] = 30      # Very infrequent updates
+                cfg_train["entropy_coef"] = 0.015                 # Moderate entropy
+                cfg_train["max_grad_norm"] = 5.0                  # Tighter gradient clipping
     
     if args.task in multi_agent_velocity_map:
         env = make_ma_mujoco_env(

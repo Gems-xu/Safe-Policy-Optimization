@@ -284,6 +284,7 @@ class PHSMAPPOActor(nn.Module):
             "Humanoid" in env_name and "MultiGoal" not in env_name
         )
         self.is_halfcheetah_velocity = self.is_velocity_task and ("HalfCheetah" in env_name)
+        self.is_ant_velocity = self.is_velocity_task and ("Ant" in env_name)
         
         # For Velocity tasks, we use Barrier PHS with R matrix for velocity safety control
         if self.is_velocity_task:
@@ -388,6 +389,15 @@ class PHSMAPPOActor(nn.Module):
         self.velocity_thigh_recovery_threshold = config.get("velocity_thigh_recovery_threshold", 0.05)
         self.velocity_front_lift_bias = config.get("velocity_front_lift_bias", 0.18)
         self.velocity_back_push_bias = config.get("velocity_back_push_bias", 0.12)
+        self.velocity_front_distal_r_relief = config.get("velocity_front_distal_r_relief", 0.45)
+        self.velocity_front_shin_abs_target = config.get("velocity_front_shin_abs_target", 0.35)
+        self.velocity_front_foot_abs_target = config.get("velocity_front_foot_abs_target", 0.25)
+        self.velocity_front_distal_extension_gain = config.get("velocity_front_distal_extension_gain", 1.8)
+        self.velocity_front_distal_extension_max = config.get("velocity_front_distal_extension_max", 0.50)
+        self.velocity_control_warmup_steps = int(config.get("velocity_control_warmup_steps", 0))
+        self.velocity_front_distal_warmup_steps = int(
+            config.get("velocity_front_distal_warmup_steps", self.velocity_control_warmup_steps)
+        )
         
         # Barrier potential parameters
         self.r_collision = config.get("r_collision", 0.17)  # Collision radius
@@ -791,6 +801,18 @@ class PHSMAPPOActor(nn.Module):
         decay_factor = np.exp(-decay_steps / 2000.0)
         target = self.barrier_weight * self.barrier_decay_rate
         return target + (self.barrier_weight_max - target) * decay_factor
+
+    def _get_velocity_warmup_ratio(self):
+        """Warmup ratio in [0, 1] for velocity control terms."""
+        if self.velocity_control_warmup_steps <= 0:
+            return 1.0
+        return float(np.clip(self._training_step / float(self.velocity_control_warmup_steps), 0.0, 1.0))
+
+    def _get_front_distal_warmup_ratio(self):
+        """Warmup ratio in [0, 1] for 6x1 front-distal extension assist."""
+        if self.velocity_front_distal_warmup_steps <= 0:
+            return 1.0
+        return float(np.clip(self._training_step / float(self.velocity_front_distal_warmup_steps), 0.0, 1.0))
     
     def _extract_physics_state(self, obs):
         """
@@ -1209,9 +1231,49 @@ class PHSMAPPOActor(nn.Module):
             return torch.zeros(qpos.shape[0], 1, device=qpos.device)
         # HalfCheetah stable gait naturally uses large leg articulation. Penalizing all
         # joint angles suppresses stride, so use torso pitch as the posture proxy.
-        if self.is_halfcheetah_velocity and qpos.shape[-1] > 2:
-            return torch.abs(qpos[:, 2:3])
+        if self.is_halfcheetah_velocity:
+            idx = self._get_halfcheetah_qpos_indices(qpos.shape[-1])
+            if idx["pitch"] is not None:
+                return torch.abs(qpos[:, idx["pitch"]:idx["pitch"] + 1])
+        # Ant: use torso tilt (quaternion qx, qy) instead of all joint angles.
+        # Ant qpos (rootx/y removed): [z, qw, qx, qy, qz, hip1, ankle1, ...]
+        # Tilt = sqrt(qx^2 + qy^2); near 0 for upright, avoids penalizing natural gaits.
+        if self.is_ant_velocity and qpos.shape[-1] >= 5:
+            tilt = torch.sqrt(qpos[:, 2:3] ** 2 + qpos[:, 3:4] ** 2 + 1e-6)
+            return tilt
         return torch.mean(torch.abs(qpos[:, 1:]), dim=-1, keepdim=True)
+
+    def _get_halfcheetah_qpos_indices(self, qpos_dim):
+        """Resolve HalfCheetah qpos indices for both full and rootx-dropped state vectors."""
+        # Full MuJoCo qpos: [rootx, rootz, rooty, bthigh, bshin, bfoot, fthigh, fshin, ffoot] (len=9)
+        # ShareEnv.state() often drops rootx, resulting in len=8.
+        if qpos_dim >= 9:
+            return {"z": 1, "pitch": 2, "bthigh": 3, "bshin": 4, "bfoot": 5, "fthigh": 6, "fshin": 7, "ffoot": 8}
+        if qpos_dim >= 8:
+            return {"z": 0, "pitch": 1, "bthigh": 2, "bshin": 3, "bfoot": 4, "fthigh": 5, "fshin": 6, "ffoot": 7}
+        return {"z": None, "pitch": None, "bthigh": None, "bshin": None, "bfoot": None, "fthigh": None, "fshin": None, "ffoot": None}
+
+    def _get_halfcheetah_qvel_indices(self, qvel_dim):
+        """Resolve HalfCheetah qvel indices for both full and rootx-dropped state vectors."""
+        # Typical qvel: [rootx, rootz, rooty, bthigh, bshin, bfoot, fthigh, fshin, ffoot]
+        if qvel_dim >= 9:
+            return {"bthigh": 3, "bshin": 4, "bfoot": 5, "fthigh": 6, "fshin": 7, "ffoot": 8}
+        if qvel_dim >= 8:
+            return {"bthigh": 2, "bshin": 3, "bfoot": 4, "fthigh": 5, "fshin": 6, "ffoot": 7}
+        return {"bthigh": None, "bshin": None, "bfoot": None, "fthigh": None, "fshin": None, "ffoot": None}
+
+    def _get_halfcheetah_local_control_vel(self, qvel):
+        """For 6x1 HalfCheetah, return the local joint velocity controlled by this agent."""
+        if not (self.is_halfcheetah_velocity and self.n_agents >= 6 and self.act_dim == 1):
+            return None
+        order = ["bthigh", "bshin", "bfoot", "fthigh", "fshin", "ffoot"]
+        if self.agent_id < 0 or self.agent_id >= len(order):
+            return None
+        idx_map = self._get_halfcheetah_qvel_indices(qvel.shape[-1])
+        idx = idx_map.get(order[self.agent_id], None)
+        if idx is None or idx >= qvel.shape[-1]:
+            return None
+        return qvel[:, idx:idx + 1]
     
     def _compute_phs_action(self, obs, state_features, laplacian):
         """
@@ -1240,6 +1302,8 @@ class PHSMAPPOActor(nn.Module):
         
         # ========== VELOCITY TASK: Barrier PHS with R Matrix Control ==========
         if self.is_velocity_task:
+            velocity_warmup = self._get_velocity_warmup_ratio()
+            front_distal_warmup = self._get_front_distal_warmup_ratio()
             # ========== Core Barrier PHS for Velocity Tasks ==========
             # H = 0.5 * v^T * M * v (pure kinetic energy)
             # ∇H = M * v ≈ v (assuming unit mass)
@@ -1264,12 +1328,14 @@ class PHSMAPPOActor(nn.Module):
             elif obs_vel_full.shape[-1] > self.velocity_n_qvel:
                 obs_vel_full = obs_vel_full[:, :self.velocity_n_qvel]
 
-            # Project full velocity to control-relevant space
-            obs_vel = self.velocity_proj_net(obs_vel_full)
-
             # ========== Enhanced Posture and Stability Analysis ==========
             qpos = obs_flat[:, :self.velocity_n_qpos]
             qvel = obs_flat[:, self.velocity_n_qpos:self.velocity_n_qpos + self.velocity_n_qvel]
+            hc_idx = self._get_halfcheetah_qpos_indices(qpos.shape[-1]) if self.is_halfcheetah_velocity else None
+            obs_vel_proj = self.velocity_proj_net(obs_vel_full)
+            obs_vel_local = self._get_halfcheetah_local_control_vel(qvel)
+            # 6x1 uses local joint velocity for PHS control alignment; others use projected velocity.
+            obs_vel = obs_vel_local if obs_vel_local is not None else obs_vel_proj
             
             # Stability risk estimation (comprehensive fall risk prediction)
             qpos_qvel_combined = torch.cat([qpos, qvel], dim=-1)
@@ -1284,20 +1350,35 @@ class PHSMAPPOActor(nn.Module):
             posture_risk = torch.clamp(posture_dev - self.velocity_posture_threshold, min=0.0)
 
             # Pitch risk: HalfCheetah-like forward fall is captured by root pitch angle
-            if qpos.shape[-1] > 2:
+            if self.is_halfcheetah_velocity and hc_idx["pitch"] is not None:
+                root_pitch = qpos[:, hc_idx["pitch"]:hc_idx["pitch"] + 1]
+                pitch_risk = torch.clamp(torch.abs(root_pitch) - self.velocity_pitch_threshold, min=0.0)
+            elif qpos.shape[-1] > 2:
                 root_pitch = qpos[:, 2:3]
                 pitch_risk = torch.clamp(torch.abs(root_pitch) - self.velocity_pitch_threshold, min=0.0)
             else:
+                root_pitch = torch.zeros(qpos.shape[0], 1, device=qpos.device)
                 pitch_risk = torch.zeros(qpos.shape[0], 1, device=qpos.device)
 
             # Height risk and pitch-rate risk for anti-forward-fall stabilization
-            if qpos.shape[-1] > 1:
+            if self.is_halfcheetah_velocity and hc_idx["z"] is not None:
+                torso_height = qpos[:, hc_idx["z"]:hc_idx["z"] + 1]
+                height_risk = torch.clamp(self.velocity_height_threshold - torso_height, min=0.0)
+            elif self.is_ant_velocity and qpos.shape[-1] >= 1:
+                # Ant: qpos[0] = z position (standing height ~0.75)
+                torso_height = qpos[:, 0:1]
+                height_risk = torch.clamp(self.velocity_height_threshold - torso_height, min=0.0)
+            elif qpos.shape[-1] > 1:
                 torso_height = qpos[:, 1:2]
                 height_risk = torch.clamp(self.velocity_height_threshold - torso_height, min=0.0)
             else:
                 torso_height = torch.zeros(qpos.shape[0], 1, device=qpos.device)
                 height_risk = torch.zeros(qpos.shape[0], 1, device=qpos.device)
-            if qvel.shape[-1] > 2:
+            if self.is_ant_velocity and qvel.shape[-1] >= 6:
+                # Ant: use angular velocity magnitude (qvel[3:6] = wx,wy,wz)
+                pitch_rate = torch.norm(qvel[:, 3:6], dim=-1, keepdim=True)
+                pitch_rate_risk = torch.clamp(pitch_rate - self.velocity_pitch_rate_threshold, min=0.0)
+            elif qvel.shape[-1] > 2:
                 pitch_rate = qvel[:, 2:3]
                 pitch_rate_risk = torch.clamp(torch.abs(pitch_rate) - self.velocity_pitch_rate_threshold, min=0.0)
             else:
@@ -1391,6 +1472,14 @@ class PHSMAPPOActor(nn.Module):
                 joint_prior[:, 0:1] = thigh_scale
                 joint_prior[:, 1:] = 1.0 + self.velocity_distal_r_boost
                 R_diag_total = R_diag_total * joint_prior
+            elif self.is_halfcheetah_velocity and self.n_agents >= 6 and self.act_dim == 1:
+                if self.agent_id in (0, 3):
+                    local_r_prior = max(1.0 - float(self.velocity_thigh_r_relief), 0.55)
+                elif self.agent_id in (4, 5):
+                    local_r_prior = max(1.0 - float(self.velocity_front_distal_r_relief), 0.45)
+                else:
+                    local_r_prior = 1.0 + 0.5 * float(self.velocity_distal_r_boost)
+                R_diag_total = R_diag_total * local_r_prior
             R_diag_total = torch.clamp(R_diag_total, min=self.velocity_r_base, max=self.velocity_r_total_max)
             
             # ========== 4. Policy Network with Agent Coordination ==========
@@ -1434,6 +1523,7 @@ class PHSMAPPOActor(nn.Module):
                 min=0.0,
                 max=self.velocity_posture_correction_max
             )
+            posture_scale = posture_scale * velocity_warmup
             
             # Combine policy, coordination, and posture correction
             # coordination_signal helps balance forces across agents
@@ -1453,15 +1543,18 @@ class PHSMAPPOActor(nn.Module):
                     min=0.0,
                     max=1.0,
                 )
+                recovery_gate = recovery_gate * velocity_warmup
                 recovery_scale = 1.0 + self.velocity_thigh_recovery_gain * torch.clamp(recovery_excess, max=1.0)
                 thigh_angle = None
                 thigh_target = None
                 if self.n_agents == 2 and self.act_dim >= 3:
                     if self.agent_id == 0:
-                        thigh_angle = qpos[:, 3:4]  # bthigh
+                        if hc_idx["bthigh"] is not None:
+                            thigh_angle = qpos[:, hc_idx["bthigh"]:hc_idx["bthigh"] + 1]
                         thigh_target = self.velocity_back_thigh_target
                     elif self.agent_id == 1:
-                        thigh_angle = qpos[:, 6:7]  # fthigh
+                        if hc_idx["fthigh"] is not None:
+                            thigh_angle = qpos[:, hc_idx["fthigh"]:hc_idx["fthigh"] + 1]
                         thigh_target = self.velocity_front_thigh_target
                     if thigh_angle is not None:
                         thigh_err = thigh_target - thigh_angle
@@ -1478,10 +1571,12 @@ class PHSMAPPOActor(nn.Module):
                         thigh_target_correction[:, 0:1] = thigh_cmd * recovery_gate
                 elif self.n_agents >= 6 and self.act_dim == 1:
                     if self.agent_id == 0:
-                        thigh_angle = qpos[:, 3:4]
+                        if hc_idx["bthigh"] is not None:
+                            thigh_angle = qpos[:, hc_idx["bthigh"]:hc_idx["bthigh"] + 1]
                         thigh_target = self.velocity_back_thigh_target
                     elif self.agent_id == 3:
-                        thigh_angle = qpos[:, 6:7]
+                        if hc_idx["fthigh"] is not None:
+                            thigh_angle = qpos[:, hc_idx["fthigh"]:hc_idx["fthigh"] + 1]
                         thigh_target = self.velocity_front_thigh_target
                     if thigh_angle is not None:
                         thigh_err = thigh_target - thigh_angle
@@ -1496,6 +1591,32 @@ class PHSMAPPOActor(nn.Module):
                             max=self.velocity_thigh_target_max,
                         ) * recovery_gate
             dx_target = dx_target + thigh_target_correction
+
+            # 6x1 front distal extension assist:
+            # encourage fshin/ffoot away from near-zero tucked posture while preserving sign.
+            front_distal_extension = torch.zeros_like(dx_target)
+            if (
+                self.is_halfcheetah_velocity
+                and self.n_agents >= 6
+                and self.act_dim == 1
+                and self.agent_id in (4, 5)
+            ):
+                joint_key = "fshin" if self.agent_id == 4 else "ffoot"
+                joint_idx = self._get_halfcheetah_qpos_indices(qpos.shape[-1]).get(joint_key, None)
+                if joint_idx is not None and joint_idx < qpos.shape[-1]:
+                    joint_angle = qpos[:, joint_idx:joint_idx + 1]
+                    target_abs = self.velocity_front_shin_abs_target if self.agent_id == 4 else self.velocity_front_foot_abs_target
+                    mag_err = torch.clamp(target_abs - torch.abs(joint_angle), min=0.0)
+                    sign = torch.where(joint_angle >= 0, torch.ones_like(joint_angle), -torch.ones_like(joint_angle))
+                    ext_cmd = self.velocity_front_distal_extension_gain * mag_err * sign
+                    ext_cmd = torch.clamp(
+                        ext_cmd,
+                        min=-self.velocity_front_distal_extension_max,
+                        max=self.velocity_front_distal_extension_max,
+                    )
+                    risk_mix = front_distal_warmup * (0.35 + 0.65 * recovery_gate)
+                    front_distal_extension[:, 0:1] = ext_cmd * risk_mix
+            dx_target = dx_target + front_distal_extension
 
             # HalfCheetah actuation rebalance for gait quality:
             # amplify thigh channel and slightly suppress distal channels.
@@ -1513,8 +1634,13 @@ class PHSMAPPOActor(nn.Module):
                     local_gain = self.velocity_thigh_action_gain
                     if self.agent_id == 3:
                         local_gain = local_gain * self.velocity_front_action_boost
+                elif self.agent_id in (4, 5):
+                    # Front distal joints need larger excursion to avoid "tucked front leg" gait.
+                    local_gain = max(self.velocity_distal_action_gain, 1.05)
+                    local_gain = local_gain * max(self.velocity_front_action_boost * 1.05, 1.10)
                 else:
                     local_gain = self.velocity_distal_action_gain
+                local_gain = 1.0 + (local_gain - 1.0) * velocity_warmup
                 dx_target = dx_target * local_gain
             
             # ========== 5. PHS Dynamics: (J - R) * ∇H ==========
@@ -1536,6 +1662,7 @@ class PHSMAPPOActor(nn.Module):
                 min=0.0,
                 max=1.0,
             )
+            phs_blend = phs_blend * velocity_warmup
             phs_comp = torch.clamp(
                 -phs_blend * phs_drift,
                 min=-self.velocity_phs_comp_max,
@@ -1573,6 +1700,8 @@ class PHSMAPPOActor(nn.Module):
                 'vel_magnitude_mean': vel_magnitude.mean().item(),
                 'phs_drift_mean': phs_drift.mean().item(),
                 'phs_blend_mean': phs_blend.mean().item(),
+                'velocity_warmup': velocity_warmup,
+                'front_distal_warmup': front_distal_warmup,
                 'posture_risk_mean': posture_risk.mean().item(),
                 'posture_correction_mean': posture_correction.mean().item(),
                 # NEW: Enhanced stability metrics
@@ -1591,6 +1720,7 @@ class PHSMAPPOActor(nn.Module):
                 'pitch_rate_risk_mean': pitch_rate_risk.mean().item(),
                 'torso_height_mean': torso_height.mean().item(),
                 'thigh_target_corr_mean': thigh_target_correction.mean().item(),
+                'front_distal_ext_mean': front_distal_extension.mean().item(),
                 'recovery_risk_mean': (pitch_risk + height_risk + 0.5 * pitch_rate_risk).mean().item(),
                 'recovery_gate_mean': recovery_gate.mean().item(),
             }
@@ -1855,7 +1985,10 @@ class PHSMAPPOActor(nn.Module):
                 obs_vel_full = obs_vel_full[:, :self.velocity_n_qvel]
 
             # Project to control-relevant velocity
-            obs_vel = self.velocity_proj_net(obs_vel_full)
+            obs_vel_proj = self.velocity_proj_net(obs_vel_full)
+            qvel = obs_flat[:, self.velocity_n_qpos:self.velocity_n_qpos + self.velocity_n_qvel]
+            obs_vel_local = self._get_halfcheetah_local_control_vel(qvel)
+            obs_vel = obs_vel_local if obs_vel_local is not None else obs_vel_proj
 
             # Posture risk from qpos (same rule as actor path)
             qpos = obs_flat[:, :self.velocity_n_qpos]
