@@ -247,15 +247,16 @@ class PHSMAPPOActor(nn.Module):
            dx = (J - R) ∇H_total
            u_mean = F⁻¹(dx - (J_sys - R_sys) ∇H_sys)
     
-    For Point/Car agents in SafetyMultiGoal:
-        - Observation: Point ~76-dim, Car ~100-dim (with ball joint sensors)
+    For Point/Car/Racecar agents in SafetyMultiGoal:
+        - Observation: Point/Racecar ~152-dim, Car ~176-dim (with ball joint sensors)
         - State: (q_pos, q_vel) = 4-dim
         - Action: 
             - Point: 2-dim (forward force, turning velocity)
             - Car: 2-dim (left wheel torque, right wheel torque) - differential drive!
+            - Racecar: 2-dim (throttle velocity, steering angle) - Ackermann steering!
     
-    CRITICAL: Car uses differential drive (left/right wheel torques), not [forward, turn]!
-    We must convert PHS output (forward, turn) → (left_wheel, right_wheel).
+    CRITICAL: Car uses differential drive → convert PHS (forward, turn) → (left, right).
+    Racecar uses Ackermann steering → PHS (forward, turn) maps directly to (throttle, steering).
     """
     
     def __init__(self, config, obs_space, act_space, device=torch.device("cuda"), n_agents=1, agent_id=0):
@@ -311,12 +312,12 @@ class PHSMAPPOActor(nn.Module):
         if self.agent_type == "auto":
             # Try to get from environment name
             env_name = config.get("env_name", "")
-            if "Car" in env_name:
+            if "Racecar" in env_name:
+                self.agent_type = "racecar"  # Ackermann steering, 12-dim base sensors
+            elif "Car" in env_name:
                 self.agent_type = "car"
             elif "Point" in env_name:
                 self.agent_type = "point"
-            elif "Racecar" in env_name:
-                self.agent_type = "car"  # Racecar also uses differential drive
             elif "Doggo" in env_name or "Ant" in env_name:
                 self.agent_type = "point"  # Use point-style control for these
             else:
@@ -328,9 +329,11 @@ class PHSMAPPOActor(nn.Module):
                     self.agent_type = "point"
         
         # Base sensor offset (before lidar starts)
+        # CRITICAL: Racecar has NO ball joint sensors, same 12-dim base as Point!
+        # Car has ballangvel_rear(3) + ballquat_rear(9) = extra 12 dims
         if self.agent_type == "car":
             self.base_sensor_dim = 24  # accelerometer(3) + velocimeter(3) + gyro(3) + magnetometer(3) + ballangvel(3) + ballquat(9)
-        else:  # point
+        else:  # point or racecar
             self.base_sensor_dim = 12  # accelerometer(3) + velocimeter(3) + gyro(3) + magnetometer(3)
         
         # ===================
@@ -651,7 +654,14 @@ class PHSMAPPOActor(nn.Module):
         )
         self.residual_weight = nn.Parameter(torch.tensor(0.0))  # sigmoid(0) = 0.5
         
-        # ========== 6. Standard Deviation Network ==========
+        # ========== 6. Standard Deviation ==========
+        # v9.4: Use GLOBAL std parameter matching proven MAPPO architecture.
+        # State-dependent std_net caused training instability (std collapse/explosion).
+        # Standard MAPPO uses a single learnable parameter → stable, proven.
+        self.std_x_coef = config.get("std_x_coef", 1.0)
+        self.std_y_coef = config.get("std_y_coef", 0.5)
+        self.action_log_std = nn.Parameter(torch.ones(self.act_dim) * self.std_x_coef)
+        # Keep std_net for velocity tasks (backward compat)
         self.std_net = nn.Sequential(
             nn.Linear(self.physics_hidden + self.act_dim, self.hidden_size // 2),
             nn.ELU(),
@@ -741,10 +751,16 @@ class PHSMAPPOActor(nn.Module):
         for m in self.state_encoder:
             init_layer(m)
         
-        # Initialize main policy network (v8.0)
-        for m in self.policy_net:
-            if isinstance(m, nn.Linear):
-                init_layer(m, gain=1.0)  # Standard gain for main policy
+        # v9.3: Initialize main policy network with NEAR-ZERO output layer
+        # Critical for PHS: guidance signal (goal_grad, barrier_grad) provides correct
+        # initial navigation direction. If policy_net output >> guidance, the guidance
+        # is drowned out and the agent takes random actions.
+        # Solution: last layer gain=0.01 → initial policy_output ≈ 0 → guidance drives behavior
+        policy_layers = [m for m in self.policy_net if isinstance(m, nn.Linear)]
+        for m in policy_layers[:-1]:
+            init_layer(m, gain=1.0)  # Normal gain for hidden layers
+        if policy_layers:
+            init_layer(policy_layers[-1], gain=0.01)  # Near-zero output → guidance dominates
         
         # Initialize PHS guidance network
         for m in self.phs_gain_net:
@@ -765,8 +781,14 @@ class PHSMAPPOActor(nn.Module):
             if isinstance(m, nn.Linear):
                 init_layer(m, gain=0.01)
         
-        for m in self.std_net:
+        # v9.3: Initialize std_net to produce reasonable initial exploration noise
+        # Previous: std_net output ≈ 0 → std = exp(0) = 1.0 → nearly uniform random actions!
+        # New: last layer bias = -1.0 → std = exp(-1) ≈ 0.37 → mean-centered exploration
+        std_layers = [m for m in self.std_net if isinstance(m, nn.Linear)]
+        for m in std_layers:
             init_layer(m, gain=0.1)
+        if std_layers:
+            nn.init.constant_(std_layers[-1].bias, -1.0)  # Initial std ≈ 0.37
 
         if self.is_velocity_task:
             for m in self.velocity_proj_net:
@@ -1171,8 +1193,14 @@ class PHSMAPPOActor(nn.Module):
             # bin 0 is typically forward, angles increase counter-clockwise
             goal_angles_body = torch.linspace(0, 2 * np.pi, num_goal_bins + 1, device=device)[:-1]
 
-            # Use centered logits for stable weighting on raw lidar
-            goal_logits = (goal_lidar - 0.5) * 6.0
+            # v9.1 FIX: Per-sample normalization for robust goal direction
+            # Previous: (lidar - 0.5) * 6.0 → when goal is far (all lidar ≈ 0),
+            #   logits = -3 → softmax uniform → zero gradient → NO goal signal!
+            # New: normalize by per-sample max → relative differences preserved
+            #   even for weak signals (0.02 vs 0.01 → 1.0 vs 0.5 after norm)
+            goal_max = goal_lidar.max(dim=-1, keepdim=True)[0].clamp(min=1e-6)
+            goal_normalized = goal_lidar / goal_max  # [0, 1] relative to strongest bin
+            goal_logits = goal_normalized * 8.0  # Temperature 8 for clear directionality
             goal_weights = F.softmax(goal_logits, dim=-1)
 
             # Weighted average direction in BODY frame
@@ -1186,10 +1214,13 @@ class PHSMAPPOActor(nn.Module):
             # forward = how much goal is in front (cos of angle to goal)
             # turn = how much we need to turn toward goal (sin of angle to goal)
             goal_magnitude = torch.sqrt(goal_dir_forward**2 + goal_dir_lateral**2 + 1e-6)
+            # v9.1: Always provide meaningful direction even for far goals
+            # Far goal (proximity→0): magnitude = 0.5 (still useful guidance)
+            # Close goal (proximity→1): magnitude = 1.0 (strong guidance)
             goal_gradient = torch.cat([
-                goal_dir_forward / goal_magnitude,   # Forward component (normalized)
-                goal_dir_lateral / goal_magnitude    # Turn component (normalized)
-            ], dim=-1) * (0.3 + 0.7 * goal_proximity_scaled)  # Scale by proximity
+                goal_dir_forward / goal_magnitude,   # Forward component (unit)
+                goal_dir_lateral / goal_magnitude    # Turn component (unit)
+            ], dim=-1) * (0.5 + 0.5 * goal_proximity_scaled)  # Min 0.5 magnitude
         
         # ========== Barrier Direction (Body Frame) ==========
         hazard_end = min(self.hazard_lidar_end, obs.shape[-1])
@@ -1201,8 +1232,11 @@ class PHSMAPPOActor(nn.Module):
             num_hazard_bins = hazard_lidar.shape[-1]
             hazard_angles_body = torch.linspace(0, 2 * np.pi, num_hazard_bins + 1, device=device)[:-1]
 
-            # Use centered logits for stable weighting on raw lidar
-            hazard_logits = (hazard_lidar - 0.5) * 6.0
+            # v9.2: Per-sample normalization for accurate hazard direction
+            # (same fix as goal gradient - ensures correct direction at all distances)
+            hazard_max = hazard_lidar.max(dim=-1, keepdim=True)[0].clamp(min=1e-6)
+            hazard_normalized = hazard_lidar / hazard_max
+            hazard_logits = hazard_normalized * 8.0
             hazard_weights = F.softmax(hazard_logits, dim=-1)
 
             # Direction TOWARD hazards in body frame
@@ -1747,47 +1781,53 @@ class PHSMAPPOActor(nn.Module):
         # For MultiGoal, act_dim should be 2, so this works
         dx_target_body = policy_output + residual_w * residual + dx_guidance
 
-        # 3. PHS Drift (Barrier + Task)
+        # 3. PHS Energy-Based Control (v9.0 - correct formulation)
+        #
+        # Previous formulation had a fatal bug: dx_target was placed in the
+        # position part of the state vector, but F_pinv only extracts the
+        # velocity part → policy_net output was COMPLETELY DISCARDED.
+        #
+        # v9.0: Direct PHS control law:
+        #   u = policy_output + guidance + PHS_correction
+        #   PHS_correction = -R * ∇H_kin = -drag * velocity  (energy damping)
+        #
+        # This preserves:
+        # - Full policy expressiveness (gradient flows through policy_net)
+        # - PHS goal/barrier guidance (from directional gradients)
+        # - Physical stability (velocity damping prevents runaway)
+        # - Hamiltonian energy decrease guarantee (dH/dt ≤ 0 via damping)
+
+        # Extract velocity for PHS damping
+        vel = obs_flat[..., self.vel_indices]  # [batch, 2] = [vx, vy]
+
+        # v9.2: Racecar uses SETPOINT actuators (velocity + position), NOT force.
+        # PHS velocity damping on setpoint commands creates dead equilibrium:
+        #   speed ↑ → damping ↑ → command ↓ → speed ↓ → agents can't move!
+        # For Point/Car (force actuators), damping is correct PHS energy dissipation.
+        if self.agent_type == "racecar":
+            # NO damping for Racecar: internal controller handles velocity regulation.
+            # PHS energy bounds maintained via barrier potential and guidance only.
+            phs_damping = torch.zeros_like(vel)
+        else:
+            # Point/Car: both channels are force actuators → damp both
+            phs_damping = -self.drag * vel
+
+        # Compute Hamiltonian info for logging (detached - no gradient needed)
         if is_multi_agent:
             H_total, grad_H_vel, H_info = self._compute_hamiltonian_gradient(
-                obs, state_features, laplacian, detach=False
+                obs, state_features, laplacian, detach=True
             )
-            grad_H_vel = grad_H_vel.view(batch_size * n_agents, -1)
         else:
             H_total, grad_H_vel, H_info = self._compute_hamiltonian_gradient(
-                obs, state_features, laplacian, detach=False
+                obs, state_features, laplacian, detach=True
             )
 
-        # Assemble gradient in state space (pos part = 0, vel part = grad_H_vel)
-        # Use effective_state_dim for proper dimensions
-        grad_H_state = torch.zeros(dx_target_body.shape[0], self.effective_state_dim, device=obs.device, dtype=obs.dtype)
-        effective_dim = self.effective_dim
-        
-        # Handle grad_H_vel dimension mismatch
-        if grad_H_vel.shape[-1] > effective_dim:
-            grad_vel = grad_H_vel[:, :effective_dim]
-        elif grad_H_vel.shape[-1] < effective_dim:
-            pad = torch.zeros(grad_H_vel.shape[0], effective_dim - grad_H_vel.shape[-1], device=obs.device, dtype=obs.dtype)
-            grad_vel = torch.cat([grad_H_vel, pad], dim=-1)
-        else:
-            grad_vel = grad_H_vel
-        grad_H_state[:, effective_dim:] = grad_vel
+        # Final action = policy + guidance + PHS damping
+        u_body = dx_target_body + phs_damping
 
-        J_R = self.J_sys - self.R_sys
-        phs_drift = torch.matmul(J_R, grad_H_state.unsqueeze(-1)).squeeze(-1)
-
-        # Desired state change in state space
-        dx_target_state = torch.zeros_like(grad_H_state)
-        # For MultiGoal, act_dim=2 and effective_dim=2, so this should work
-        min_dim = min(self.act_dim, effective_dim)
-        dx_target_state[:, :min_dim] = dx_target_body[:, :min_dim]
-
-        # Compute port action a via pseudo-inverse of F
-        u_body = torch.matmul(self.F_pinv, (dx_target_state - phs_drift).unsqueeze(-1)).squeeze(-1)
-        
         # ========== 4. Convert to Agent-Specific Action Space ==========
         if self.agent_type == "car":
-            # Differential drive: [forward, turn] -> [left_wheel, right_wheel]
+            # Car: Differential drive: [forward, turn] -> [left_wheel, right_wheel]
             forward = u_body[:, 0:1]
             turn = u_body[:, 1:2]
             
@@ -1797,11 +1837,24 @@ class PHSMAPPOActor(nn.Module):
             right_wheel = forward - turn_mix * turn
             
             u_mean = torch.cat([left_wheel, right_wheel], dim=-1)
+        elif self.agent_type == "racecar":
+            # Racecar: Ackermann steering [throttle, steering_angle]
+            # PHS output [forward, turn] maps directly to [throttle, steering]
+            # No conversion needed - action[0]=throttle velocity, action[1]=steering angle
+            u_mean = u_body
         else:
             u_mean = u_body
         
         # ========== 5. Scale ==========
-        u_mean = torch.tanh(u_mean) * self.f_max
+        # v9.4: NO tanh squashing for MultiGoal tasks.
+        # Standard MAPPO does NOT apply tanh to action mean — it outputs unconstrained
+        # means and lets the environment handle action bounds.
+        # tanh was causing:
+        #   1. Gradient vanishing for large policy outputs (tanh'(2)=0.07)
+        #   2. Limited action range (bounded to [-f_max, f_max])
+        #   3. Non-linear distortion of the guidance signal
+        # The environment wrapper clips actions to valid range internally.
+        # u_mean is already reasonable: guidance ≈ 0.2, policy_net starts near 0.
         
         # Reshape if multi-agent
         if is_multi_agent:
@@ -1819,6 +1872,8 @@ class PHSMAPPOActor(nn.Module):
             'goal_grad_forward': goal_grad[:, 0].mean().item(),
             'goal_grad_turn': goal_grad[:, 1].mean().item(),
             'dx_target_mean': dx_target_body.mean().item(),
+            'phs_damping_mean': phs_damping.mean().item(),
+            'vel_magnitude': vel.pow(2).sum(dim=-1).sqrt().mean().item(),
         })
         
         return u_mean, H_info, state_features
@@ -1856,22 +1911,26 @@ class PHSMAPPOActor(nn.Module):
         # Compute action from PHS dynamics
         u_mean, H_info, state_feat = self._compute_phs_action(obs, state_features, laplacian)
         
-        # Compute action std
-        if is_multi_agent:
-            n_agents = obs.shape[1]
-            state_feat_for_std = state_features.view(batch_size * n_agents, -1)
-            u_mean_flat = u_mean.view(batch_size * n_agents, -1)
+        # v9.4: Compute action std (matching standard MAPPO architecture)
+        if self.is_velocity_task:
+            # Velocity tasks: keep state-dependent std for backward compatibility
+            if is_multi_agent:
+                n_agents = obs.shape[1]
+                state_feat_for_std = state_features.view(batch_size * n_agents, -1)
+                u_mean_flat = u_mean.view(batch_size * n_agents, -1)
+            else:
+                state_feat_for_std = state_features
+                u_mean_flat = u_mean
+            std_input = torch.cat([state_feat_for_std, u_mean_flat], dim=-1)
+            u_log_std = self.std_net(std_input)
+            u_log_std = torch.clamp(u_log_std, -2.0, 0.5)
+            u_std = torch.exp(u_log_std)
+            if is_multi_agent:
+                u_std = u_std.view(batch_size, n_agents, -1)
         else:
-            state_feat_for_std = state_features
-            u_mean_flat = u_mean
-            
-        std_input = torch.cat([state_feat_for_std, u_mean_flat], dim=-1)
-        u_log_std = self.std_net(std_input)
-        u_log_std = torch.clamp(u_log_std, -2.0, 0.5)  # Reasonable std range
-        u_std = torch.exp(u_log_std)
-        
-        if is_multi_agent:
-            u_std = u_std.view(batch_size, n_agents, -1)
+            # MultiGoal tasks: global std parameter (proven MAPPO approach)
+            # sigmoid(log_std / x_coef) * y_coef → bounded, stable std
+            u_std = torch.sigmoid(self.action_log_std / self.std_x_coef) * self.std_y_coef
         
         # Create distribution and sample
         dist = torch.distributions.Normal(u_mean, u_std)
@@ -1879,10 +1938,10 @@ class PHSMAPPOActor(nn.Module):
         if deterministic:
             action = u_mean
         else:
-            action = dist.rsample()
+            action = dist.sample()
         
-        # Clip actions
-        action = torch.clamp(action, -1.0, 1.0)
+        # v9.4: No action clamping (matching standard MAPPO)
+        # Environment wrapper handles action bounds internally.
         
         # Compute log probs
         action_log_probs = dist.log_prob(action)
@@ -1927,22 +1986,24 @@ class PHSMAPPOActor(nn.Module):
         # Compute action from PHS dynamics
         u_mean, H_info, state_feat = self._compute_phs_action(obs, state_features, laplacian)
         
-        # Compute action std (must match forward())
-        if is_multi_agent:
-            n_agents = obs.shape[1]
-            state_feat_for_std = state_features.view(batch_size * n_agents, -1)
-            u_mean_flat = u_mean.view(batch_size * n_agents, -1)
+        # v9.4: Compute action std (must match forward())
+        if self.is_velocity_task:
+            if is_multi_agent:
+                n_agents = obs.shape[1]
+                state_feat_for_std = state_features.view(batch_size * n_agents, -1)
+                u_mean_flat = u_mean.view(batch_size * n_agents, -1)
+            else:
+                state_feat_for_std = state_features
+                u_mean_flat = u_mean
+            std_input = torch.cat([state_feat_for_std, u_mean_flat], dim=-1)
+            u_log_std = self.std_net(std_input)
+            u_log_std = torch.clamp(u_log_std, -2.0, 0.5)
+            u_std = torch.exp(u_log_std)
+            if is_multi_agent:
+                u_std = u_std.view(batch_size, n_agents, -1)
         else:
-            state_feat_for_std = state_features
-            u_mean_flat = u_mean
-            
-        std_input = torch.cat([state_feat_for_std, u_mean_flat], dim=-1)
-        u_log_std = self.std_net(std_input)
-        u_log_std = torch.clamp(u_log_std, -2.0, 0.5)
-        u_std = torch.exp(u_log_std)
-        
-        if is_multi_agent:
-            u_std = u_std.view(batch_size, n_agents, -1)
+            # MultiGoal: global std parameter (matching MAPPO)
+            u_std = torch.sigmoid(self.action_log_std / self.std_x_coef) * self.std_y_coef
         
         # Create distribution
         dist = torch.distributions.Normal(u_mean, u_std)

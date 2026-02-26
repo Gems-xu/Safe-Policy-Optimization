@@ -14,7 +14,7 @@ seed: 0
 run_dir: ./runs
 num_env_steps: 10000000
 episode_length: 1000
-n_rollout_threads: 10
+n_rollout_threads: 20
 n_eval_rollout_threads: 1
 hidden_size: 256
 use_render: False
@@ -27,7 +27,7 @@ eval_interval: 25
 log_interval: 25
 eval_episodes: 20
 
-gamma: 0.99
+gamma: 0.96
 gae_lambda: 0.95
 use_gae: True
 use_popart: True
@@ -53,8 +53,8 @@ use_huber_loss: True
 use_value_active_masks: False
 use_policy_active_masks: False
 
-actor_lr: 2.e-4
-critic_lr: 2.e-3
+actor_lr: 9.e-5
+critic_lr: 5.e-3
 opti_eps: 1.e-5
 weight_decay: 0.0
 

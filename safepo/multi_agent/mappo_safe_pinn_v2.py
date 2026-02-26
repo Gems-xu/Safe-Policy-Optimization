@@ -246,6 +246,7 @@ class MAPPOSafePINNv2Trainer:
         self.lagrangian_update_interval = config.get("lagrangian_update_interval", 5)
         self.lagrangian_ema_alpha = config.get("lagrangian_ema_alpha", 0.9)
         self.lagrangian_slow_rate = config.get("lagrangian_slow_rate", 0.01)
+        self.lagrangian_warmup_steps = config.get("lagrangian_warmup_steps", 0)
         self._ema_cost = None
         
         # Soft cost for Cost Critic training
@@ -481,14 +482,25 @@ class MAPPOSafePINNv2Trainer:
                 + (1.0 - self.lagrangian_ema_alpha) * current_cost
             )
 
-        cost_violation = self._ema_cost - cost_limit
-        if self._training_step % self.lagrangian_update_interval == 0:
-            delta_lamda = self.lagrangian_slow_rate * cost_violation
-            self.lamda_lagr = float(np.clip(
-                self.lamda_lagr + delta_lamda,
-                self.lamda_lagr_min,
-                self.lamda_lagr_max
-            ))
+        # v9.4: Lagrangian warmup - don't penalize cost during early exploration
+        # The policy needs time to learn basic navigation before safety constraints kick in.
+        # Without warmup, early exploration cost → λ increases → agent learns "don't move".
+        if self._training_step < self.lagrangian_warmup_steps:
+            # During warmup: force lambda to min, don't update
+            self.lamda_lagr = self.lamda_lagr_min
+            cost_violation = 0.0
+        else:
+            cost_violation = self._ema_cost - cost_limit
+            if self._training_step % self.lagrangian_update_interval == 0:
+                delta_lamda = self.lagrangian_slow_rate * cost_violation
+                # Clamp per-step delta to prevent oscillation from cost spikes
+                max_delta = 0.03
+                delta_lamda = float(np.clip(delta_lamda, -max_delta, max_delta))
+                self.lamda_lagr = float(np.clip(
+                    self.lamda_lagr + delta_lamda,
+                    self.lamda_lagr_min,
+                    self.lamda_lagr_max
+                ))
         
         aux_info['lamda_lagr'] = self.lamda_lagr
         aux_info['cost_violation'] = cost_violation
@@ -1732,6 +1744,43 @@ def train(args, cfg_train):
                 cfg_train["entropy_coef"] = 0.015                 # Moderate entropy
                 cfg_train["max_grad_norm"] = 5.0                  # Tighter gradient clipping
     
+    # =========================================================================
+    # Racecar MultiGoal Task-Specific Configuration
+    # =========================================================================
+    # Racecar uses Ackermann steering (throttle + steering angle), NOT differential
+    # drive. The PHS actor directly outputs [forward, turn] → [throttle, steering].
+    # Key: base_sensor_dim=12 (same as Point), agent_type="racecar"
+    if "Racecar" in args.task and args.task in multi_agent_goal_tasks:
+        # v9.4: Align with proven MAPPO/MAPPOLag training dynamics while keeping PHS guidance
+        # PHS provides structural bias (goal gradient, barrier potential) but training
+        # parameters should match the proven baseline for stable convergence.
+        
+        # PHS guidance: goal gradient provides initial navigation signal
+        cfg_train["phs_goal_guidance_weight"] = 0.55
+        cfg_train["phs_barrier_guidance_weight"] = 0.25
+        cfg_train["phs_drag"] = 0.0  # No damping (Racecar uses setpoint actuators)
+        
+        # Barrier potential
+        cfg_train["obstacle_barrier_weight"] = 1.2
+        cfg_train["obstacle_barrier_threshold"] = 0.70
+        cfg_train["obstacle_barrier_alpha"] = 5.0
+        
+        # v9.4: Lagrangian with warmup period
+        # Key insight from MAPPO-Lag: lagrangian_coef_rate = 1e-5 (1000x smaller than PHS!)
+        # Also: don't penalize cost until policy has learned basic navigation (3M steps)
+        cfg_train["cost_limit"] = 25.0
+        cfg_train["lamda_lagr"] = 0.0
+        cfg_train["lamda_lagr_min"] = 0.0
+        cfg_train["lamda_lagr_max"] = 2.0
+        cfg_train["lagrangian_slow_rate"] = 0.005
+        cfg_train["lagrangian_update_interval"] = 10
+        cfg_train["lagrangian_ema_alpha"] = 0.97
+        cfg_train["lagrangian_warmup_steps"] = 300  # ~3M env steps with 20 threads
+        
+        # v9.4: Low entropy (matching MAPPO which uses 0.0)
+        # High entropy fights against learning deterministic navigation
+        cfg_train["entropy_coef"] = 0.005
+
     if args.task in multi_agent_velocity_map:
         env = make_ma_mujoco_env(
             scenario=args.scenario,
