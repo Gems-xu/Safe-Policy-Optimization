@@ -1282,7 +1282,7 @@ class Runner:
             potential_visualizer = BarrierPotentialVideoVisualizer(
                 actor=self.policy[0].actor,
                 world_bounds=(-2.5, 2.5, -2.5, 2.5),
-                grid_resolution=30,
+                grid_resolution=50,
                 device='cpu',
                 hazard_radius=hazard_radius,
             )
