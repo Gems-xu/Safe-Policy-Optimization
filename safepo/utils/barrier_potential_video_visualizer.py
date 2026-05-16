@@ -648,10 +648,11 @@ class BarrierPotentialVideoVisualizer:
         vmax_barrier = np.percentile(H_barrier, 95) if H_barrier.max() > 0 else 1.0
         im1 = axes[1].imshow(
             H_barrier, extent=extent, origin='lower',
-            cmap='hot_r', vmin=0, vmax=max(vmax_barrier, 0.1), alpha=0.8
+            cmap='hot_r', vmin=0, vmax=max(vmax_barrier, 0.1), alpha=0.8,
+            interpolation='bicubic'
         )
         self._add_overlays(axes[1], obstacle_positions, goal_positions, agent_positions)
-        axes[1].set_title('Barrier Potential (H_barrier)', fontsize=12)
+        axes[1].set_title('Barrier Potential (V_barrier)', fontsize=12)
         axes[1].set_xlabel('X Position')
         axes[1].set_ylabel('Y Position')
         axes[1].set_xlim(self.world_bounds[0], self.world_bounds[1])
@@ -659,17 +660,18 @@ class BarrierPotentialVideoVisualizer:
         axes[1].set_aspect('equal')
         axes[1].grid(True, alpha=0.3)
         cbar1 = plt.colorbar(im1, ax=axes[1], shrink=0.8)
-        cbar1.set_label('H_barrier', fontsize=9)
+        cbar1.set_label('V_barrier', fontsize=9)
         
         # === 3. Task Potential ===
         vmin_task = H_task.min()
         vmax_task = max(H_task.max(), 0.1)
         im2 = axes[2].imshow(
             H_task, extent=extent, origin='lower',
-            cmap='coolwarm', vmin=vmin_task, vmax=vmax_task, alpha=0.8
+            cmap='coolwarm', vmin=vmin_task, vmax=vmax_task, alpha=0.8,
+            interpolation='bicubic'
         )
         self._add_overlays(axes[2], obstacle_positions, goal_positions, agent_positions)
-        axes[2].set_title('Task Potential (H_task)', fontsize=12)
+        axes[2].set_title('Task Potential (V_task)', fontsize=12)
         axes[2].set_xlabel('X Position')
         axes[2].set_ylabel('Y Position')
         axes[2].set_xlim(self.world_bounds[0], self.world_bounds[1])
@@ -677,17 +679,18 @@ class BarrierPotentialVideoVisualizer:
         axes[2].set_aspect('equal')
         axes[2].grid(True, alpha=0.3)
         cbar2 = plt.colorbar(im2, ax=axes[2], shrink=0.8)
-        cbar2.set_label('H_task', fontsize=9)
+        cbar2.set_label('V_task', fontsize=9)
         
         # === 4. Total Potential ===
         vmin_total = H_total.min()
         vmax_total = np.percentile(H_total, 95) if H_total.max() > 0 else 1.0
         im3 = axes[3].imshow(
             H_total, extent=extent, origin='lower',
-            cmap='RdYlGn_r', vmin=vmin_total, vmax=max(vmax_total, abs(vmin_total)), alpha=0.8
+            cmap='RdYlGn_r', vmin=vmin_total, vmax=max(vmax_total, abs(vmin_total)), alpha=0.8,
+            interpolation='bicubic'
         )
         self._add_overlays(axes[3], obstacle_positions, goal_positions, agent_positions)
-        axes[3].set_title('Total Potential (H_total)', fontsize=12)
+        axes[3].set_title('Total Potential (V_total)', fontsize=12)
         axes[3].set_xlabel('X Position')
         axes[3].set_ylabel('Y Position')
         axes[3].set_xlim(self.world_bounds[0], self.world_bounds[1])
@@ -695,7 +698,7 @@ class BarrierPotentialVideoVisualizer:
         axes[3].set_aspect('equal')
         axes[3].grid(True, alpha=0.3)
         cbar3 = plt.colorbar(im3, ax=axes[3], shrink=0.8)
-        cbar3.set_label('H_total', fontsize=9)
+        cbar3.set_label('V_total', fontsize=9)
         
         plt.tight_layout()
         
@@ -759,7 +762,8 @@ class BarrierPotentialVideoVisualizer:
         
         im = ax.imshow(
             potential_field, extent=extent, origin='lower',
-            cmap=cmap, vmin=vmin, vmax=max(vmax, 0.1), alpha=0.8
+            cmap=cmap, vmin=vmin, vmax=max(vmax, 0.1), alpha=0.8,
+            interpolation='bicubic'
         )
         
         self._add_overlays(ax, obstacle_positions, goal_positions, agent_positions)
