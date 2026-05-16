@@ -523,29 +523,29 @@ class BarrierPotentialVisualizer:
             ax.set_aspect('equal')
         
         # Barrier potential
-        im1 = axes[0].contourf(X, Y, H_barrier, levels=20, cmap='hot')
-        axes[0].set_title('Barrier Potential $H_{barrier}(x, y)$', fontsize=14, fontweight='bold')
+        im1 = axes[0].contourf(X, Y, H_barrier, levels=60, cmap='hot', antialiased=True)
+        axes[0].set_title('Barrier Potential $V_{barrier}(x, y)$', fontsize=14, fontweight='bold')
         axes[0].set_xlabel('X Position (m)', fontsize=12)
         axes[0].set_ylabel('Y Position (m)', fontsize=12)
-        fig.colorbar(im1, ax=axes[0], label='Potential Energy')
+        fig.colorbar(im1, ax=axes[0], label='$V_{barrier}$')
         add_markers(axes[0])
         axes[0].grid(True, alpha=0.3)
         
         # Task potential
-        im2 = axes[1].contourf(X, Y, H_task, levels=20, cmap='viridis')
-        axes[1].set_title('Task Potential $H_{task}(x, y)$', fontsize=14, fontweight='bold')
+        im2 = axes[1].contourf(X, Y, H_task, levels=60, cmap='viridis', antialiased=True)
+        axes[1].set_title('Task Potential $V_{task}(x, y)$', fontsize=14, fontweight='bold')
         axes[1].set_xlabel('X Position (m)', fontsize=12)
         axes[1].set_ylabel('Y Position (m)', fontsize=12)
-        fig.colorbar(im2, ax=axes[1], label='Potential Energy')
+        fig.colorbar(im2, ax=axes[1], label='$V_{task}$')
         add_markers(axes[1])
         axes[1].grid(True, alpha=0.3)
         
         # Total potential
-        im3 = axes[2].contourf(X, Y, H_total, levels=20, cmap='coolwarm')
-        axes[2].set_title('Total Potential $H_{total}(x, y)$', fontsize=14, fontweight='bold')
+        im3 = axes[2].contourf(X, Y, H_total, levels=60, cmap='coolwarm', antialiased=True)
+        axes[2].set_title('Total Potential $V_{total}(x, y)$', fontsize=14, fontweight='bold')
         axes[2].set_xlabel('X Position (m)', fontsize=12)
         axes[2].set_ylabel('Y Position (m)', fontsize=12)
-        fig.colorbar(im3, ax=axes[2], label='Potential Energy')
+        fig.colorbar(im3, ax=axes[2], label='$V_{total}$')
         add_markers(axes[2])
         axes[2].grid(True, alpha=0.3)
         
